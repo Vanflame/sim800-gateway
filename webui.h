@@ -1,0 +1,160 @@
+#pragma once
+
+// ============================================================================
+// Web UI Server
+// HTTP server for configuration and monitoring
+// ============================================================================
+
+#include "config.h"
+#include <WebServer.h>
+
+// Web server instance
+extern WebServer server;
+
+// -----------------------------------------------------------------------------
+// Initialization
+// -----------------------------------------------------------------------------
+
+// Initialize web server and register all routes
+void initWebUI();
+
+// Handle web requests in main loop
+void handleWebRequests();
+
+// -----------------------------------------------------------------------------
+// Route Handlers - Status
+// -----------------------------------------------------------------------------
+
+// GET / - Main page
+void handleRoot();
+
+// GET /status - System status JSON
+void handleStatus();
+
+// GET /monitor - Monitor log text
+void handleMonitor();
+
+// GET /clear-monitor - Clear monitor log
+void handleClearMonitor();
+
+// -----------------------------------------------------------------------------
+// Route Handlers - WiFi
+// -----------------------------------------------------------------------------
+
+// GET /scan - Scan WiFi networks
+void handleScan();
+
+// POST /save-wifi - Save WiFi credentials
+void handleSaveWifi();
+
+// GET /disconnect - Disconnect WiFi
+void handleDisconnect();
+
+// -----------------------------------------------------------------------------
+// Route Handlers - SIM Management
+// -----------------------------------------------------------------------------
+
+// GET /sim-config - Get all SIM states
+void handleSimConfig();
+
+// GET /check-sim?slot=N - Check specific SIM
+void handleCheckSim();
+
+// GET /check-all-sim - Check all SIMs
+void handleCheckAllSim();
+
+// POST /sim-enable?slot=N&enabled=1/0 - Enable/disable SIM
+void handleSimEnable();
+
+// -----------------------------------------------------------------------------
+// Route Handlers - Calls
+// -----------------------------------------------------------------------------
+
+// GET /calls - Get call log
+void handleCalls();
+
+// GET /clear-calls - Clear call log
+void handleClearCalls();
+
+// POST /call?number=XXX&slot=N - Make a call
+void handleCall();
+
+// POST /hangup - Hang up current call
+void handleHangup();
+
+// -----------------------------------------------------------------------------
+// Route Handlers - SMS
+// -----------------------------------------------------------------------------
+
+// POST /send-sms?number=XXX&message=XXX&slot=N - Send SMS
+void handleSendSms();
+
+// GET /messages - Get message history
+void handleMessages();
+
+// -----------------------------------------------------------------------------
+// Route Handlers - Agent Config
+// -----------------------------------------------------------------------------
+
+// POST /agent-config - Save agent configuration
+void handleAgentConfig();
+
+// GET /test-push - Test push to backend
+void handleTestPush();
+
+// POST /login - Agent login
+void handleLogin();
+
+// GET /logout - Logout
+void handleLogout();
+
+// POST /refresh-token - Refresh access token
+void handleRefreshToken();
+
+// POST /register-device - Register device with backend
+void handleRegisterDevice();
+
+// POST /register-sim - Register SIM with backend
+void handleRegisterSim();
+
+// POST /heartbeat - Manual heartbeat trigger (debug)
+void handleHeartbeatManual();
+
+// POST /toggle-polling - Toggle SMS polling pause
+void handleTogglePolling();
+
+// -----------------------------------------------------------------------------
+// Route Handlers - Battery
+// -----------------------------------------------------------------------------
+
+// GET /battery - Get battery info
+void handleBattery();
+
+// -----------------------------------------------------------------------------
+// JSON Response Helpers
+// -----------------------------------------------------------------------------
+
+// Send JSON success response
+void sendJsonSuccess(const char* message = NULL);
+
+// Send JSON error response
+void sendJsonError(const char* error, int code = 400);
+
+// Send JSON response
+void sendJson(const char* json);
+
+// -----------------------------------------------------------------------------
+// HTML Generation
+// -----------------------------------------------------------------------------
+
+// Get HTML page (from PROGMEM)
+const char* getHtmlPage();
+
+// Build status JSON
+void buildStatusJson(char* buf, size_t bufSize);
+
+// Build SIM config JSON
+void buildSimConfigJson(char* buf, size_t bufSize);
+
+// Build call log JSON
+void buildCallLogJson(char* buf, size_t bufSize);
