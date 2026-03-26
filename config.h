@@ -96,6 +96,8 @@
 // -----------------------------------------------------------------------------
 #define SMS_HEX_DEBUG     false    // Enable hex dump of SMS data
 
+#define HEARTBEAT_DEBUG   false    // Enable verbose heartbeat request/response logging
+
 // -----------------------------------------------------------------------------
 // Type Definitions
 // -----------------------------------------------------------------------------
@@ -159,6 +161,7 @@ extern int monitorLogCount;
 extern unsigned long lastHeartbeatMs;
 extern unsigned long lastSmsPollMs;
 extern unsigned long smsPollingPauseUntilMs;
+extern bool heartbeatPaused;
 
 // Agent config
 extern char agentBaseUrl[128];

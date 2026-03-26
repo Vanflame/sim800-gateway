@@ -39,6 +39,7 @@ int currentMuxSim = 0;
 volatile bool simBusy = false;
 volatile bool httpsBusy = false;  // Prevent concurrent HTTPS
 bool smsPollingPaused = false;
+bool heartbeatPaused = false;
 bool deviceRegistered = false;
 bool simRegistered = false;
 
@@ -164,7 +165,7 @@ void loop() {
     unsigned long now = millis();
     
     // Heartbeat / sync with backend
-    if (now - lastHeartbeatMs > HEARTBEAT_INTERVAL_MS) {
+    if (!heartbeatPaused && (now - lastHeartbeatMs > HEARTBEAT_INTERVAL_MS)) {
         lastHeartbeatMs = now;
         performHeartbeat();
     }
@@ -242,6 +243,7 @@ void loadSettings() {
     agentSimSlot = preferences.getInt("slot", 0);
     preferences.getString("path", agentApiPath, sizeof(agentApiPath));
     agentUseAuth = preferences.getBool("auth", true);
+    heartbeatPaused = preferences.getBool("hb_pause", false);
     preferences.end();
     
     // Use default base URL if not saved
@@ -266,6 +268,21 @@ void loadSettings() {
 // -----------------------------------------------------------------------------
 // Heartbeat / Backend Sync
 // -----------------------------------------------------------------------------
+
+// Normalize SIM number to include + prefix for PH numbers
+static void normalizeSimNumber(const char* raw, char* out, size_t outSize) {
+    if (!raw || !raw[0]) {
+        out[0] = '\0';
+        return;
+    }
+    // If already starts with +, copy as-is
+    if (raw[0] == '+') {
+        charBufSet(out, outSize, raw);
+        return;
+    }
+    // Add + prefix
+    snprintf(out, outSize, "+%s", raw);
+}
 
 void performHeartbeat() {
     if (charBufIsEmpty(agentBaseUrl)) {
@@ -325,6 +342,10 @@ void performHeartbeat() {
         http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
     }
 
+    if (HEARTBEAT_DEBUG) {
+        http.addHeader("x-heartbeat-debug", "1");
+    }
+
     // Backend expects { device_id, sims:[{number,slot,status}] }
     static char body[2048];
     size_t pos = 0;
@@ -342,9 +363,11 @@ void performHeartbeat() {
         if (!first) pos += snprintf(body + pos, sizeof(body) - pos, ",");
         first = false;
 
-        // status: ACTIVE when enabled, DISABLED otherwise (we only send enabled sims)
+        // Normalize number with + prefix for backend consistency
         char numEsc[64];
-        jsonEscape(simStates[i].number, numEsc, sizeof(numEsc));
+        char normalizedNum[PHONE_BUFFER_SIZE];
+        normalizeSimNumber(simStates[i].number, normalizedNum, sizeof(normalizedNum));
+        jsonEscape(normalizedNum, numEsc, sizeof(numEsc));
         pos += snprintf(body + pos, sizeof(body) - pos,
             "{\"number\":%s,\"slot\":%d,\"status\":\"ACTIVE\"}",
             numEsc,
@@ -353,6 +376,13 @@ void performHeartbeat() {
     }
 
     pos += snprintf(body + pos, sizeof(body) - pos, "]}");
+
+    if (HEARTBEAT_DEBUG) {
+        logMsg("[HEARTBEAT][DBG] Request body:");
+        appendMonitorLog("[HEARTBEAT][DBG] Request body:");
+        logMsg(body);
+        appendMonitorLog(body);
+    }
 
     // Try up to 2 times for connection errors
     int attempt = 0;
@@ -436,6 +466,20 @@ void performHeartbeat() {
         logMsgInt("[HEARTBEAT] Failed, code", code);
         appendMonitorLogInt("[HEARTBEAT] Failed", code);
     }
+
+    if (HEARTBEAT_DEBUG) {
+        appendMonitorLogInt("[HEARTBEAT][DBG] HTTP code", code);
+        if (resp.length() > 0) {
+            String r = resp;
+            if (r.length() > 900) r = r.substring(0, 900);
+            appendMonitorLog("[HEARTBEAT][DBG] Response (trunc):");
+            appendMonitorLog(r.c_str());
+            logMsg("[HEARTBEAT][DBG] Response (trunc):");
+            logMsg(r.c_str());
+        } else {
+            appendMonitorLog("[HEARTBEAT][DBG] Empty response body");
+        }
+    }
     
     // Always close connections fully
     http.end();
@@ -489,17 +533,19 @@ void performHeartbeat() {
                     if (slot >= 1 && slot <= SIM_COUNT && status[0] != '\0') {
                         int idx = slot - 1;
                         bool shouldEnable = (strcmp(status, "ACTIVE") == 0 || strcmp(status, "IN_USE") == 0);
+
+                        if (HEARTBEAT_DEBUG) {
+                            char dbgLine[96];
+                            snprintf(dbgLine, sizeof(dbgLine), "[HEARTBEAT][DBG] slot=%d status=%s => enable=%d", slot, status, shouldEnable ? 1 : 0);
+                            appendMonitorLog(dbgLine);
+                            logMsg(dbgLine);
+                        }
+
                         simStates[idx].enabled = shouldEnable;
                         if (!shouldEnable) {
                             appendMonitorLogVal("[HEARTBEAT] Backend disabled SIM", String(slot).c_str());
-                            simStates[idx].responsive = false;
-                            simStates[idx].registered = false;
-                            simStates[idx].backendRegistered = false;
-                            simStates[idx].basicInitDone = false;
-                            charBufClear(simStates[idx].number, sizeof(simStates[idx].number));
-                            charBufClear(simStates[idx].creg, sizeof(simStates[idx].creg));
-                            charBufClear(simStates[idx].cops, sizeof(simStates[idx].cops));
-                            charBufClear(simStates[idx].csq, sizeof(simStates[idx].csq));
+                            // Do NOT clear state - keep number so SIM can be re-enabled and resent in next heartbeat
+                            // simStates[idx].responsive remains true so it will be included in next heartbeat
                         }
                     }
 

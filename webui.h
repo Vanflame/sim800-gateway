@@ -123,6 +123,9 @@ void handleHeartbeatManual();
 // POST /toggle-polling - Toggle SMS polling pause
 void handleTogglePolling();
 
+// POST /toggle-heartbeat - Toggle heartbeat pause
+void handleToggleHeartbeat();
+
 // -----------------------------------------------------------------------------
 // Route Handlers - Battery
 // -----------------------------------------------------------------------------

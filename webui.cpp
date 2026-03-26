@@ -47,6 +47,9 @@ extern int batteryMv;
 // NTP status (from main .ino)
 extern bool ntpConfigured;
 
+// Heartbeat pause flag (from main .ino)
+extern bool heartbeatPaused;
+
 // Forward declarations for handlers
 void handleScanNetworks();
 void handleSelectNetwork();
@@ -73,6 +76,7 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
     .btn.bad { background: var(--bad); }
     .btn.ok { background: var(--ok); }
     .btn.full { width: 100%; }
+    .btn.red { background: var(--bad); }
     input { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid rgba(148,163,184,0.2); background: rgba(0,0,0,0.3); color: var(--text); font-size: 14px; }
     input:focus { outline: none; border-color: var(--accent); }
     select { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid rgba(148,163,184,0.2); background: rgba(0,0,0,0.3); color: var(--text); }
@@ -222,6 +226,7 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
         <h2>SIM Slots</h2>
         <button class="btn sm gray" id="checkAllBtn">Refresh All</button>
         <button class="btn sm gray" id="pausePollingBtn">Pause SMS</button>
+        <button class="btn sm gray" id="pauseHeartbeatBtn">Pause HB</button>
       </div>
       <div id="simList"></div>
     </div>
@@ -334,6 +339,17 @@ async function refreshStatus() {
     // Device info
     if ($('deviceIdDisplay')) $('deviceIdDisplay').textContent = s.device_id || '-';
     if ($('tokenStatus')) $('tokenStatus').textContent = (s.bearer_token && s.bearer_token.length > 0) ? '(set)' : 'Not set';
+
+    // Heartbeat pause button state
+    if ($('pauseHeartbeatBtn')) {
+      if (s.heartbeat_paused) {
+        $('pauseHeartbeatBtn').textContent = 'Resume HB';
+        $('pauseHeartbeatBtn').classList.add('red');
+      } else {
+        $('pauseHeartbeatBtn').textContent = 'Pause HB';
+        $('pauseHeartbeatBtn').classList.remove('red');
+      }
+    }
     
   } catch(e) {
     console.error('Status error:', e);
@@ -536,6 +552,26 @@ async function togglePollingPause() {
       } else {
         $('pausePollingBtn').textContent = 'Pause SMS';
         $('pausePollingBtn').classList.remove('red');
+      }
+    } else {
+      toast(r.error || 'Failed');
+    }
+  } catch(e) {
+    toast('Failed to toggle');
+  }
+}
+
+async function toggleHeartbeatPause() {
+  try {
+    const r = await post('/toggle-heartbeat', {});
+    if (r.success) {
+      toast(r.message || 'Toggled');
+      if (r.paused) {
+        $('pauseHeartbeatBtn').textContent = 'Resume HB';
+        $('pauseHeartbeatBtn').classList.add('red');
+      } else {
+        $('pauseHeartbeatBtn').textContent = 'Pause HB';
+        $('pauseHeartbeatBtn').classList.remove('red');
       }
     } else {
       toast(r.error || 'Failed');
@@ -815,6 +851,17 @@ async function doRegisterAllSims() {
 async function checkAuthStatus() {
   const s = await get('/status');
   const hasToken = s.bearer_token && s.bearer_token.length > 0;
+
+  // Update heartbeat pause button state
+  if ($('pauseHeartbeatBtn')) {
+    if (s.heartbeat_paused) {
+      $('pauseHeartbeatBtn').textContent = 'Resume HB';
+      $('pauseHeartbeatBtn').classList.add('red');
+    } else {
+      $('pauseHeartbeatBtn').textContent = 'Pause HB';
+      $('pauseHeartbeatBtn').classList.remove('red');
+    }
+  }
   
   // Update device info section
   $('deviceIdDisplay').textContent = s.device_id || '-';
@@ -839,6 +886,7 @@ $('connectBtn').onclick = connectWifi;
 $('disconnectBtn').onclick = disconnectWifi;
 $('checkAllBtn').onclick = checkAllSims;
 $('pausePollingBtn').onclick = togglePollingPause;
+$('pauseHeartbeatBtn').onclick = toggleHeartbeatPause;
 $('saveConfigBtn').onclick = saveConfig;
 $('testPushBtn').onclick = testPush;
 $('clearLogBtn').onclick = clearLog;
@@ -912,6 +960,7 @@ void initWebUI() {
     server.on("/select-network", HTTP_POST, handleSelectNetwork);
     server.on("/heartbeat", HTTP_POST, handleHeartbeatManual);
     server.on("/toggle-polling", HTTP_POST, handleTogglePolling);
+    server.on("/toggle-heartbeat", HTTP_POST, handleToggleHeartbeat);
     
     // Start server
     server.begin();
@@ -981,7 +1030,8 @@ void buildStatusJson(char* buf, size_t bufSize) {
         "\"base_url\":\"%s\","
         "\"api_path\":\"%s\","
         "\"device_id\":\"%s\","
-        "\"bearer_token\":\"%s\""
+        "\"bearer_token\":\"%s\","
+        "\"heartbeat_paused\":%s"
         "}",
         staConnected ? "true" : "false",
         staConnected ? staIp.toString().c_str() : "",
@@ -997,7 +1047,8 @@ void buildStatusJson(char* buf, size_t bufSize) {
         agentBaseUrl,
         agentApiPath,
         agentDeviceId,
-        hasBearerToken ? "(set)" : ""
+        hasBearerToken ? "(set)" : "",
+        heartbeatPaused ? "true" : "false"
     );
 }
 
@@ -2526,6 +2577,31 @@ void handleTogglePolling() {
         snprintf(buf, sizeof(buf), "{\"success\":true,\"paused\":true,\"message\":\"Polling paused 5 min\"}");
         server.send(200, "application/json", buf);
     }
+}
+
+void handleToggleHeartbeat() {
+    if (heartbeatPaused) {
+        heartbeatPaused = false;
+        logMsg("[HEARTBEAT] Resumed");
+        appendMonitorLog("[HEARTBEAT] Resumed");
+    } else {
+        heartbeatPaused = true;
+        logMsg("[HEARTBEAT] Paused");
+        appendMonitorLog("[HEARTBEAT] Paused");
+    }
+
+    // Persist setting
+    preferences.begin("agent", false);
+    preferences.putBool("hb_pause", heartbeatPaused);
+    preferences.end();
+
+    char buf[160];
+    snprintf(buf, sizeof(buf),
+        "{\"success\":true,\"paused\":%s,\"message\":\"Heartbeat %s\"}",
+        heartbeatPaused ? "true" : "false",
+        heartbeatPaused ? "paused" : "resumed"
+    );
+    server.send(200, "application/json", buf);
 }
 
 // -----------------------------------------------------------------------------
