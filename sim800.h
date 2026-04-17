@@ -12,8 +12,13 @@
 // Serial Interface
 // -----------------------------------------------------------------------------
 
-// Global serial instance for SIM800
-extern HardwareSerial sim800;
+// Get currently active serial interface (depends on selected SIM slot)
+HardwareSerial& simSerial();
+
+// Set/get active SIM slot (0-based). In mux mode this selects the MUX channel.
+// In dual-UART mode this selects which UART is used for subsequent AT commands.
+void setActiveSimSlot(int slot);
+int getActiveSimSlot();
 
 // Initialize SIM800 serial
 void initSIM800Serial();
@@ -158,3 +163,6 @@ bool extractValue(const char* prefix, char* value, size_t valueSize);
 // Get/set busy state
 bool isSimBusy();
 void setSimBusy(bool busy);
+
+// Verify SIM is responsive after MUX switch (with retries)
+bool verifySIMResponsive(int expectedSlot);

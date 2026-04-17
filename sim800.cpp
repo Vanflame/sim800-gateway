@@ -14,8 +14,15 @@ extern WebServer server;
 
 static bool gYieldToWebServer = true;
 
+#if USE_DUAL_UART
+static HardwareSerial sim800_1(1);
+static HardwareSerial sim800_2(2);
+static int gActiveSimSlot = 0;
+#else
 // Hardware serial instance (UART2 on ESP32)
 HardwareSerial sim800(2);
+static int gActiveSimSlot = 0;
+#endif
 
 // Response buffer (static to avoid heap allocation)
 static char simBuffer[SIM_BUFFER_SIZE];
@@ -28,8 +35,32 @@ static size_t simBufferLen = 0;
 // Serial Interface
 // -----------------------------------------------------------------------------
 
+HardwareSerial& simSerial() {
+    #if USE_DUAL_UART
+        return (gActiveSimSlot == 1) ? sim800_2 : sim800_1;
+    #else
+        return sim800;
+    #endif
+}
+
+void setActiveSimSlot(int slot) {
+    if (slot < 0) slot = 0;
+    if (slot >= SIM_COUNT) slot = SIM_COUNT - 1;
+    gActiveSimSlot = slot;
+}
+
+int getActiveSimSlot() {
+    return gActiveSimSlot;
+}
+
 void initSIM800Serial() {
-    sim800.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+    #if USE_DUAL_UART
+        sim800_1.begin(UART_BAUD_RATE, SERIAL_8N1, UART1_RX_PIN, UART1_TX_PIN);
+        sim800_2.begin(UART_BAUD_RATE, SERIAL_8N1, UART2_RX_PIN, UART2_TX_PIN);
+        setActiveSimSlot(0);
+    #else
+        sim800.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+    #endif
     delay(100);
     flushSimInput();
     logMsg("[SIM800] Serial initialized");
@@ -51,23 +82,33 @@ char* getSimBuffer() {
 void sendATCapture(const char* cmd, unsigned long timeoutMs) {
     setSimBusy(true);
     clearSimBuffer();
-    
-    // Flush any pending unsolicited bytes so they don't mix with this command response
-    for (int i = 0; i < 200 && sim800.available(); i++) {
-        (void)sim800.read();
-        delay(1);
+
+    HardwareSerial& serial = simSerial();
+
+    // Thorough flush before sending - critical for multiplexed SIMs
+    // Multiple passes to ensure all residual data is cleared
+    for (int pass = 0; pass < 3; pass++) {
+        int flushed = 0;
+        unsigned long flushStart = millis();
+        while (serial.available() && flushed < 100 && (millis() - flushStart < 100)) {
+            (void)serial.read();
+            flushed++;
+        }
+        if (flushed > 0) {
+            delay(10);
+        }
     }
-    
+
     // Send command
-    sim800.println(cmd);
-    
+    serial.println(cmd);
+
     // Read response with timeout
     unsigned long start = millis();
     while (millis() - start < timeoutMs) {
         int readCount = 0;
-        while (sim800.available() && readCount < 100) {
+        while (serial.available() && readCount < 100) {
             readCount++;
-            char c = (char)sim800.read();
+            char c = (char)serial.read();
             if (simBufferLen < SIM_BUFFER_SIZE - 1) {
                 simBuffer[simBufferLen++] = c;
                 simBuffer[simBufferLen] = '\0';
@@ -116,15 +157,16 @@ bool sendAT(const char* cmd, unsigned long timeoutMs) {
 
 int readLine(char* buf, size_t bufSize, unsigned long timeoutMs) {
     if (!buf || bufSize < 1) return 0;
-    
+
     buf[0] = '\0';
     size_t len = 0;
     unsigned long start = millis();
-    
+    HardwareSerial& serial = simSerial();
+
     while (millis() - start < timeoutMs && len < bufSize - 1) {
-        if (sim800.available()) {
-            char c = (char)sim800.read();
-            
+        if (serial.available()) {
+            char c = (char)serial.read();
+
             if (c == '\n') {
                 if (len > 0) {
                     buf[len] = '\0';
@@ -136,26 +178,35 @@ int readLine(char* buf, size_t bufSize, unsigned long timeoutMs) {
         }
         delay(1);
     }
-    
+
     buf[len] = '\0';
     return len;
 }
 
 void readAllAvailable(char* buf, size_t bufSize) {
     if (!buf || bufSize < 1) return;
-    
+
     size_t len = 0;
-    while (sim800.available() && len < bufSize - 1) {
-        buf[len++] = (char)sim800.read();
+    HardwareSerial& serial = simSerial();
+    while (serial.available() && len < bufSize - 1) {
+        buf[len++] = (char)serial.read();
         delay(1);
     }
     buf[len] = '\0';
 }
 
 void flushSimInput() {
-    for (int i = 0; i < UART_FLUSH_ITER && sim800.available(); i++) {
-        sim800.read();
-        delay(1);
+    HardwareSerial& serial = simSerial();
+    // Multi-pass flush for reliability with multiplexed SIMs
+    for (int pass = 0; pass < 3; pass++) {
+        int flushed = 0;
+        while (serial.available() && flushed < UART_FLUSH_ITER) {
+            serial.read();
+            flushed++;
+        }
+        if (flushed > 0) {
+            delay(10);
+        }
     }
 }
 
@@ -316,22 +367,23 @@ bool enableLocalTimestamp() {
 
 bool dialNumber(const char* number) {
     if (!number || !number[0]) return false;
-    
+
     flushSimInput();
-    
-    sim800.print("ATD");
-    sim800.print(number);
-    sim800.println(";");
-    
+
+    HardwareSerial& serial = simSerial();
+    serial.print("ATD");
+    serial.print(number);
+    serial.println(";");
+
     // Wait for response
     sendATCapture("", 5000);
-    
+
     return responseIsOK() || responseContains("OK");
 }
 
 void hangupCall() {
     simBusy = true;
-    sim800.println("ATH");
+    simSerial().println("ATH");
     delay(100);
     flushSimInput();
     simBusy = false;
@@ -445,23 +497,25 @@ bool deleteAllSMS() {
 
 bool sendSMS(const char* number, const char* message) {
     if (!number || !number[0] || !message) return false;
-    
+
     // Set text mode
     if (!setSMSTextMode()) return false;
-    
+
+    HardwareSerial& serial = simSerial();
+
     // Start SMS
-    sim800.print("AT+CMGS=\"");
-    sim800.print(number);
-    sim800.println("\"");
-    
+    serial.print("AT+CMGS=\"");
+    serial.print(number);
+    serial.println("\"");
+
     delay(500);
-    
+
     // Wait for ">" prompt
     unsigned long start = millis();
     bool gotPrompt = false;
     while (millis() - start < 2000) {
-        if (sim800.available()) {
-            char c = (char)sim800.read();
+        if (serial.available()) {
+            char c = (char)serial.read();
             if (c == '>') {
                 gotPrompt = true;
                 break;
@@ -469,16 +523,16 @@ bool sendSMS(const char* number, const char* message) {
         }
         delay(10);
     }
-    
+
     if (!gotPrompt) {
         logMsg("[SMS] No prompt for SMS send");
         return false;
     }
-    
+
     // Send message
-    sim800.print(message);
-    sim800.write(0x1A);  // Ctrl+Z
-    
+    serial.print(message);
+    serial.write(0x1A);  // Ctrl+Z
+
     // Wait for response
     sendATCapture("", 5000);
     
@@ -503,6 +557,21 @@ void setSimBusy(bool busy) {
     simBusy = busy;
 }
 
+// Verify SIM is responsive after MUX switch (with retries)
+bool verifySIMResponsive(int expectedSlot) {
+    extern SimState simStates[];
+    
+    for (int retry = 0; retry < MUX_VERIFY_RETRIES; retry++) {
+        sendATCapture("AT", 500);
+        if (strstr(getSimBuffer(), "OK") != NULL) {
+            return true;
+        }
+        // Re-select and try again
+        delay(100);
+    }
+    return false;
+}
+
 // Check all SIMs on startup - marks responsive SIMs and initializes them
 void checkAllSIMsOnStartup() {
     extern SimState simStates[];
@@ -511,11 +580,21 @@ void checkAllSIMsOnStartup() {
     bool prevYield = gYieldToWebServer;
     gYieldToWebServer = false;
 
-    // Pass 1: probe all SIMs
+    // Pass 1: probe all SIMs with extra settling time
     for (int i = 0; i < SIM_COUNT; i++) {
         selectSIM(i);
-        sendATCapture("AT", 500);
-        bool isResponsive = (strstr(getSimBuffer(), "OK") != NULL);
+        delay(200);  // Extra settling time on first probe
+        
+        // Try multiple times to detect SIM
+        bool isResponsive = false;
+        for (int retry = 0; retry < 3 && !isResponsive; retry++) {
+            sendATCapture("AT", 800);  // Longer timeout
+            isResponsive = (strstr(getSimBuffer(), "OK") != NULL);
+            if (!isResponsive) {
+                delay(200);
+            }
+        }
+        
         simStates[i].responsive = isResponsive;
 
         if (!isResponsive) {
@@ -533,29 +612,33 @@ void checkAllSIMsOnStartup() {
             logMsgInt("[SETUP] SIM not responding:", i + 1);
         }
 
-        delay(100);
+        delay(150);  // Longer delay between SIMs
     }
 
-    // Pass 2: init responsive SIMs
+    // Pass 2: init responsive SIMs with proper delays
     for (int i = 0; i < SIM_COUNT; i++) {
         if (!simStates[i].responsive) continue;
 
         selectSIM(i);
+        delay(200);  // Extra settling time
 
         logMsgInt("[SETUP] SIM init begin:", i + 1);
-        sendATCapture("AT+CPIN?", 700);
-        sendATCapture("AT+CMGF=1", 700);
-        sendATCapture("AT+CSCS=\"GSM\"", 700);
-        sendATCapture("AT+CPMS=\"SM\",\"SM\",\"SM\"", 700);
-        sendATCapture("AT+CNMI=2,1,0,0,0", 700);
-        sendATCapture("AT+CLIP=0", 700);
-        sendATCapture("AT+GSMBUSY=1", 700);
+        
+        // Init with longer timeouts
+        sendATCapture("AT", 800);
+        sendATCapture("AT+CPIN?", 1000);
+        sendATCapture("AT+CMGF=1", 800);
+        sendATCapture("AT+CSCS=\"GSM\"", 800);
+        sendATCapture("AT+CPMS=\"SM\",\"SM\",\"SM\"", 1000);
+        sendATCapture("AT+CNMI=2,1,0,0,0", 800);
+        sendATCapture("AT+CLIP=0", 800);
+        sendATCapture("AT+GSMBUSY=1", 800);
         
         // Debug: Show SMS storage status
-        sendATCapture("AT+CPMS?", 600);
+        sendATCapture("AT+CPMS?", 800);
         logMsgVal("[SETUP] SMS Storage", getSimBuffer());
         // Debug: Show SMSC (SMS center number)
-        sendATCapture("AT+CSCA?", 600);
+        sendATCapture("AT+CSCA?", 800);
         logMsgVal("[SETUP] SMSC", getSimBuffer());
         
         simStates[i].basicInitDone = true;
@@ -564,14 +647,14 @@ void checkAllSIMsOnStartup() {
         sendATCapture("AT+CSQ", 3000);
         charBufSet(simStates[i].csq, sizeof(simStates[i].csq), getSimBuffer());
 
-        sendATCapture("AT+CREG?", 1500);
+        sendATCapture("AT+CREG?", 2000);
         charBufSet(simStates[i].creg, sizeof(simStates[i].creg), getSimBuffer());
         simStates[i].registered = (strstr(simStates[i].creg, "0,1") != NULL || strstr(simStates[i].creg, "0,5") != NULL);
 
-        sendATCapture("AT+COPS?", 1500);
+        sendATCapture("AT+COPS?", 2000);
         charBufSet(simStates[i].cops, sizeof(simStates[i].cops), getSimBuffer());
 
-        sendATCapture("AT+CNUM", 1500);
+        sendATCapture("AT+CNUM", 2000);
         char numBuf[64];
         charBufSet(numBuf, sizeof(numBuf), getSimBuffer());
         const char* numStart = strstr(numBuf, ",\"");
@@ -590,7 +673,7 @@ void checkAllSIMsOnStartup() {
         getBatteryInfo(&simStates[i].batteryPercent, &simStates[i].batteryMv);
         logMsgInt("[SETUP] SIM init complete:", i + 1);
 
-        delay(100);
+        delay(150);  // Longer delay between SIMs
     }
 
     gYieldToWebServer = prevYield;

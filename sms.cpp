@@ -36,6 +36,53 @@ static unsigned long lastPollMs = 0;
 // Queue Functions
 // -----------------------------------------------------------------------------
 
+static bool extractNthQuotedField(const char* s, int fieldIndex, char* out, size_t outSize) {
+    if (!out || outSize < 1) return false;
+    out[0] = '\0';
+    if (!s || fieldIndex < 0) return false;
+
+    int found = 0;
+    const char* p = s;
+    while ((p = strchr(p, '"')) != NULL) {
+        const char* start = p + 1;
+        const char* end = strchr(start, '"');
+        if (!end) break;
+
+        if (found == fieldIndex) {
+            size_t len = (size_t)(end - start);
+            if (len >= outSize) len = outSize - 1;
+            strncpy(out, start, len);
+            out[len] = '\0';
+            charBufTrim(out);
+            return true;
+        }
+
+        found++;
+        p = end + 1;
+    }
+
+    return false;
+}
+
+static bool extractBracketPrefix(const char* msg, char* out, size_t outSize) {
+    if (!out || outSize < 1) return false;
+    out[0] = '\0';
+    if (!msg) return false;
+
+    // Common OTP format: [SHEIN] ...
+    if (msg[0] != '[') return false;
+    const char* end = strchr(msg, ']');
+    if (!end) return false;
+
+    size_t len = (size_t)(end - (msg + 1));
+    if (len == 0) return false;
+    if (len >= outSize) len = outSize - 1;
+    strncpy(out, msg + 1, len);
+    out[len] = '\0';
+    charBufTrim(out);
+    return out[0] != '\0';
+}
+
 void initSMSQueue() {
     pendingCount = 0;
     memset(pendingQueue, 0, sizeof(pendingQueue));
@@ -181,44 +228,46 @@ int parseSMSList(const char* response, SmsMessage* messages, int maxMessages) {
         const char* cmgl = strstr(p, "+CMGL:");
         if (!cmgl) break;
         
-        // Parse: +CMGL: <index>,"<status>","<sender>",,"<timestamp>"
+        // Parse header line:
+        // +CMGL: <index>,"<status>","<sender>","<alpha>","<timestamp>"
         SmsMessage* msg = &messages[count];
         msg->messageIndex = atoi(cmgl + 6);
+        msg->sender[0] = '\0';
+        msg->timestamp[0] = '\0';
+        msg->message[0] = '\0';
+        msg->unread = false;
+
+        // Extract quoted fields robustly from the header
+        // Field 0 = status, 1 = sender, 2 = alpha (optional), 3 = timestamp
+        char status[16] = "";
+        char alpha[32] = "";
         
-        // Find sender
-        const char* q1 = strchr(cmgl, '"');
-        if (q1) {
-            q1 = strchr(q1 + 1, '"');  // Skip status
-            if (q1) {
-                q1 = strchr(q1 + 1, '"');  // Find sender start
-                if (q1) {
-                    q1++;
-                    const char* q2 = strchr(q1, '"');
-                    if (q2) {
-                        size_t len = q2 - q1;
-                        if (len >= PHONE_BUFFER_SIZE) len = PHONE_BUFFER_SIZE - 1;
-                        strncpy(msg->sender, q1, len);
-                        msg->sender[len] = '\0';
-                    }
-                }
+        (void)extractNthQuotedField(cmgl, 0, status, sizeof(status));
+        (void)extractNthQuotedField(cmgl, 1, msg->sender, sizeof(msg->sender));
+        (void)extractNthQuotedField(cmgl, 2, alpha, sizeof(alpha));
+        (void)extractNthQuotedField(cmgl, 3, msg->timestamp, sizeof(msg->timestamp));
+        
+        // If we have an alpha field (branded sender name), use it if sender is numeric/empty
+        if (alpha[0] != '\0' && !charBufIsEmpty(alpha)) {
+            // Alpha field contains the alphanumeric sender (brand name)
+            // Use it if sender is numeric or empty
+            if (charBufIsEmpty(msg->sender) || isPhoneNumber(msg->sender)) {
+                charBufSet(msg->sender, sizeof(msg->sender), alpha);
             }
         }
         
-        // Find timestamp (after sender)
-        const char* ts1 = q1 ? strchr(q1, ',') : NULL;
-        if (ts1) {
-            ts1 = strchr(ts1 + 1, '"');
-            if (ts1) {
-                ts1++;
-                const char* ts2 = strchr(ts1, '"');
-                if (ts2) {
-                    size_t len = ts2 - ts1;
-                    if (len >= 32) len = 31;
-                    strncpy(msg->timestamp, ts1, len);
-                    msg->timestamp[len] = '\0';
-                }
+        // Clean up sender - remove any garbage characters
+        for (size_t i = 0; msg->sender[i] != '\0'; i++) {
+            // Remove control characters and invalid chars
+            if (msg->sender[i] < 32 || msg->sender[i] == ',' || 
+                (msg->sender[i] == '+' && i > 0 && msg->sender[i-1] != '\0')) {
+                msg->sender[i] = '\0';
+                break;
             }
         }
+        charBufTrim(msg->sender);
+        
+        msg->unread = (strcmp(status, "REC UNREAD") == 0 || strstr(cmgl, "REC UNREAD") != NULL);
         
         // Find message body (after header line)
         const char* newline = strchr(cmgl, '\n');
@@ -240,8 +289,6 @@ int parseSMSList(const char* response, SmsMessage* messages, int maxMessages) {
             msg->message[len] = '\0';
         }
         
-        msg->unread = (strstr(cmgl, "REC UNREAD") != NULL);
-        
         p = cmgl + 1;
         count++;
     }
@@ -257,9 +304,44 @@ void processIncomingSMS(int simSlot, const SmsMessage* msg) {
     totalReceived++;
     
     // Log
-    logMsgInt("[SMS] Received on SIM", simSlot + 1);
-    logMsgVal("[SMS] From", msg->sender);
-    appendMonitorLogVal("[SMS] From ", msg->sender);
+    logMsgIntVal("[SMS] SIM", simSlot + 1, "Num", simStates[simSlot].number);
+
+    char rawSender[PHONE_BUFFER_SIZE];
+    charBufSet(rawSender, sizeof(rawSender), msg->sender);
+    
+    // Defensive cleanup: some networks/modems can yield odd sender strings.
+    // Keep only the first token and avoid mid-string '+' that can appear from corrupted parses.
+    for (size_t i = 0; rawSender[i] != '\0'; i++) {
+        if (rawSender[i] == ',' || rawSender[i] == '\r' || rawSender[i] == '\n') {
+            rawSender[i] = '\0';
+            break;
+        }
+        if (rawSender[i] == '+' && i > 0) {
+            rawSender[i] = '\0';
+            break;
+        }
+    }
+    charBufTrim(rawSender);
+
+    char senderDisplay[PHONE_BUFFER_SIZE];
+    charBufSet(senderDisplay, sizeof(senderDisplay), rawSender);
+    char brand[PHONE_BUFFER_SIZE];
+    if (extractBracketPrefix(msg->message, brand, sizeof(brand))) {
+        // If sender is numeric/shortcode, prefer bracket prefix for display
+        if (isPhoneNumber(rawSender)) {
+            charBufSet(senderDisplay, sizeof(senderDisplay), brand);
+        }
+    }
+
+    if (strcmp(senderDisplay, rawSender) != 0) {
+        logMsg2Val("[SMS] From", senderDisplay, "Raw", rawSender);
+    } else {
+        logMsgVal("[SMS] From", senderDisplay);
+    }
+
+    char monLine[96];
+    snprintf(monLine, sizeof(monLine), "[SMS] SIM%d ", simSlot + 1);
+    appendMonitorLogVal(monLine, senderDisplay);
 
     // Add message preview to monitor (clip to avoid huge log lines)
     char preview[96];
@@ -505,22 +587,32 @@ void pollSIMsForSMS() {
             continue;
         }
         
-        // Select SIM and do basic init if needed
+        // Select SIM and verify it's responsive
         selectSIM(slot);
+        delay(100);  // Extra settling time after MUX switch
+        
+        // Verify SIM is responsive before polling
+        sendATCapture("AT", 500);
+        if (!strstr(getSimBuffer(), "OK")) {
+            logMsgInt("[SMS] SIM not responding during poll:", slot + 1);
+            continue;  // Skip this SIM
+        }
         
         if (!simStates[slot].basicInitDone) {
-            sendATCapture("AT", 400);
-            sendATCapture("AT+CMGF=1", 600);
+            sendATCapture("AT", 500);
+            sendATCapture("AT+CMGF=1", 800);
             // Set SMS storage to SIM memory
-            sendATCapture("AT+CPMS=\"SM\",\"SM\",\"SM\"", 600);
+            sendATCapture("AT+CPMS=\"SM\",\"SM\",\"SM\"", 800);
             // Enable new SMS indications - store to SIM
-            sendATCapture("AT+CNMI=2,1,0,0,0", 600);
+            sendATCapture("AT+CNMI=2,1,0,0,0", 800);
+            // Set character set to GSM for proper sender decoding
+            sendATCapture("AT+CSCS=\"GSM\"", 800);
             
             // Debug: Show SMS storage status
-            sendATCapture("AT+CPMS?", 600);
+            sendATCapture("AT+CPMS?", 800);
             logMsgVal("[SMS] Storage", getSimBuffer());
             // Debug: Show SMSC (SMS center number)
-            sendATCapture("AT+CSCA?", 600);
+            sendATCapture("AT+CSCA?", 800);
             logMsgVal("[SMS] SMSC", getSimBuffer());
             
             simStates[slot].basicInitDone = true;
@@ -530,7 +622,7 @@ void pollSIMsForSMS() {
         // AT+CMGL="ALL" returns all stored messages (more reliable than REC UNREAD)
         // Format: +CMGL: <index>,"status","sender","","timestamp"<CR><LF>body<CR><LF>
         logMsgInt("[SMS] Polling SIM", slot + 1);
-        sendATCapture("AT+CMGL=\"ALL\"", 6000);  // 6 second timeout like original
+        sendATCapture("AT+CMGL=\"ALL\"", 8000);  // 8 second timeout for reliability
         
         char* buf = getSimBuffer();
         
@@ -550,8 +642,8 @@ void pollSIMsForSMS() {
             logMsgInt("[SMS] Found messages on SIM", slot + 1);
             
             // Parse and process (static + small to avoid stack overflow)
-            static SmsMessage messages[3];
-            int count = parseSMSList(buf, messages, 3);
+            static SmsMessage messages[5];  // Increased from 3 to 5
+            int count = parseSMSList(buf, messages, 5);
             
             for (int j = 0; j < count; j++) {
                 messages[j].simSlot = slot;
@@ -561,13 +653,13 @@ void pollSIMsForSMS() {
             // No messages, just OK
 
             // Some SIMs store SMS in ME; try once per cycle as a fallback
-            sendATCapture("AT+CPMS=\"ME\",\"ME\",\"ME\"", 600);
-            sendATCapture("AT+CMGL=\"ALL\"", 6000);
+            sendATCapture("AT+CPMS=\"ME\",\"ME\",\"ME\"", 800);
+            sendATCapture("AT+CMGL=\"ALL\"", 8000);
             char* buf2 = getSimBuffer();
             if (strstr(buf2, "+CMGL:") != NULL) {
                 logMsgInt("[SMS] Found messages on SIM (ME)", slot + 1);
-                static SmsMessage messages[3];
-                int count = parseSMSList(buf2, messages, 3);
+                static SmsMessage messages[5];
+                int count = parseSMSList(buf2, messages, 5);
                 for (int j = 0; j < count; j++) {
                     messages[j].simSlot = slot;
                     processIncomingSMS(slot, &messages[j]);
@@ -583,8 +675,8 @@ void pollSIMsForSMS() {
             logMsgInt("[SMS] Poll error on SIM", slot + 1);
         }
         
-        // Small delay between SIMs
-        delay(100);
+        // Longer delay between SIMs for stability
+        delay(150);
     }
     
     // Move to next SIM for next cycle

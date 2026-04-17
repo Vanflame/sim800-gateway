@@ -11,17 +11,33 @@
 // -----------------------------------------------------------------------------
 // Hardware Serial Pins (ESP32)
 // -----------------------------------------------------------------------------
+// Set to 1 to use two independent SIM800L modules on two UARTs (no mux).
+// Set to 0 to use the CD74HC4067 mux (single UART shared across SIM slots).
+#define USE_DUAL_UART   1
+
+#define UART_BAUD_RATE  115200
+
+// Mux mode (single UART)
 #define UART_RX_PIN     4       // GPIO4 - RX from multiplexer
 #define UART_TX_PIN     5       // GPIO5 - TX to all SIM RX (shared)
-#define UART_BAUD_RATE  115200
+
+// Dual-UART mode (two independent UARTs)
+// SIM800L #1
+#define UART1_RX_PIN    4
+#define UART1_TX_PIN    5
+// SIM800L #2
+#define UART2_RX_PIN    16
+#define UART2_TX_PIN    17
 
 // -----------------------------------------------------------------------------
 // Multiplexer Control Pins (CD74HC4067)
 // -----------------------------------------------------------------------------
+#if !USE_DUAL_UART
 #define MUX_S0          16      // GPIO16
 #define MUX_S1          17      // GPIO17
 #define MUX_S2          18      // GPIO18
 #define MUX_S3          19      // GPIO19
+#endif
 
 // -----------------------------------------------------------------------------
 // Reset Pin (for SIM reset via secondary multiplexer)
@@ -31,9 +47,15 @@
 // -----------------------------------------------------------------------------
 // SIM Configuration
 // -----------------------------------------------------------------------------
+#if USE_DUAL_UART
+#define SIM_COUNT       2       // Two SIM800L modules
+#else
 #define SIM_COUNT       16      // Total number of SIM slots
-#define MUX_SETTLE_MS   300     // Delay after switching MUX channel (ms)
-#define UART_FLUSH_ITER 100    // Max iterations when flushing UART
+#endif
+#define MUX_SETTLE_MS   500     // Delay after switching MUX channel (ms) - increased for stability
+#define MUX_VERIFY_RETRIES 3    // Number of retries to verify SIM after switch
+#define UART_FLUSH_ITER 200    // Max iterations when flushing UART - increased
+#define UART_FLUSH_WAIT_MS 50  // Wait time during UART flush
 
 // -----------------------------------------------------------------------------
 // Timing Intervals (ms)
