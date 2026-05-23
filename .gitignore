@@ -1,9 +1,4 @@
-# Arduino / ESP32 build output
-build/
-*.elf
-*.bin
-*.map
-*.hex
+
 
 # IDE
 .vscode/

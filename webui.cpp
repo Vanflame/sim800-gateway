@@ -3543,7 +3543,7 @@ void handleAgentConfig() {
         charBufSet(agentApiPath, sizeof(agentApiPath), server.arg("api_path").c_str());
     }
     if (server.hasArg("device_id")) {
-        const String devId = server.arg("device_id");
+        String devId = server.arg("device_id");
         devId.trim();
         if (devId.length() > 0) {
             charBufSet(agentDeviceId, sizeof(agentDeviceId), devId.c_str());
