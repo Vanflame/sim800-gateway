@@ -9,8 +9,17 @@
 
 #if !USE_DUAL_UART
 
-// Current channel tracking
-static int currentChannel = 0;
+// Logical slot -> mux channel (see config.h SLOT_TO_MUX_CHANNEL_INIT)
+static const uint8_t SLOT_TO_MUX_CHANNEL[SIM_COUNT] = SLOT_TO_MUX_CHANNEL_INIT;
+
+// Current logical slot tracking
+static int currentLogicalSlot = 0;
+
+int logicalSlotToMuxChannel(int logicalSlot) {
+    if (logicalSlot < 0) logicalSlot = 0;
+    if (logicalSlot >= SIM_COUNT) logicalSlot = SIM_COUNT - 1;
+    return (int)SLOT_TO_MUX_CHANNEL[logicalSlot];
+}
 
 // -----------------------------------------------------------------------------
 // Initialization
@@ -37,21 +46,23 @@ void initMux() {
 // Channel Selection
 // -----------------------------------------------------------------------------
 
-void selectSIM(int channel) {
+void selectSIM(int logicalSlot) {
     // Clamp to valid range
-    if (channel < 0) channel = 0;
-    if (channel >= SIM_COUNT) channel = SIM_COUNT - 1;
+    if (logicalSlot < 0) logicalSlot = 0;
+    if (logicalSlot >= SIM_COUNT) logicalSlot = SIM_COUNT - 1;
 
-    // Skip if already on this channel
-    if (currentChannel == channel) {
+    // Skip if already on this logical slot
+    if (currentLogicalSlot == logicalSlot) {
         return;
     }
 
-    // Set S0-S3 based on channel bits
-    digitalWrite(MUX_S0, (channel & 0x01) ? HIGH : LOW);
-    digitalWrite(MUX_S1, (channel & 0x02) ? HIGH : LOW);
-    digitalWrite(MUX_S2, (channel & 0x04) ? HIGH : LOW);
-    digitalWrite(MUX_S3, (channel & 0x08) ? HIGH : LOW);
+    const int muxChannel = logicalSlotToMuxChannel(logicalSlot);
+
+    // Set S0-S3 from mux channel bits (not logical slot index)
+    digitalWrite(MUX_S0, (muxChannel & 0x01) ? HIGH : LOW);
+    digitalWrite(MUX_S1, (muxChannel & 0x02) ? HIGH : LOW);
+    digitalWrite(MUX_S2, (muxChannel & 0x04) ? HIGH : LOW);
+    digitalWrite(MUX_S3, (muxChannel & 0x08) ? HIGH : LOW);
 
     // Wait for MUX to settle (longer for stability)
     delay(MUX_SETTLE_MS);
@@ -70,26 +81,26 @@ void selectSIM(int channel) {
         }
     }
 
-    currentChannel = channel;
+    currentLogicalSlot = logicalSlot;
 }
 
 // -----------------------------------------------------------------------------
 
-int getCurrentMuxChannel() {
-    return currentChannel;
+int getCurrentLogicalSlot() {
+    return currentLogicalSlot;
 }
 
 // -----------------------------------------------------------------------------
 // Reset Control
 // -----------------------------------------------------------------------------
 
-void resetSIM(int channel) {
-    if (!isValidChannel(channel)) return;
+void resetSIM(int logicalSlot) {
+    if (!isValidChannel(logicalSlot)) return;
 
-    logMsgInt("[MUX] Resetting SIM", channel + 1);
+    logMsgInt("[MUX] Resetting SIM", logicalSlot + 1);
 
-    // Select the channel first
-    selectSIM(channel);
+    // Select the logical slot first (maps to correct mux channel)
+    selectSIM(logicalSlot);
 
     // Toggle reset line
     digitalWrite(RESET_PIN, LOW);
@@ -99,7 +110,7 @@ void resetSIM(int channel) {
     // Wait for SIM to boot
     delay(6000);
 
-    logMsgInt("[MUX] SIM reset complete", channel + 1);
+    logMsgInt("[MUX] SIM reset complete", logicalSlot + 1);
 }
 
 #endif // !USE_DUAL_UART

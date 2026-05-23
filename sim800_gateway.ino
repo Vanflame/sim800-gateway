@@ -18,11 +18,13 @@
 #include "webui.h"
 #include "logger.h"
 #include "utils.h"
+#include "ota.h"
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
+#include <LittleFS.h>
 #include <time.h>
 
 // -----------------------------------------------------------------------------
@@ -34,6 +36,8 @@ PendingSms pendingSmsQueue[MAX_PENDING_SMS];
 CallLogItem callLog[MAX_CALL_LOG];
 int pendingSmsCount = 0;
 int callLogCount = 0;
+ActiveSession activeSessions[8];  // Max 8 concurrent sessions
+int activeSessionCount = 0;
 int activeSim = 0;
 int currentMuxSim = 0;
 volatile bool simBusy = false;
@@ -46,6 +50,10 @@ bool simRegistered = false;
 // Monitor log
 char monitorLog[MONITOR_LOG_MAX_SIZE][160];
 int monitorLogCount = 0;
+
+// Error log (persistent, longer messages)
+char errorLog[ERROR_LOG_MAX_SIZE][ERROR_LOG_LINE_SIZE];
+int errorLogCount = 0;
 
 // Timing
 unsigned long lastHeartbeatMs = 0;
@@ -79,6 +87,182 @@ bool ntpConfigured = false;
 
 Preferences preferences;
 
+// Persistent statistics (stored in NVS)
+unsigned long persistentReceived = 0;
+unsigned long persistentForwarded = 0;
+unsigned long persistentFailed = 0;
+
+// -----------------------------------------------------------------------------
+// Persistent Storage Functions
+// -----------------------------------------------------------------------------
+
+void loadPersistentStats() {
+    preferences.begin("gateway", true);  // read-only
+    persistentReceived = preferences.getULong("received", 0);
+    persistentForwarded = preferences.getULong("forwarded", 0);
+    persistentFailed = preferences.getULong("failed", 0);
+    preferences.end();
+    
+    logMsgInt("[STORE] Loaded stats - Received:", (int)persistentReceived);
+}
+
+void savePersistentStats() {
+    preferences.begin("gateway", false);  // read-write
+    preferences.putULong("received", persistentReceived);
+    preferences.putULong("forwarded", persistentForwarded);
+    preferences.putULong("failed", persistentFailed);
+    preferences.end();
+}
+
+// Append SMS to persistent file
+void appendSmsToFile(const char* time, int simSlot, const char* number, const char* sender, const char* message) {
+    File file = LittleFS.open("/messages.log", "a");
+    if (!file) {
+        logMsg("[STORE] Failed to open messages.log");
+        return;
+    }
+    
+    // Format: timestamp|sim|number|sender|message\n
+    file.print(time);
+    file.print("|");
+    file.print(simSlot);
+    file.print("|");
+    file.print(number);
+    file.print("|");
+    file.print(sender);
+    file.print("|");
+    file.println(message);
+    file.close();
+}
+
+// Read SMS messages from file (returns count, fills buffer)
+int readSmsFromFile(char* buf, size_t bufSize, int maxMessages) {
+    if (!LittleFS.exists("/messages.log")) {
+        return 0;
+    }
+    
+    File file = LittleFS.open("/messages.log", "r");
+    if (!file) return 0;
+    
+    // Read file in chunks, keeping only last maxMessages
+    int count = 0;
+    size_t pos = 0;
+    buf[0] = '\0';
+    
+    // Simple approach: read and count, then seek back
+    file.seek(0, SeekEnd);
+    size_t fileSize = file.position();
+    file.seek(0, SeekSet);
+    
+    // If file is small enough, just read it all
+    if (fileSize < bufSize) {
+        while (file.available() && pos < bufSize - 1) {
+            buf[pos++] = file.read();
+        }
+        buf[pos] = '\0';
+        
+        // Count newlines
+        for (size_t i = 0; buf[i]; i++) {
+            if (buf[i] == '\n') count++;
+        }
+    } else {
+        // For large files, read from end
+        // Find start of last maxMessages lines
+        int linesFound = 0;
+        size_t readPos = fileSize;
+        char chunk[128];
+        
+        while (readPos > 0 && linesFound < maxMessages) {
+            size_t chunkSize = (readPos > sizeof(chunk)) ? sizeof(chunk) : readPos;
+            readPos -= chunkSize;
+            file.seek(readPos, SeekSet);
+            file.readBytes(chunk, chunkSize);
+            
+            for (int i = chunkSize - 1; i >= 0 && linesFound < maxMessages; i--) {
+                if (chunk[i] == '\n') linesFound++;
+            }
+        }
+        
+        // Now read from that position
+        file.seek(readPos, SeekSet);
+        while (file.available() && pos < bufSize - 1) {
+            buf[pos++] = file.read();
+        }
+        buf[pos] = '\0';
+        count = linesFound;
+    }
+    
+    file.close();
+    return count;
+}
+
+// Append error to persistent file
+void appendErrorToFile(const char* time, const char* error) {
+    File file = LittleFS.open("/errors.log", "a");
+    if (!file) return;
+    
+    file.print(time);
+    file.print("|");
+    file.println(error);
+    file.close();
+}
+
+// Read errors from persistent file
+int readErrorsFromFile(char* buf, size_t bufSize, int maxErrors) {
+    if (!LittleFS.exists("/errors.log")) {
+        return 0;
+    }
+    
+    File file = LittleFS.open("/errors.log", "r");
+    if (!file) return 0;
+    
+    int count = 0;
+    size_t pos = 0;
+    buf[0] = '\0';
+    
+    file.seek(0, SeekEnd);
+    size_t fileSize = file.position();
+    file.seek(0, SeekSet);
+    
+    // If file is small enough, just read it all
+    if (fileSize < bufSize) {
+        while (file.available() && pos < bufSize - 1) {
+            buf[pos++] = file.read();
+        }
+        buf[pos] = '\0';
+        
+        for (size_t i = 0; buf[i]; i++) {
+            if (buf[i] == '\n') count++;
+        }
+    } else {
+        // For large files, read from end
+        int linesFound = 0;
+        size_t readPos = fileSize;
+        char chunk[128];
+        
+        while (readPos > 0 && linesFound < maxErrors) {
+            size_t chunkSize = (readPos > sizeof(chunk)) ? sizeof(chunk) : readPos;
+            readPos -= chunkSize;
+            file.seek(readPos, SeekSet);
+            file.readBytes(chunk, chunkSize);
+            
+            for (int i = chunkSize - 1; i >= 0 && linesFound < maxErrors; i--) {
+                if (chunk[i] == '\n') linesFound++;
+            }
+        }
+        
+        file.seek(readPos, SeekSet);
+        while (file.available() && pos < bufSize - 1) {
+            buf[pos++] = file.read();
+        }
+        buf[pos] = '\0';
+        count = linesFound;
+    }
+    
+    file.close();
+    return count;
+}
+
 // -----------------------------------------------------------------------------
 // Setup
 // -----------------------------------------------------------------------------
@@ -102,6 +286,10 @@ void setup() {
         simStates[i].registered = false;
         simStates[i].backendRegistered = false;
         simStates[i].errorCount = 0;
+        simStates[i].consecutiveErrors = 0;
+        simStates[i].signalStrength = -1;
+        simStates[i].networkType[0] = '\0';
+        simStates[i].lastSuccessfulPoll = 0;
         charBufClear(simStates[i].number, sizeof(simStates[i].number));
         charBufClear(simStates[i].creg, sizeof(simStates[i].creg));
         charBufClear(simStates[i].cops, sizeof(simStates[i].cops));
@@ -110,8 +298,20 @@ void setup() {
     
     // Load settings
     loadSettings();
+    otaLoadUrlFromPreferences();
     appendMonitorLog("[BOOT] Settings loaded");
-
+    
+    // Initialize LittleFS for persistent storage
+    if (!LittleFS.begin(true)) {
+        Serial.println("[STORE] LittleFS mount failed, formatting...");
+        appendMonitorLog("[STORE] LittleFS format needed");
+    } else {
+        Serial.println("[STORE] LittleFS mounted");
+    }
+    
+    // Load persistent statistics
+    loadPersistentStats();
+    
     // Initialize WiFi
     initWiFi();
     appendMonitorLog(WiFi.isConnected() ? "[WIFI] Connected" : "[WIFI] AP mode");
@@ -175,6 +375,22 @@ void loop() {
     if (now - lastBatteryMs > BATTERY_INFO_INTERVAL_MS) {
         lastBatteryMs = now;
         updateBatteryInfo();
+    }
+    
+    // SIM watchdog - check for unresponsive SIMs and attempt recovery
+    static unsigned long lastWatchdogMs = 0;
+    if (now - lastWatchdogMs > 30000) {  // Check every 30 seconds
+        lastWatchdogMs = now;
+        checkAndRecoverUnresponsiveSims();
+    }
+    
+    // Periodic signal strength update for all SIMs
+    static unsigned long lastSignalUpdateMs = 0;
+    static int signalUpdateSimIdx = 0;
+    if (now - lastSignalUpdateMs > 5000) {  // Update one SIM every 5 seconds
+        lastSignalUpdateMs = now;
+        updateSimSignalStrength(signalUpdateSimIdx);
+        signalUpdateSimIdx = (signalUpdateSimIdx + 1) % SIM_COUNT;
     }
     
     // Small delay to prevent tight loops
@@ -346,16 +562,32 @@ void performHeartbeat() {
         http.addHeader("x-heartbeat-debug", "1");
     }
 
-    // Backend expects { device_id, sims:[{number,slot,status}] }
-    static char body[2048];
+    // Backend expects { device_id, battery_level, sims:[{number,slot,status,signal_strength,network_type}] }
+    static char body[3072];  // Reduced from 4096
+    
+    // Find lowest battery percentage among all responsive SIMs
+    int lowestBatteryPercent = 100;
+    for (int i = 0; i < SIM_COUNT; i++) {
+        if (!simStates[i].enabled) continue;
+        if (!simStates[i].responsive) continue;
+        if (simStates[i].batteryPercent > 0 && simStates[i].batteryPercent < lowestBatteryPercent) {
+            lowestBatteryPercent = simStates[i].batteryPercent;
+        }
+    }
+    // If no SIM has battery info, use ESP32's battery (if available)
+    if (lowestBatteryPercent == 100 && batteryPercent > 0) {
+        lowestBatteryPercent = batteryPercent;
+    }
+    
     size_t pos = 0;
     pos += snprintf(body + pos, sizeof(body) - pos,
-        "{\"device_id\":\"%s\",\"sims\":[",
-        agentDeviceId
+        "{\"device_id\":\"%s\",\"battery_level\":%d,\"sims\":[",
+        agentDeviceId,
+        lowestBatteryPercent
     );
 
     bool first = true;
-    for (int i = 0; i < SIM_COUNT && pos < sizeof(body) - 200; i++) {
+    for (int i = 0; i < SIM_COUNT && pos < sizeof(body) - 300; i++) {
         if (!simStates[i].enabled) continue;
         if (!simStates[i].responsive) continue;
         if (charBufIsEmpty(simStates[i].number)) continue;
@@ -368,10 +600,19 @@ void performHeartbeat() {
         char normalizedNum[PHONE_BUFFER_SIZE];
         normalizeSimNumber(simStates[i].number, normalizedNum, sizeof(normalizedNum));
         jsonEscape(normalizedNum, numEsc, sizeof(numEsc));
+        
+        // Get signal strength from CSQ
+        int signal = extractSignalQuality(simStates[i].csq);
+        
+        // Get network type (SIM800L is 2G only)
+        const char* netType = simStates[i].networkType[0] ? simStates[i].networkType : "2G";
+        
         pos += snprintf(body + pos, sizeof(body) - pos,
-            "{\"number\":%s,\"slot\":%d,\"status\":\"ACTIVE\"}",
+            "{\"number\":%s,\"slot\":%d,\"status\":\"ACTIVE\",\"signal_strength\":%d,\"network_type\":\"%s\"}",
             numEsc,
-            i + 1
+            i,
+            signal,
+            netType
         );
     }
 
@@ -426,6 +667,7 @@ void performHeartbeat() {
     if (code < 0) {
         logMsgInt("[HEARTBEAT] Failed, code", code);
         appendMonitorLogInt("[HEARTBEAT] Failed", code);
+        appendErrorLogInt("[HEARTBEAT] Connection failed", code);
         clientSecure.stop();
         client.stop();
         httpsBusy = false;
@@ -465,6 +707,7 @@ void performHeartbeat() {
     } else {
         logMsgInt("[HEARTBEAT] Failed, code", code);
         appendMonitorLogInt("[HEARTBEAT] Failed", code);
+        appendErrorLogInt("[HEARTBEAT] HTTP error", code);
     }
 
     if (HEARTBEAT_DEBUG) {
@@ -530,8 +773,7 @@ void performHeartbeat() {
                         }
                     }
 
-                    if (slot >= 1 && slot <= SIM_COUNT && status[0] != '\0') {
-                        int idx = slot - 1;
+                    if (slot >= 0 && slot < SIM_COUNT && status[0] != '\0') {
                         bool shouldEnable = (strcmp(status, "ACTIVE") == 0 || strcmp(status, "IN_USE") == 0);
 
                         if (HEARTBEAT_DEBUG) {
@@ -541,7 +783,7 @@ void performHeartbeat() {
                             logMsg(dbgLine);
                         }
 
-                        simStates[idx].enabled = shouldEnable;
+                        simStates[slot].enabled = shouldEnable;
                         if (!shouldEnable) {
                             appendMonitorLogVal("[HEARTBEAT] Backend disabled SIM", String(slot).c_str());
                             // Do NOT clear state - keep number so SIM can be re-enabled and resent in next heartbeat
@@ -553,8 +795,155 @@ void performHeartbeat() {
                 }
             }
         }
+
+        // Parse activeSessions from response
+        activeSessionCount = 0;
+        const char* sessionsKey = strstr(s, "\"activeSessions\"");
+        if (sessionsKey) {
+            const char* p2 = strchr(sessionsKey, '[');
+            if (p2) {
+                p2++;
+                while (*p2 && *p2 != ']' && activeSessionCount < 8) {
+                    const char* objStart = strchr(p2, '{');
+                    if (!objStart) break;
+                    const char* objEnd = strchr(objStart, '}');
+                    if (!objEnd) break;
+
+                    ActiveSession* sess = &activeSessions[activeSessionCount];
+                    memset(sess, 0, sizeof(ActiveSession));
+
+                    // Extract sessionId
+                    const char* idKey = strstr(objStart, "\"sessionId\"");
+                    if (idKey && idKey < objEnd) {
+                        const char* colon = strchr(idKey, ':');
+                        if (colon && colon < objEnd) {
+                            const char* vStart = strchr(colon, '"');
+                            if (vStart && vStart < objEnd) {
+                                vStart++;
+                                const char* vEnd = strchr(vStart, '"');
+                                if (vEnd && vEnd < objEnd) {
+                                    int len = (int)(vEnd - vStart);
+                                    if (len > 0 && len < 64) {
+                                        strncpy(sess->sessionId, vStart, len);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Extract simNumber
+                    const char* numKey = strstr(objStart, "\"simNumber\"");
+                    if (numKey && numKey < objEnd) {
+                        const char* colon = strchr(numKey, ':');
+                        if (colon && colon < objEnd) {
+                            const char* vStart = strchr(colon, '"');
+                            if (vStart && vStart < objEnd) {
+                                vStart++;
+                                const char* vEnd = strchr(vStart, '"');
+                                if (vEnd && vEnd < objEnd) {
+                                    int len = (int)(vEnd - vStart);
+                                    if (len > 0 && len < PHONE_BUFFER_SIZE) {
+                                        strncpy(sess->simNumber, vStart, len);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Extract appName
+                    const char* appKey = strstr(objStart, "\"appName\"");
+                    if (appKey && appKey < objEnd) {
+                        const char* colon = strchr(appKey, ':');
+                        if (colon && colon < objEnd) {
+                            const char* vStart = strchr(colon, '"');
+                            if (vStart && vStart < objEnd) {
+                                vStart++;
+                                const char* vEnd = strchr(vStart, '"');
+                                if (vEnd && vEnd < objEnd) {
+                                    int len = (int)(vEnd - vStart);
+                                    if (len > 0 && len < 32) {
+                                        strncpy(sess->appName, vStart, len);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Extract slot
+                    const char* slotKey = strstr(objStart, "\"slot\"");
+                    if (slotKey && slotKey < objEnd) {
+                        const char* colon = strchr(slotKey, ':');
+                        if (colon && colon < objEnd) {
+                            sess->slot = atoi(colon + 1);
+                        }
+                    }
+
+                    // Extract messageCount
+                    const char* msgKey = strstr(objStart, "\"messageCount\"");
+                    if (msgKey && msgKey < objEnd) {
+                        const char* colon = strchr(msgKey, ':');
+                        if (colon && colon < objEnd) {
+                            sess->messageCount = atoi(colon + 1);
+                        }
+                    }
+
+                    // Extract expiresAt (ISO format: 2026-05-07T16:30:00.000Z or +00:00)
+                    const char* expKey = strstr(objStart, "\"expiresAt\"");
+                    if (expKey && expKey < objEnd) {
+                        const char* colon = strchr(expKey, ':');
+                        if (colon && colon < objEnd) {
+                            const char* vStart = strchr(colon, '"');
+                            if (vStart && vStart < objEnd) {
+                                vStart++;
+                                const char* vEnd = strchr(vStart, '"');
+                                if (vEnd && vEnd < objEnd) {
+                                    // Parse ISO timestamp: YYYY-MM-DDTHH:MM:SS
+                                    int year, month, day, hour, min, sec;
+                                    if (sscanf(vStart, "%d-%d-%dT%d:%d:%d", &year, &month, &day, &hour, &min, &sec) >= 6) {
+                                        // Manual UTC to Unix timestamp conversion
+                                        // Days per month (non-leap year)
+                                        static const int daysInMonth[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+
+                                        // Calculate days since 1970-01-01
+                                        long days = 0;
+
+                                        // Add days for complete years
+                                        for (int y = 1970; y < year; y++) {
+                                            days += 365;
+                                            // Leap year check
+                                            if ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)) {
+                                                days += 1;
+                                            }
+                                        }
+
+                                        // Add days for complete months in current year
+                                        for (int m = 1; m < month; m++) {
+                                            days += daysInMonth[m - 1];
+                                            // February in leap year
+                                            if (m == 2 && ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0))) {
+                                                days += 1;
+                                            }
+                                        }
+
+                                        // Add days in current month
+                                        days += day - 1;
+
+                                        // Convert to Unix timestamp (seconds)
+                                        time_t ts = days * 86400L + hour * 3600L + min * 60L + sec;
+                                        sess->expiresAtMs = ts * 1000L;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    activeSessionCount++;
+                    p2 = objEnd + 1;
+                }
+            }
+        }
     }
-    
+
     if (code > 0 && code < 400) {
         deviceRegistered = true;
         logMsgInt("[HEARTBEAT] OK, code", code);
@@ -573,6 +962,245 @@ void updateBatteryInfo() {
     setSimBusy(true);
     selectSIM(activeSim);
     getBatteryInfo(&batteryPercent, &batteryMv);
+    setSimBusy(false);
+}
+
+// -----------------------------------------------------------------------------
+// SIM Watchdog - Detect and recover unresponsive SIMs
+// -----------------------------------------------------------------------------
+
+void checkAndRecoverUnresponsiveSims() {
+    if (isSimBusy()) return;
+    
+    unsigned long now = millis();
+    
+    for (int i = 0; i < SIM_COUNT; i++) {
+        // Skip disabled SIMs
+        if (!simStates[i].enabled) continue;
+        
+        // For unresponsive SIMs, retry every 5 minutes
+        if (!simStates[i].responsive) {
+            // Check if we should retry this unresponsive SIM
+            static unsigned long lastUnresponsiveRetry[SIM_COUNT] = {0};
+            if (now - lastUnresponsiveRetry[i] < 300000) {  // 5 minutes
+                continue;
+            }
+            lastUnresponsiveRetry[i] = now;
+            
+            // Try to recover unresponsive SIM
+            appendMonitorLogInt("[WATCHDOG] Retrying unresponsive SIM", i + 1);
+            logMsgInt("[WATCHDOG] Retrying unresponsive SIM", i + 1);
+            
+            setSimBusy(true);
+            selectSIM(i);
+            delay(500);
+            
+            // Try aggressive recovery
+            initMux();
+            delay(100);
+            flushSimInput();
+            delay(100);
+            selectSIM(i);
+            delay(500);
+            
+            bool recovered = false;
+            for (int retry = 0; retry < 5 && !recovered; retry++) {
+                flushSimInput();
+                sendATCapture("AT", 2000);
+                if (strstr(getSimBuffer(), "OK") != NULL) {
+                    recovered = true;
+                } else {
+                    selectSIM(i);
+                    delay(300);
+                }
+            }
+            
+            if (recovered) {
+                // Full re-initialization
+                sendATCapture("AT", 1000);
+                sendATCapture("AT+CPIN?", 2000);
+                sendATCapture("AT+CMGF=1", 800);
+                sendATCapture("AT+CSCS=\"GSM\"", 800);
+                sendATCapture("AT+CPMS=\"SM\",\"SM\",\"SM\"", 1000);
+                sendATCapture("AT+CNMI=2,1,0,0,0", 800);
+                
+                sendATCapture("AT+CSQ", 2000);
+                charBufSet(simStates[i].csq, sizeof(simStates[i].csq), getSimBuffer());
+                simStates[i].signalStrength = extractSignalQuality(simStates[i].csq);
+                
+                simStates[i].consecutiveErrors = 0;
+                simStates[i].errorCount = 0;
+                simStates[i].lastSuccessfulPoll = millis();
+                simStates[i].responsive = true;
+                simStates[i].basicInitDone = true;
+                
+                appendMonitorLogInt("[WATCHDOG] Unresponsive SIM recovered", i + 1);
+                logMsgInt("[WATCHDOG] Unresponsive SIM recovered", i + 1);
+            }
+            
+            setSimBusy(false);
+            delay(100);
+            continue;
+        }
+        
+        // Check if SIM has too many consecutive errors or hasn't responded in a while
+        bool needsRecovery = false;
+        
+        // Condition 1: Too many consecutive errors
+        if (simStates[i].consecutiveErrors >= SIM_CONSECUTIVE_ERROR_THRESHOLD) {
+            needsRecovery = true;
+            appendMonitorLogInt("[WATCHDOG] SIM has consecutive errors", i + 1);
+            appendErrorLogInt("[WATCHDOG] SIM consecutive errors", i + 1);
+        }
+        
+        // Condition 2: No successful poll for too long (watchdog timeout)
+        if (simStates[i].lastSuccessfulPoll > 0 && 
+            (now - simStates[i].lastSuccessfulPoll) > SIM_WATCHDOG_TIMEOUT_MS) {
+            needsRecovery = true;
+            appendMonitorLogInt("[WATCHDOG] SIM watchdog timeout", i + 1);
+            appendErrorLogInt("[WATCHDOG] SIM watchdog timeout", i + 1);
+        }
+        
+        if (!needsRecovery) continue;
+        
+        // Attempt recovery
+        appendMonitorLogInt("[WATCHDOG] Attempting recovery for SIM", i + 1);
+        logMsgInt("[WATCHDOG] Recovering SIM", i + 1);
+        
+        setSimBusy(true);
+        selectSIM(i);
+        delay(MUX_SETTLE_MS);
+        
+        // Try to ping the SIM multiple times
+        bool recovered = false;
+        for (int retry = 0; retry < 3 && !recovered; retry++) {
+            sendATCapture("AT", 1000);
+            if (strstr(getSimBuffer(), "OK") != NULL) {
+                recovered = true;
+            } else {
+                delay(500);
+            }
+        }
+        
+        if (recovered) {
+            // Re-initialize the SIM
+            sendATCapture("AT+CPIN?", 2000);
+            sendATCapture("AT+CMGF=1", 800);
+            sendATCapture("AT+CSCS=\"GSM\"", 800);
+            
+            // Update signal and network info
+            sendATCapture("AT+CSQ", 2000);
+            charBufSet(simStates[i].csq, sizeof(simStates[i].csq), getSimBuffer());
+            simStates[i].signalStrength = extractSignalQuality(simStates[i].csq);
+            
+            // Reset error counters
+            simStates[i].consecutiveErrors = 0;
+            simStates[i].errorCount = 0;
+            simStates[i].lastSuccessfulPoll = now;
+            
+            appendMonitorLogInt("[WATCHDOG] SIM recovered (soft)", i + 1);
+            logMsgInt("[WATCHDOG] SIM recovered successfully", i + 1);
+        } else {
+            // Software recovery failed - try aggressive ESP32-side recovery
+            appendMonitorLogInt("[WATCHDOG] Soft recovery failed, trying aggressive recovery", i + 1);
+            logMsgInt("[WATCHDOG] Aggressive recovery for SIM", i + 1);
+            
+            // 1. Re-initialize MUX (toggle all control pins)
+            initMux();
+            delay(100);
+            
+            // 2. Flush serial buffer thoroughly
+            flushSimInput();
+            delay(100);
+            
+            // 3. Re-select the SIM with extra settling time
+            selectSIM(i);
+            delay(500);  // Extra settling time
+            
+            // 4. Try multiple AT commands with longer timeouts
+            bool recoveredAggressive = false;
+            for (int retry = 0; retry < 5 && !recoveredAggressive; retry++) {
+                // Longer timeout and multiple flushes
+                flushSimInput();
+                sendATCapture("AT", 2000);  // 2 second timeout
+                if (strstr(getSimBuffer(), "OK") != NULL) {
+                    recoveredAggressive = true;
+                } else {
+                    // Re-select and wait longer
+                    selectSIM(i);
+                    delay(300);
+                }
+            }
+            
+            if (recoveredAggressive) {
+                // Full re-initialization
+                sendATCapture("AT", 1000);
+                sendATCapture("AT+CPIN?", 2000);
+                sendATCapture("AT+CMGF=1", 800);
+                sendATCapture("AT+CSCS=\"GSM\"", 800);
+                sendATCapture("AT+CPMS=\"SM\",\"SM\",\"SM\"", 1000);
+                sendATCapture("AT+CNMI=2,1,0,0,0", 800);
+                
+                // Update signal
+                sendATCapture("AT+CSQ", 2000);
+                charBufSet(simStates[i].csq, sizeof(simStates[i].csq), getSimBuffer());
+                simStates[i].signalStrength = extractSignalQuality(simStates[i].csq);
+                
+                // Reset error counters
+                simStates[i].consecutiveErrors = 0;
+                simStates[i].errorCount = 0;
+                simStates[i].lastSuccessfulPoll = millis();
+                simStates[i].responsive = true;
+                simStates[i].basicInitDone = true;
+                
+                appendMonitorLogInt("[WATCHDOG] SIM recovered (aggressive)", i + 1);
+                logMsgInt("[WATCHDOG] SIM recovered after aggressive recovery", i + 1);
+            } else {
+                // Mark as unresponsive - will be retried next watchdog cycle
+                simStates[i].responsive = false;
+                appendMonitorLogInt("[WATCHDOG] SIM marked unresponsive", i + 1);
+                logMsgInt("[WATCHDOG] Failed to recover SIM", i + 1);
+            }
+        }
+        
+        setSimBusy(false);
+        delay(100);  // Small delay between SIMs
+    }
+}
+
+// Update signal strength for a single SIM (called periodically)
+void updateSimSignalStrength(int simIdx) {
+    if (simIdx < 0 || simIdx >= SIM_COUNT) return;
+    if (!simStates[simIdx].enabled) return;
+    if (!simStates[simIdx].responsive) return;
+    if (isSimBusy()) return;
+    
+    setSimBusy(true);
+    selectSIM(simIdx);
+    delay(100);  // Settling time
+    
+    // Get signal strength
+    sendATCapture("AT+CSQ", 1000);
+    charBufSet(simStates[simIdx].csq, sizeof(simStates[simIdx].csq), getSimBuffer());
+    simStates[simIdx].signalStrength = extractSignalQuality(simStates[simIdx].csq);
+    
+    // Get battery info from SIM800L
+    sendATCapture("AT+CBC", 1000);
+    // Parse: +CBC: <bcs>,<bcl>,<v>
+    const char* p = strstr(getSimBuffer(), "+CBC:");
+    if (p) {
+        p += 5;
+        while (*p == ' ') p++;
+        const char* comma1 = strchr(p, ',');
+        if (comma1) {
+            const char* comma2 = strchr(comma1 + 1, ',');
+            if (comma2) {
+                simStates[simIdx].batteryPercent = atoi(comma1 + 1);
+                simStates[simIdx].batteryMv = atoi(comma2 + 1);
+            }
+        }
+    }
+    
     setSimBusy(false);
 }
 
@@ -632,6 +1260,72 @@ void getMonitorLogText(char* buf, size_t bufSize) {
 
 void clearMonitorLog() {
     monitorLogCount = 0;
+}
+
+// -----------------------------------------------------------------------------
+// Error Log Implementation (persistent, no truncation)
+// -----------------------------------------------------------------------------
+
+void appendErrorLog(const char* msg) {
+    char stamped[ERROR_LOG_LINE_SIZE];
+    char ts[32];
+    
+    if (getLocalTimeStamp(ts, sizeof(ts))) {
+        snprintf(stamped, sizeof(stamped), "%s %s", ts, msg);
+    } else {
+        getFallbackTimeStamp(ts, sizeof(ts));
+        snprintf(stamped, sizeof(stamped), "%s %s", ts, msg);
+    }
+    
+    // Add to RAM buffer
+    if (errorLogCount < ERROR_LOG_MAX_SIZE) {
+        charBufSet(errorLog[errorLogCount], sizeof(errorLog[0]), stamped);
+        errorLogCount++;
+    } else {
+        // Shift log (FIFO)
+        for (int i = 1; i < ERROR_LOG_MAX_SIZE; i++) {
+            strcpy(errorLog[i - 1], errorLog[i]);
+        }
+        charBufSet(errorLog[ERROR_LOG_MAX_SIZE - 1], sizeof(errorLog[0]), stamped);
+    }
+    
+    // Also append to persistent file
+    appendErrorToFile(ts, msg);
+}
+
+void appendErrorLogInt(const char* msg, int val) {
+    char buf[ERROR_LOG_LINE_SIZE - 32];
+    snprintf(buf, sizeof(buf), "%s: %d", msg, val);
+    appendErrorLog(buf);
+}
+
+void appendErrorLogVal(const char* msg, const char* val) {
+    char buf[ERROR_LOG_LINE_SIZE - 32];
+    snprintf(buf, sizeof(buf), "%s: %s", msg, val);
+    appendErrorLog(buf);
+}
+
+void getErrorLogText(char* buf, size_t bufSize) {
+    if (!buf || bufSize < 1) return;
+    
+    size_t pos = 0;
+    for (int i = 0; i < errorLogCount && pos < bufSize - 2; i++) {
+        size_t len = strlen(errorLog[i]);
+        if (pos + len + 2 >= bufSize) break;
+        
+        strcpy(buf + pos, errorLog[i]);
+        pos += len;
+        buf[pos++] = '\n';
+    }
+    buf[pos] = '\0';
+}
+
+void clearErrorLog() {
+    errorLogCount = 0;
+    // Also delete persistent file
+    if (LittleFS.exists("/errors.log")) {
+        LittleFS.remove("/errors.log");
+    }
 }
 
 // -----------------------------------------------------------------------------

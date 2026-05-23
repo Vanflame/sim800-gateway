@@ -71,6 +71,25 @@ void getMonitorLogText(char* buf, size_t bufSize);
 void clearMonitorLog();
 
 // -----------------------------------------------------------------------------
+// Error Log (persistent, no truncation)
+// -----------------------------------------------------------------------------
+
+// Append to error log buffer
+void appendErrorLog(const char* msg);
+
+// Append with integer value
+void appendErrorLogInt(const char* msg, int val);
+
+// Append with string value
+void appendErrorLogVal(const char* msg, const char* val);
+
+// Get error log as text
+void getErrorLogText(char* buf, size_t bufSize);
+
+// Clear error log
+void clearErrorLog();
+
+// -----------------------------------------------------------------------------
 // Implementation (inline for performance)
 // -----------------------------------------------------------------------------
 

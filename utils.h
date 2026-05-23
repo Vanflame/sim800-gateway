@@ -97,6 +97,10 @@ bool cregIndicatesRegistered(const char* creg);
 // Returns -1 if invalid
 int extractSignalQuality(const char* csq);
 
+// Extract network type from COPS or CNMP response
+// SIM800L only supports 2G: "2G", "EDGE", "GPRS", or "UNKNOWN"
+void extractNetworkType(const char* response, char* output, size_t outputSize);
+
 // Extract phone number from +CNUM response
 int extractPhoneNumber(const char* cnum, char* output, size_t outputSize);
 
@@ -332,6 +336,40 @@ inline int extractSignalQuality(const char* csq) {
     while (*p == ' ') p++;  // Skip spaces
     
     return atoi(p);
+}
+
+inline void extractNetworkType(const char* response, char* output, size_t outputSize) {
+    if (!output || outputSize < 2) return;
+    output[0] = '\0';
+    
+    if (!response) {
+        strncpy(output, "UNKNOWN", outputSize - 1);
+        output[outputSize - 1] = '\0';
+        return;
+    }
+    
+    // SIM800L only supports 2G networks
+    // Check for CNMP response: +CNMP: 2 (GSM only)
+    const char* cnmp = strstr(response, "+CNMP:");
+    if (cnmp) {
+        cnmp += 7;
+        while (*cnmp == ' ') cnmp++;
+        int mode = atoi(cnmp);
+        // SIM800L modes: 2=GSM, 13=GSM only, 38=GPRS, 48=EDGE
+        if (mode == 48) {
+            strncpy(output, "EDGE", outputSize - 1);
+        } else if (mode == 38) {
+            strncpy(output, "GPRS", outputSize - 1);
+        } else {
+            strncpy(output, "2G", outputSize - 1);
+        }
+        output[outputSize - 1] = '\0';
+        return;
+    }
+    
+    // Default to 2G for SIM800L (it doesn't support 3G/4G)
+    strncpy(output, "2G", outputSize - 1);
+    output[outputSize - 1] = '\0';
 }
 
 inline int extractOperatorName(const char* cops, char* output, size_t outputSize) {

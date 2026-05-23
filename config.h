@@ -13,7 +13,7 @@
 // -----------------------------------------------------------------------------
 // Set to 1 to use two independent SIM800L modules on two UARTs (no mux).
 // Set to 0 to use the CD74HC4067 mux (single UART shared across SIM slots).
-#define USE_DUAL_UART   1
+#define USE_DUAL_UART   0
 
 #define UART_BAUD_RATE  115200
 
@@ -45,12 +45,37 @@
 #define RESET_PIN       23      // GPIO23
 
 // -----------------------------------------------------------------------------
+// Firmware version (shown in web UI; bump when releasing OTA builds)
+// -----------------------------------------------------------------------------
+#define FIRMWARE_VERSION    "1.0.0"
+
+// -----------------------------------------------------------------------------
+// Over-the-air updates (ESP32 HTTPS OTA from GitHub Releases or custom URL)
+// Requires partition scheme with OTA slots (e.g. "Minimal SPIFFS (1.9MB APP with OTA)")
+// -----------------------------------------------------------------------------
+#define OTA_ENABLED         1
+// Set owner/repo for releases/latest/download/<OTA_FIRMWARE_BIN>, or leave owner empty
+// and configure URL in the web UI (saved to NVS).
+#define OTA_GITHUB_OWNER    ""
+#define OTA_GITHUB_REPO     "sim800_gateway"
+#define OTA_FIRMWARE_BIN    "firmware.bin"
+// Optional one-line version file (e.g. raw.githubusercontent.com/.../version.txt)
+#define OTA_VERSION_URL     ""
+
+// -----------------------------------------------------------------------------
 // SIM Configuration
 // -----------------------------------------------------------------------------
 #if USE_DUAL_UART
 #define SIM_COUNT       2       // Two SIM800L modules
 #else
 #define SIM_COUNT       16      // Total number of SIM slots
+
+// Logical slot (0-15, UI "SIM 1".."SIM 16") -> CD74HC4067 mux channel (S0-S3)
+// Physical bank position 1..16 per hardware wiring.
+#define SLOT_TO_MUX_CHANNEL_INIT { \
+     3,  4,  5, 12, 11, 10,  0,  1, \
+     2, 15, 14, 13,  6,  7,  8,  9  \
+}
 #endif
 #define MUX_SETTLE_MS   500     // Delay after switching MUX channel (ms) - increased for stability
 #define MUX_VERIFY_RETRIES 3    // Number of retries to verify SIM after switch
@@ -74,7 +99,7 @@
 // -----------------------------------------------------------------------------
 // Buffer Sizes
 // -----------------------------------------------------------------------------
-#define SIM_BUFFER_SIZE     512     // Main UART response buffer
+#define SIM_BUFFER_SIZE     2048    // Main UART response buffer (increased for SMS list responses)
 #define PHONE_BUFFER_SIZE   24      // Phone number buffer
 #define CREG_BUFFER_SIZE    32      // CREG response buffer
 #define COPS_BUFFER_SIZE    48      // COPS response buffer
@@ -87,12 +112,16 @@
 // -----------------------------------------------------------------------------
 #define MAX_PENDING_SMS     20      // Pending SMS queue size
 #define MAX_CALL_LOG        15      // Call log entries
-#define MONITOR_LOG_MAX_SIZE     40      // Monitor log entries (reduced for heap - SSL needs RAM)
+#define MONITOR_LOG_MAX_SIZE     20      // Monitor log entries (reduced for RAM)
+#define ERROR_LOG_MAX_SIZE       15      // Error log entries (reduced for RAM)
+#define ERROR_LOG_LINE_SIZE      128     // Reduced from 160
 
 // -----------------------------------------------------------------------------
 // Error Thresholds
 // -----------------------------------------------------------------------------
 #define SIM_ERROR_THRESHOLD    3   // Reset SIM after this many errors
+#define SIM_CONSECUTIVE_ERROR_THRESHOLD 5  // Consecutive errors before recovery attempt
+#define SIM_WATCHDOG_TIMEOUT_MS 120000  // 2 minutes without successful poll = unresponsive
 
 // -----------------------------------------------------------------------------
 // WiFi AP Configuration
@@ -110,7 +139,7 @@
 // -----------------------------------------------------------------------------
 // Default Backend Configuration
 // -----------------------------------------------------------------------------
-#define DEFAULT_BASE_URL        "https://www.otpocket.app"
+#define DEFAULT_BASE_URL        "https://seller.otpocket.app"
 #define DEFAULT_API_PATH        "/api/agent/incoming-sms"
 
 // -----------------------------------------------------------------------------
@@ -137,9 +166,13 @@ typedef struct {
     char csq[CSQ_BUFFER_SIZE];
     int batteryPercent;
     int batteryMv;
+    int signalStrength;       // ASU 0-31, -1 if unknown
+    char networkType[8];      // "2G", "EDGE", "GPRS", "UNKNOWN"
     uint8_t errorCount;
+    uint8_t consecutiveErrors; // Track consecutive failures for recovery
     unsigned long lastBackendRegAttempt;
     unsigned long lastNoSmsLog;
+    unsigned long lastSuccessfulPoll; // For watchdog detection
 } SimState;
 
 // Pending SMS for retry queue
@@ -160,14 +193,26 @@ typedef struct {
     unsigned long durationMs;
 } CallLogItem;
 
+// Active session from backend
+typedef struct {
+    char sessionId[64];
+    char simNumber[PHONE_BUFFER_SIZE];
+    char appName[32];
+    int slot;
+    int messageCount;
+    unsigned long expiresAtMs;  // Unix timestamp in milliseconds
+} ActiveSession;
+
 // -----------------------------------------------------------------------------
 // Global State Extern Declarations (defined in main .ino)
 // -----------------------------------------------------------------------------
 extern SimState simStates[SIM_COUNT];
 extern PendingSms pendingSmsQueue[MAX_PENDING_SMS];
 extern CallLogItem callLog[MAX_CALL_LOG];
+extern ActiveSession activeSessions[8];  // Max 8 concurrent sessions
 extern int pendingSmsCount;
 extern int callLogCount;
+extern int activeSessionCount;
 extern int activeSim;
 extern int currentMuxSim;
 extern volatile bool simBusy;
@@ -178,6 +223,10 @@ extern bool simRegistered;
 // Monitor log
 extern char monitorLog[MONITOR_LOG_MAX_SIZE][160];
 extern int monitorLogCount;
+
+// Error log (persistent, longer messages)
+extern char errorLog[ERROR_LOG_MAX_SIZE][ERROR_LOG_LINE_SIZE];
+extern int errorLogCount;
 
 // Timing
 extern unsigned long lastHeartbeatMs;

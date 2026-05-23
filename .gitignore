@@ -1,0 +1,22 @@
+# Arduino / ESP32 build output
+build/
+*.elf
+*.bin
+*.map
+*.hex
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets (if you move WiFi/tokens to local overrides)
+secrets.h
+.env
+.env.*

@@ -22,6 +22,24 @@ typedef struct {
 } SmsMessage;
 
 // -----------------------------------------------------------------------------
+// Multipart SMS (Concatenated)
+// -----------------------------------------------------------------------------
+
+#define MAX_MULTIPART_PARTS 3
+#define MAX_MULTIPART_QUEUE 2
+#define MULTIPART_MSG_SIZE 512
+
+typedef struct {
+    int simSlot;
+    char sender[PHONE_BUFFER_SIZE];
+    unsigned long firstPartTime;        // Time first part received
+    int receivedParts;                  // Parts received so far
+    char combined[MULTIPART_MSG_SIZE];  // Combined message buffer
+    int partIndices[MAX_MULTIPART_PARTS]; // SIM indices for deletion
+    bool active;
+} MultipartSms;
+
+// -----------------------------------------------------------------------------
 // SMS Queue (Pending for retry)
 // -----------------------------------------------------------------------------
 
@@ -70,6 +88,10 @@ bool forwardSmsToBackend(const SmsMessage* msg);
 
 // Forward SMS to backend with full HTTP implementation
 bool forwardSmsToBackendFull(const SmsMessage* msg);
+
+// Forward SMS to backend with optional normalized sender (brand name extracted from message)
+// errorOut: optional buffer to receive error message on failure
+bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalizedSender, char* errorOut = nullptr, size_t errorOutSize = 0);
 
 // -----------------------------------------------------------------------------
 // SMS Polling

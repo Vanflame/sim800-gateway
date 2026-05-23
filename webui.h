@@ -126,6 +126,15 @@ void handleTogglePolling();
 // POST /toggle-heartbeat - Toggle heartbeat pause
 void handleToggleHeartbeat();
 
+// GET /firmware-check - Compare FIRMWARE_VERSION to remote version.txt
+void handleFirmwareCheck();
+
+// POST /firmware-update - Download and flash firmware (optional url=)
+void handleFirmwareUpdate();
+
+// POST /firmware-config - Save OTA firmware URL to NVS
+void handleFirmwareConfig();
+
 // -----------------------------------------------------------------------------
 // Route Handlers - Battery
 // -----------------------------------------------------------------------------

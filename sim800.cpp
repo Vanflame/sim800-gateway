@@ -58,11 +58,19 @@ void initSIM800Serial() {
         sim800_1.begin(UART_BAUD_RATE, SERIAL_8N1, UART1_RX_PIN, UART1_TX_PIN);
         sim800_2.begin(UART_BAUD_RATE, SERIAL_8N1, UART2_RX_PIN, UART2_TX_PIN);
         setActiveSimSlot(0);
+
+        // Flush both UARTs at startup to clear any residual data
+        delay(100);
+        for (int pass = 0; pass < 3; pass++) {
+            while (sim800_1.available()) { (void)sim800_1.read(); }
+            while (sim800_2.available()) { (void)sim800_2.read(); }
+            delay(10);
+        }
     #else
         sim800.begin(UART_BAUD_RATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+        delay(100);
+        flushSimInput();
     #endif
-    delay(100);
-    flushSimInput();
     logMsg("[SIM800] Serial initialized");
 }
 
@@ -102,8 +110,13 @@ void sendATCapture(const char* cmd, unsigned long timeoutMs) {
     // Send command
     serial.println(cmd);
 
+    // Check if this is a long response command (SMS list)
+    bool isLongResponse = (strstr(cmd, "AT+CMGL") != NULL);
+
     // Read response with timeout
     unsigned long start = millis();
+    unsigned long lastDataTime = millis();  // Track when we last received data
+
     while (millis() - start < timeoutMs) {
         int readCount = 0;
         while (serial.available() && readCount < 100) {
@@ -113,12 +126,27 @@ void sendATCapture(const char* cmd, unsigned long timeoutMs) {
                 simBuffer[simBufferLen++] = c;
                 simBuffer[simBufferLen] = '\0';
             }
+            lastDataTime = millis();  // Update last data time
         }
-        
+
+        // For long responses (SMS list), wait for data to stop coming
+        // before checking for completion
+        if (isLongResponse) {
+            // Only check for completion if no data received in last 50ms
+            if (millis() - lastDataTime < 50) {
+                // Still receiving data, continue reading
+                if (gYieldToWebServer) {
+                    server.handleClient();
+                }
+                delay(2);
+                continue;
+            }
+        }
+
         // Check if response is complete (ends with OK or ERROR)
         charBufTrim(simBuffer);
         simBufferLen = strlen(simBuffer);  // Update length after trim
-        
+
         if (simBufferLen >= 2) {
             // Check for "OK" at end
             if (strcmp(simBuffer + simBufferLen - 2, "OK") == 0) {
@@ -133,14 +161,14 @@ void sendATCapture(const char* cmd, unsigned long timeoutMs) {
                 break;
             }
         }
-        
+
         // Yield to web server to keep UI responsive (can be disabled to prevent re-entrancy)
         if (gYieldToWebServer) {
             server.handleClient();
         }
         delay(2);
     }
-    
+
     charBufTrim(simBuffer);
     simBufferLen = strlen(simBuffer);
     setSimBusy(false);
@@ -600,6 +628,10 @@ void checkAllSIMsOnStartup() {
         if (!isResponsive) {
             simStates[i].enabled = false;
             simStates[i].registered = false;
+            simStates[i].consecutiveErrors = 0;
+            simStates[i].signalStrength = -1;
+            simStates[i].networkType[0] = '\0';
+            simStates[i].lastSuccessfulPoll = 0;
             charBufClear(simStates[i].number, sizeof(simStates[i].number));
             charBufClear(simStates[i].creg, sizeof(simStates[i].creg));
             charBufClear(simStates[i].cops, sizeof(simStates[i].cops));
@@ -646,6 +678,7 @@ void checkAllSIMsOnStartup() {
 
         sendATCapture("AT+CSQ", 3000);
         charBufSet(simStates[i].csq, sizeof(simStates[i].csq), getSimBuffer());
+        simStates[i].signalStrength = extractSignalQuality(simStates[i].csq);
 
         sendATCapture("AT+CREG?", 2000);
         charBufSet(simStates[i].creg, sizeof(simStates[i].creg), getSimBuffer());
@@ -653,6 +686,8 @@ void checkAllSIMsOnStartup() {
 
         sendATCapture("AT+COPS?", 2000);
         charBufSet(simStates[i].cops, sizeof(simStates[i].cops), getSimBuffer());
+        // SIM800L is 2G only - set network type
+        charBufSet(simStates[i].networkType, sizeof(simStates[i].networkType), "2G");
 
         sendATCapture("AT+CNUM", 2000);
         char numBuf[64];
