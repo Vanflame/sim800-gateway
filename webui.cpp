@@ -1519,7 +1519,7 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
               Firmware update
             </div>
-            <p class="card-subtitle">Manual OTA from GitHub — also checked every 12 hours</p>
+            <p class="card-subtitle">Check GitHub version (12h). Install needs Custom partition + OTA build.</p>
           </div>
           <span class="status-pill off" id="firmwareStatusPill"><span class="status-dot"></span> Not checked</span>
         </div>
@@ -2582,7 +2582,10 @@ async function installFirmwareUpdate() {
   }
   toast('Downloading firmware… device will restart');
   try {
-    await post('/firmware-update', {});
+    const r = await post('/firmware-update', {});
+    if (r && r.success === false) {
+      toast(r.message || 'OTA not available in this build');
+    }
   } catch (e) {
     toast('Update request failed');
     if (btn) {
@@ -5023,6 +5026,12 @@ void handleFirmwareConfig() {
 }
 
 void handleFirmwareUpdate() {
+#if !OTA_ENABLED
+    server.send(200, "application/json",
+        "{\"success\":false,\"message\":\"OTA install disabled in this build. "
+        "Set OTA_ENABLED=1 and Partition Scheme Custom (partitions.csv), then USB flash once.\"}");
+    return;
+#endif
     if (!WiFi.isConnected()) {
         server.send(400, "application/json", "{\"success\":false,\"message\":\"WiFi required for OTA\"}");
         return;

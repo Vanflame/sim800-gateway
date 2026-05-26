@@ -53,8 +53,10 @@
 // Over-the-air updates (ESP32 HTTPS OTA from GitHub Releases or custom URL)
 // Requires partition scheme with OTA slots (e.g. "Minimal SPIFFS (1.9MB APP with OTA)")
 // -----------------------------------------------------------------------------
-// 0 = smaller build (fits 1.25MB OTA slot). 1 = needs Minimal SPIFFS / 1.9MB APP partition.
-#define OTA_ENABLED         1
+// 0 = fits default 1.25MB partition (Check updates OK; Install needs OTA_ENABLED 1 + large partition).
+// 1 = full HTTPS OTA install (~1.32MB). REQUIRED partition: Tools → Custom → partitions.csv
+//     OR "Minimal SPIFFS (1.9MB APP with OTA)" — then set OTA_ENABLED to 1.
+#define OTA_ENABLED         0
 #define OTA_FIRMWARE_URL_DEFAULT \
     "https://github.com/Vanflame/sim800-gateway/releases/download/latest/firmware.bin"
 #define OTA_VERSION_URL \

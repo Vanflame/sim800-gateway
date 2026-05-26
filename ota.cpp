@@ -9,8 +9,10 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include <HTTPUpdate.h>
 #include <Preferences.h>
+#if OTA_ENABLED
+#include <HTTPUpdate.h>
+#endif
 
 char otaFirmwareUrl[256] = "";
 
