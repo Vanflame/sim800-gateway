@@ -66,6 +66,24 @@ void handleCheckAllSim();
 // POST /sim-enable?slot=N&enabled=1/0 - Enable/disable SIM
 void handleSimEnable();
 
+// POST /sim-disable-all - Disable every SIM slot (same as Off per slot)
+void handleSimDisableAll();
+
+// POST /ussd-check?slot=N - Start *143# on one SIM (background)
+void handleUssdCheck();
+
+// GET /ussd-manual-status - Progress or result for manual *143#
+void handleUssdManualStatus();
+
+// POST /ussd-bulk - Start *143# on all enabled SIMs (background)
+void handleUssdBulk();
+
+// GET /ussd-bulk-status - Progress or final OK/fail list with numbers
+void handleUssdBulkStatus();
+
+// POST /toggle-missed-call?enabled=1/0 - Enable/disable missed call → Viber SMS
+void handleToggleMissedCall();
+
 // -----------------------------------------------------------------------------
 // Route Handlers - Calls
 // -----------------------------------------------------------------------------
@@ -113,6 +131,9 @@ void handleRefreshToken();
 
 // POST /register-device - Register device with backend
 void handleRegisterDevice();
+
+// Register device_id with backend (required before heartbeat). Returns true on 2xx.
+bool registerDeviceWithBackend();
 
 // POST /register-sim - Register SIM with backend
 void handleRegisterSim();

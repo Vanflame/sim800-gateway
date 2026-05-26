@@ -112,6 +112,10 @@ bool dialNumber(const char* number);
 // Hang up call
 void hangupCall();
 
+// Send USSD code (e.g. *143#) and capture network reply into resultOut
+// Returns true when a +CUSD response was received without modem ERROR
+bool runUssdCode(const char* code, char* resultOut, size_t resultSize, int* modeOut);
+
 // Check if call is in progress
 bool isCallInProgress();
 

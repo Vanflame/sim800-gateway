@@ -19,6 +19,9 @@
 #include "logger.h"
 #include "utils.h"
 #include "ota.h"
+#include "calls.h"
+#include "ussd.h"
+#include "maintenance.h"
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -44,6 +47,9 @@ volatile bool simBusy = false;
 volatile bool httpsBusy = false;  // Prevent concurrent HTTPS
 bool smsPollingPaused = false;
 bool heartbeatPaused = false;
+bool pendingHeartbeatFollowup = false;
+bool missedCallForwardEnabled = MISSED_CALL_FORWARD_DEFAULT;
+int missedCallWatchSlot = -1;
 bool deviceRegistered = false;
 bool simRegistered = false;
 
@@ -281,6 +287,7 @@ void setup() {
     // Logger is header-only (no init function)
     for (int i = 0; i < SIM_COUNT; i++) {
         simStates[i].enabled = true;
+        simStates[i].userDisabled = false;
         simStates[i].basicInitDone = false;
         simStates[i].responsive = false;
         simStates[i].registered = false;
@@ -294,17 +301,30 @@ void setup() {
         charBufClear(simStates[i].creg, sizeof(simStates[i].creg));
         charBufClear(simStates[i].cops, sizeof(simStates[i].cops));
         charBufClear(simStates[i].csq, sizeof(simStates[i].csq));
+        simStates[i].ussdStatus = 0;
+        simStates[i].ussdLastDurationSec = 0;
+        simStates[i].ussdLastCheckMs = 0;
+        charBufClear(simStates[i].ussdLastResult, sizeof(simStates[i].ussdLastResult));
     }
     
     // Load settings
     loadSettings();
+#if OTA_ENABLED
     otaLoadUrlFromPreferences();
+#endif
     appendMonitorLog("[BOOT] Settings loaded");
     
     // Initialize LittleFS for persistent storage
     if (!LittleFS.begin(true)) {
         Serial.println("[STORE] LittleFS mount failed, formatting...");
-        appendMonitorLog("[STORE] LittleFS format needed");
+        appendMonitorLog("[STORE] LittleFS format");
+        LittleFS.format();
+        if (LittleFS.begin(true)) {
+            Serial.println("[STORE] LittleFS mounted after format");
+        } else {
+            Serial.println("[STORE] LittleFS still failed after format");
+            appendMonitorLog("[STORE] LittleFS mount failed");
+        }
     } else {
         Serial.println("[STORE] LittleFS mounted");
     }
@@ -345,6 +365,8 @@ void setup() {
     appendMonitorLog("[BOOT] Ready");
 }
 
+static void fetchHeartbeatFollowup();
+
 // -----------------------------------------------------------------------------
 // Main Loop
 // -----------------------------------------------------------------------------
@@ -353,6 +375,11 @@ void loop() {
     // Handle web requests (must be called frequently)
     handleWebRequests();
     
+    // Fast missed-call scan (one SIM per tick; no AT / minimal flush)
+    if (missedCallForwardEnabled && !smsPollingPaused) {
+        pollMissedCallsFast();
+    }
+
     // Poll SIMs for new SMS
     if (!isSimBusy() && !smsPollingPaused) {
         pollSIMsForSMS();
@@ -360,13 +387,30 @@ void loop() {
     
     // Process pending SMS queue
     processPendingSmsQueue();
-    
+
+    // Background *143# bulk queue
+    ussdTick();
+
+    // Followup uses WiFi only — do not wait for modem (isSimBusy)
+    if (pendingHeartbeatFollowup && !httpsBusy) {
+        pendingHeartbeatFollowup = false;
+        fetchHeartbeatFollowup();
+        pruneExpiredActiveSessions();
+        maintenanceOnSessionsUpdated();
+        if (!isSimBusy()) {
+            flushPendingMissedCallsAfterHeartbeat();
+        }
+    }
+
     // Periodic tasks
     unsigned long now = millis();
+
+    maintenanceTick(now);
     
     // Heartbeat / sync with backend
     if (!heartbeatPaused && (now - lastHeartbeatMs > HEARTBEAT_INTERVAL_MS)) {
         lastHeartbeatMs = now;
+        pruneExpiredActiveSessions();
         performHeartbeat();
     }
     
@@ -460,7 +504,12 @@ void loadSettings() {
     preferences.getString("path", agentApiPath, sizeof(agentApiPath));
     agentUseAuth = preferences.getBool("auth", true);
     heartbeatPaused = preferences.getBool("hb_pause", false);
+    missedCallForwardEnabled = preferences.getBool("mcall", MISSED_CALL_FORWARD_DEFAULT);
+    missedCallWatchSlot = preferences.getInt("mcall_slot", -1);
     preferences.end();
+
+    loadSimUserDisabledMask();
+    maintenanceOnBoot();
     
     // Use default base URL if not saved
     if (charBufIsEmpty(agentBaseUrl)) {
@@ -498,6 +547,361 @@ static void normalizeSimNumber(const char* raw, char* out, size_t outSize) {
     }
     // Add + prefix
     snprintf(out, outSize, "+%s", raw);
+}
+
+void pruneExpiredActiveSessions() {  // called from maintenance + heartbeat
+    time_t nowSecs = time(nullptr);
+    if (nowSecs <= 1600000000L) return;
+    const unsigned long nowMs = (unsigned long)nowSecs * 1000UL;
+    int out = 0;
+    for (int i = 0; i < activeSessionCount; i++) {
+        if (activeSessions[i].expiresAtMs > 0 && activeSessions[i].expiresAtMs <= nowMs) {
+            continue;
+        }
+        if (out != i) {
+            activeSessions[out] = activeSessions[i];
+        }
+        out++;
+    }
+    activeSessionCount = out;
+}
+
+static void loadSimUserDisabledMask() {
+    preferences.begin("agent", true);
+    const uint32_t mask = preferences.getUInt("sim_off", 0);
+    preferences.end();
+    for (int i = 0; i < SIM_COUNT; i++) {
+        simStates[i].userDisabled = (mask & (1UL << i)) != 0;
+        if (simStates[i].userDisabled) {
+            simStates[i].enabled = false;
+        }
+    }
+}
+
+static void saveSimUserDisabledMask() {
+    uint32_t mask = 0;
+    for (int i = 0; i < SIM_COUNT; i++) {
+        if (simStates[i].userDisabled) {
+            mask |= (1UL << i);
+        }
+    }
+    preferences.begin("agent", false);
+    preferences.putUInt("sim_off", mask);
+    preferences.end();
+}
+
+void setSimUserDisabled(int simIdx, bool disabled) {
+    if (simIdx < 0 || simIdx >= SIM_COUNT) return;
+    simStates[simIdx].userDisabled = disabled;
+    if (disabled) {
+        simStates[simIdx].enabled = false;
+    }
+    saveSimUserDisabledMask();
+}
+
+static void applyBackendSimStatusFromJson(const char* s) {
+    if (!s || !s[0]) return;
+    const char* simsKey = strstr(s, "\"sims\"");
+    if (!simsKey) return;
+    const char* p = strchr(simsKey, '[');
+    if (!p) return;
+    p++;
+
+    while (*p && *p != ']') {
+        const char* objStart = strchr(p, '{');
+        if (!objStart) break;
+        const char* objEnd = strchr(objStart, '}');
+        if (!objEnd) break;
+
+        int slot = 0;
+        const char* slotKey = strstr(objStart, "\"slot\"");
+        if (slotKey && slotKey < objEnd) {
+            const char* colon = strchr(slotKey, ':');
+            if (colon && colon < objEnd) {
+                slot = atoi(colon + 1);
+            }
+        }
+
+        char status[16];
+        status[0] = '\0';
+        const char* stKey = strstr(objStart, "\"status\":\"");
+        if (stKey && stKey < objEnd) {
+            const char* v = stKey + strlen("\"status\":\"");
+            const char* endQuote = strchr(v, '"');
+            if (endQuote && endQuote < objEnd) {
+                const int len = (int)(endQuote - v);
+                if (len > 0 && len < (int)sizeof(status)) {
+                    strncpy(status, v, (size_t)len);
+                    status[len] = '\0';
+                }
+            }
+        }
+
+        if (slot >= 0 && slot < SIM_COUNT && status[0] != '\0' &&
+            !simStates[slot].userDisabled) {
+            const bool shouldEnable =
+                (strcmp(status, "ACTIVE") == 0 || strcmp(status, "IN_USE") == 0);
+            simStates[slot].enabled = shouldEnable;
+            if (!shouldEnable) {
+                appendMonitorLogVal("[HEARTBEAT] Backend disabled SIM", String(slot).c_str());
+            }
+        }
+
+        p = objEnd + 1;
+    }
+}
+
+static void parseActiveSessionsFromJson(const char* s) {
+    if (!s || !s[0]) return;
+
+    const char* sessionsKey = strstr(s, "\"activeSessions\"");
+    if (!sessionsKey) return;
+
+    const char* p2 = strchr(sessionsKey, '[');
+    if (!p2) return;
+
+    const char* afterBracket = p2 + 1;
+    while (*afterBracket == ' ' || *afterBracket == '\n' || *afterBracket == '\r') {
+        afterBracket++;
+    }
+    if (*afterBracket == ']') {
+        activeSessionCount = 0;
+        return;
+    }
+
+    activeSessionCount = 0;
+    p2++;
+
+    while (*p2 && *p2 != ']' && activeSessionCount < 8) {
+        const char* objStart = strchr(p2, '{');
+        if (!objStart) break;
+        const char* objEnd = strchr(objStart, '}');
+        if (!objEnd) break;
+
+        ActiveSession* sess = &activeSessions[activeSessionCount];
+        memset(sess, 0, sizeof(ActiveSession));
+
+        const char* idKey = strstr(objStart, "\"sessionId\"");
+        if (idKey && idKey < objEnd) {
+            const char* colon = strchr(idKey, ':');
+            if (colon && colon < objEnd) {
+                const char* vStart = strchr(colon, '"');
+                if (vStart && vStart < objEnd) {
+                    vStart++;
+                    const char* vEnd = strchr(vStart, '"');
+                    if (vEnd && vEnd < objEnd) {
+                        int len = (int)(vEnd - vStart);
+                        if (len > 0 && len < 64) {
+                            strncpy(sess->sessionId, vStart, (size_t)len);
+                        }
+                    }
+                }
+            }
+        }
+
+        const char* numKey = strstr(objStart, "\"simNumber\"");
+        if (numKey && numKey < objEnd) {
+            const char* colon = strchr(numKey, ':');
+            if (colon && colon < objEnd) {
+                const char* vStart = strchr(colon, '"');
+                if (vStart && vStart < objEnd) {
+                    vStart++;
+                    const char* vEnd = strchr(vStart, '"');
+                    if (vEnd && vEnd < objEnd) {
+                        int len = (int)(vEnd - vStart);
+                        if (len > 0 && len < PHONE_BUFFER_SIZE) {
+                            strncpy(sess->simNumber, vStart, (size_t)len);
+                        }
+                    }
+                }
+            }
+        }
+
+        const char* appKey = strstr(objStart, "\"appName\"");
+        if (appKey && appKey < objEnd) {
+            const char* colon = strchr(appKey, ':');
+            if (colon && colon < objEnd) {
+                const char* vStart = strchr(colon, '"');
+                if (vStart && vStart < objEnd) {
+                    vStart++;
+                    const char* vEnd = strchr(vStart, '"');
+                    if (vEnd && vEnd < objEnd) {
+                        int len = (int)(vEnd - vStart);
+                        if (len > 0 && len < 32) {
+                            strncpy(sess->appName, vStart, (size_t)len);
+                        }
+                    }
+                }
+            }
+        }
+
+        const char* slotKey = strstr(objStart, "\"slot\"");
+        if (slotKey && slotKey < objEnd) {
+            const char* colon = strchr(slotKey, ':');
+            if (colon && colon < objEnd) {
+                sess->slot = atoi(colon + 1);
+            }
+        }
+
+        const char* msgKey = strstr(objStart, "\"messageCount\"");
+        if (msgKey && msgKey < objEnd) {
+            const char* colon = strchr(msgKey, ':');
+            if (colon && colon < objEnd) {
+                sess->messageCount = atoi(colon + 1);
+            }
+        }
+
+        const char* expKey = strstr(objStart, "\"expiresAt\"");
+        if (expKey && expKey < objEnd) {
+            const char* colon = strchr(expKey, ':');
+            if (colon && colon < objEnd) {
+                const char* vStart = strchr(colon, '"');
+                if (vStart && vStart < objEnd) {
+                    vStart++;
+                    const char* vEnd = strchr(vStart, '"');
+                    if (vEnd && vEnd < objEnd) {
+                        int year, month, day, hour, min, sec;
+                        if (sscanf(vStart, "%d-%d-%dT%d:%d:%d", &year, &month, &day, &hour, &min, &sec) >= 6) {
+                            static const int daysInMonth[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+                            long days = 0;
+                            for (int y = 1970; y < year; y++) {
+                                days += 365;
+                                if ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)) days += 1;
+                            }
+                            for (int m = 1; m < month; m++) {
+                                days += daysInMonth[m - 1];
+                                if (m == 2 && ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0))) days += 1;
+                            }
+                            days += day - 1;
+                            time_t ts = days * 86400L + hour * 3600L + min * 60L + sec;
+                            sess->expiresAtMs = (unsigned long)ts * 1000UL;
+                        }
+                    }
+                }
+            }
+        }
+
+        activeSessionCount++;
+        p2 = objEnd + 1;
+    }
+}
+
+static bool simInHeartbeatReport(int i) {
+    if (i < 0 || i >= SIM_COUNT) return false;
+    if (simStates[i].userDisabled) return false;
+    if (!simStates[i].enabled) return false;
+    if (!simStates[i].responsive) return false;
+    if (charBufIsEmpty(simStates[i].number)) return false;
+    return true;
+}
+
+static void fetchHeartbeatFollowup() {
+    if (charBufIsEmpty(agentBaseUrl) || charBufIsEmpty(agentBearerToken)) return;
+    if (!WiFi.isConnected() || httpsBusy) return;
+
+    static char url[256];
+    snprintf(url, sizeof(url), "%s/api/agent/heartbeat/followup", agentBaseUrl);
+
+    static char body[2048];
+    size_t pos = snprintf(body, sizeof(body), "{\"device_id\":\"%s\",\"sim_numbers\":[", agentDeviceId);
+
+    bool firstNum = true;
+    for (int i = 0; i < SIM_COUNT && pos < sizeof(body) - 300; i++) {
+        if (!simInHeartbeatReport(i)) continue;
+        char normalizedNum[PHONE_BUFFER_SIZE];
+        normalizeSimNumber(simStates[i].number, normalizedNum, sizeof(normalizedNum));
+        char numEsc[64];
+        jsonEscape(normalizedNum, numEsc, sizeof(numEsc));
+        if (!firstNum) pos += snprintf(body + pos, sizeof(body) - pos, ",");
+        firstNum = false;
+        pos += snprintf(body + pos, sizeof(body) - pos, "%s", numEsc);
+    }
+
+    pos += snprintf(body + pos, sizeof(body) - pos, "],\"sim_slots\":[");
+    bool firstSlot = true;
+    for (int i = 0; i < SIM_COUNT && pos < sizeof(body) - 200; i++) {
+        if (!simInHeartbeatReport(i)) continue;
+        char normalizedNum[PHONE_BUFFER_SIZE];
+        normalizeSimNumber(simStates[i].number, normalizedNum, sizeof(normalizedNum));
+        char numEsc[64];
+        jsonEscape(normalizedNum, numEsc, sizeof(numEsc));
+        if (!firstSlot) pos += snprintf(body + pos, sizeof(body) - pos, ",");
+        firstSlot = false;
+        pos += snprintf(body + pos, sizeof(body) - pos, "{\"number\":%s,\"slot\":%d}", numEsc, i);
+    }
+    pos += snprintf(body + pos, sizeof(body) - pos, "]}");
+
+    if (firstNum) {
+        return;
+    }
+
+    httpsBusy = true;
+    HTTPClient http;
+    WiFiClientSecure clientSecure;
+    WiFiClient clientPlain;
+    const bool isHttps = (strncmp(url, "https://", 8) == 0);
+    bool begun = false;
+
+    if (isHttps) {
+        clientSecure.setInsecure();
+        clientSecure.setTimeout(10000);
+        begun = http.begin(clientSecure, url);
+    } else {
+        clientPlain.setTimeout(10000);
+        begun = http.begin(clientPlain, url);
+    }
+
+    if (!begun) {
+        httpsBusy = false;
+        return;
+    }
+
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(10000);
+    http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
+
+    const int code = http.POST(body);
+
+    static char respBuf[2048];
+    respBuf[0] = '\0';
+    if (code > 0) {
+        WiFiClient* stream = http.getStreamPtr();
+        if (stream) {
+            unsigned long t0 = millis();
+            int total = 0;
+            while (millis() - t0 < 6000 && total < (int)sizeof(respBuf) - 1) {
+                if (stream->available()) {
+                    int n = stream->read((uint8_t*)(respBuf + total), sizeof(respBuf) - 1 - total);
+                    if (n > 0) {
+                        total += n;
+                    }
+                } else if (!http.connected()) {
+                    break;
+                } else {
+                    delay(2);
+                }
+            }
+            respBuf[total] = '\0';
+        }
+    }
+
+    http.end();
+    if (isHttps) {
+        clientSecure.stop();
+    } else {
+        clientPlain.stop();
+    }
+    httpsBusy = false;
+
+    if (code >= 200 && code < 300 && respBuf[0] != '\0') {
+        parseActiveSessionsFromJson(respBuf);
+        if (activeSessionCount > 0) {
+            logMsgInt("[HEARTBEAT] Followup sessions", activeSessionCount);
+        }
+        appendMonitorLog("[HEARTBEAT] Followup OK");
+        pruneExpiredActiveSessions();
+        maintenanceOnSessionsUpdated();
+    }
 }
 
 void performHeartbeat() {
@@ -588,23 +992,17 @@ void performHeartbeat() {
 
     bool first = true;
     for (int i = 0; i < SIM_COUNT && pos < sizeof(body) - 300; i++) {
-        if (!simStates[i].enabled) continue;
-        if (!simStates[i].responsive) continue;
-        if (charBufIsEmpty(simStates[i].number)) continue;
+        if (!simInHeartbeatReport(i)) continue;
 
         if (!first) pos += snprintf(body + pos, sizeof(body) - pos, ",");
         first = false;
 
-        // Normalize number with + prefix for backend consistency
         char numEsc[64];
         char normalizedNum[PHONE_BUFFER_SIZE];
         normalizeSimNumber(simStates[i].number, normalizedNum, sizeof(normalizedNum));
         jsonEscape(normalizedNum, numEsc, sizeof(numEsc));
         
-        // Get signal strength from CSQ
         int signal = extractSignalQuality(simStates[i].csq);
-        
-        // Get network type (SIM800L is 2G only)
         const char* netType = simStates[i].networkType[0] ? simStates[i].networkType : "2G";
         
         pos += snprintf(body + pos, sizeof(body) - pos,
@@ -724,231 +1122,29 @@ void performHeartbeat() {
         }
     }
     
-    // Always close connections fully
-    http.end();
+    // http.end() already called in retry loop — do NOT call http.end() again (causes hang)
     clientSecure.stop();
     client.stop();
-    delay(50);  // Let connection fully close
+    delay(50);
     
     httpsBusy = false;
 
-    // Apply backend SIM status (source of truth) from response.sims[]
-    if (resp.length() > 0) {
-        const char* s = resp.c_str();
-        const char* simsKey = strstr(s, "\"sims\"");
-        if (simsKey) {
-            const char* p = strchr(simsKey, '[');
-            if (p) {
-                p++;
-                while (*p && *p != ']') {
-                    const char* objStart = strchr(p, '{');
-                    if (!objStart) break;
-                    const char* objEnd = strchr(objStart, '}');
-                    if (!objEnd) break;
-
-                    // Extract slot
-                    int slot = 0;
-                    const char* slotKey = strstr(objStart, "\"slot\"");
-                    if (slotKey && slotKey < objEnd) {
-                        const char* colon = strchr(slotKey, ':');
-                        if (colon && colon < objEnd) {
-                            slot = atoi(colon + 1);
-                        }
-                    }
-
-                    // Extract status value
-                    // Expected: "status":"ACTIVE" (or IN_USE / DISABLED)
-                    char status[16];
-                    status[0] = '\0';
-                    const char* stKey = strstr(objStart, "\"status\":\"");
-                    if (stKey && stKey < objEnd) {
-                        const char* v = stKey + strlen("\"status\":\"");
-                        const char* endQuote = strchr(v, '"');
-                        if (endQuote && endQuote < objEnd) {
-                            int len = (int)(endQuote - v);
-                            if (len > 0 && len < (int)sizeof(status)) {
-                                strncpy(status, v, (size_t)len);
-                                status[len] = '\0';
-                            }
-                        }
-                    }
-
-                    if (slot >= 0 && slot < SIM_COUNT && status[0] != '\0') {
-                        bool shouldEnable = (strcmp(status, "ACTIVE") == 0 || strcmp(status, "IN_USE") == 0);
-
-                        if (HEARTBEAT_DEBUG) {
-                            char dbgLine[96];
-                            snprintf(dbgLine, sizeof(dbgLine), "[HEARTBEAT][DBG] slot=%d status=%s => enable=%d", slot, status, shouldEnable ? 1 : 0);
-                            appendMonitorLog(dbgLine);
-                            logMsg(dbgLine);
-                        }
-
-                        simStates[slot].enabled = shouldEnable;
-                        if (!shouldEnable) {
-                            appendMonitorLogVal("[HEARTBEAT] Backend disabled SIM", String(slot).c_str());
-                            // Do NOT clear state - keep number so SIM can be re-enabled and resent in next heartbeat
-                            // simStates[idx].responsive remains true so it will be included in next heartbeat
-                        }
-                    }
-
-                    p = objEnd + 1;
-                }
-            }
+    if (code >= 200 && code < 300 && resp.length() > 0) {
+        applyBackendSimStatusFromJson(resp.c_str());
+        pendingHeartbeatFollowup = !charBufIsEmpty(agentBearerToken);
+        pruneExpiredActiveSessions();
+        maintenanceOnHeartbeatSuccess();
+        if (!pendingHeartbeatFollowup) {
+            maintenanceOnSessionsUpdated();
         }
-
-        // Parse activeSessions from response
-        activeSessionCount = 0;
-        const char* sessionsKey = strstr(s, "\"activeSessions\"");
-        if (sessionsKey) {
-            const char* p2 = strchr(sessionsKey, '[');
-            if (p2) {
-                p2++;
-                while (*p2 && *p2 != ']' && activeSessionCount < 8) {
-                    const char* objStart = strchr(p2, '{');
-                    if (!objStart) break;
-                    const char* objEnd = strchr(objStart, '}');
-                    if (!objEnd) break;
-
-                    ActiveSession* sess = &activeSessions[activeSessionCount];
-                    memset(sess, 0, sizeof(ActiveSession));
-
-                    // Extract sessionId
-                    const char* idKey = strstr(objStart, "\"sessionId\"");
-                    if (idKey && idKey < objEnd) {
-                        const char* colon = strchr(idKey, ':');
-                        if (colon && colon < objEnd) {
-                            const char* vStart = strchr(colon, '"');
-                            if (vStart && vStart < objEnd) {
-                                vStart++;
-                                const char* vEnd = strchr(vStart, '"');
-                                if (vEnd && vEnd < objEnd) {
-                                    int len = (int)(vEnd - vStart);
-                                    if (len > 0 && len < 64) {
-                                        strncpy(sess->sessionId, vStart, len);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Extract simNumber
-                    const char* numKey = strstr(objStart, "\"simNumber\"");
-                    if (numKey && numKey < objEnd) {
-                        const char* colon = strchr(numKey, ':');
-                        if (colon && colon < objEnd) {
-                            const char* vStart = strchr(colon, '"');
-                            if (vStart && vStart < objEnd) {
-                                vStart++;
-                                const char* vEnd = strchr(vStart, '"');
-                                if (vEnd && vEnd < objEnd) {
-                                    int len = (int)(vEnd - vStart);
-                                    if (len > 0 && len < PHONE_BUFFER_SIZE) {
-                                        strncpy(sess->simNumber, vStart, len);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Extract appName
-                    const char* appKey = strstr(objStart, "\"appName\"");
-                    if (appKey && appKey < objEnd) {
-                        const char* colon = strchr(appKey, ':');
-                        if (colon && colon < objEnd) {
-                            const char* vStart = strchr(colon, '"');
-                            if (vStart && vStart < objEnd) {
-                                vStart++;
-                                const char* vEnd = strchr(vStart, '"');
-                                if (vEnd && vEnd < objEnd) {
-                                    int len = (int)(vEnd - vStart);
-                                    if (len > 0 && len < 32) {
-                                        strncpy(sess->appName, vStart, len);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Extract slot
-                    const char* slotKey = strstr(objStart, "\"slot\"");
-                    if (slotKey && slotKey < objEnd) {
-                        const char* colon = strchr(slotKey, ':');
-                        if (colon && colon < objEnd) {
-                            sess->slot = atoi(colon + 1);
-                        }
-                    }
-
-                    // Extract messageCount
-                    const char* msgKey = strstr(objStart, "\"messageCount\"");
-                    if (msgKey && msgKey < objEnd) {
-                        const char* colon = strchr(msgKey, ':');
-                        if (colon && colon < objEnd) {
-                            sess->messageCount = atoi(colon + 1);
-                        }
-                    }
-
-                    // Extract expiresAt (ISO format: 2026-05-07T16:30:00.000Z or +00:00)
-                    const char* expKey = strstr(objStart, "\"expiresAt\"");
-                    if (expKey && expKey < objEnd) {
-                        const char* colon = strchr(expKey, ':');
-                        if (colon && colon < objEnd) {
-                            const char* vStart = strchr(colon, '"');
-                            if (vStart && vStart < objEnd) {
-                                vStart++;
-                                const char* vEnd = strchr(vStart, '"');
-                                if (vEnd && vEnd < objEnd) {
-                                    // Parse ISO timestamp: YYYY-MM-DDTHH:MM:SS
-                                    int year, month, day, hour, min, sec;
-                                    if (sscanf(vStart, "%d-%d-%dT%d:%d:%d", &year, &month, &day, &hour, &min, &sec) >= 6) {
-                                        // Manual UTC to Unix timestamp conversion
-                                        // Days per month (non-leap year)
-                                        static const int daysInMonth[] = {31,28,31,30,31,30,31,31,30,31,30,31};
-
-                                        // Calculate days since 1970-01-01
-                                        long days = 0;
-
-                                        // Add days for complete years
-                                        for (int y = 1970; y < year; y++) {
-                                            days += 365;
-                                            // Leap year check
-                                            if ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)) {
-                                                days += 1;
-                                            }
-                                        }
-
-                                        // Add days for complete months in current year
-                                        for (int m = 1; m < month; m++) {
-                                            days += daysInMonth[m - 1];
-                                            // February in leap year
-                                            if (m == 2 && ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0))) {
-                                                days += 1;
-                                            }
-                                        }
-
-                                        // Add days in current month
-                                        days += day - 1;
-
-                                        // Convert to Unix timestamp (seconds)
-                                        time_t ts = days * 86400L + hour * 3600L + min * 60L + sec;
-                                        sess->expiresAtMs = ts * 1000L;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    activeSessionCount++;
-                    p2 = objEnd + 1;
-                }
-            }
-        }
+    } else if (code < 200 || code >= 300) {
+        appendMonitorLog("[HEARTBEAT] Keeping local sessions (request failed)");
+        pruneExpiredActiveSessions();
+        maintenanceOnSessionsUpdated();
     }
 
     if (code > 0 && code < 400) {
         deviceRegistered = true;
-        logMsgInt("[HEARTBEAT] OK, code", code);
-    } else {
-        logMsgInt("[HEARTBEAT] Failed, code", code);
     }
 }
 

@@ -4,6 +4,7 @@
 
 #include "webui.h"
 #include "ota.h"
+#include "calls.h"
 #include "mux.h"
 #include "config.h"
 #include "sim800.h"
@@ -11,17 +12,24 @@
 #include "sms.h"
 #include "logger.h"
 #include "utils.h"
+#include "ussd.h"
 #include <WiFi.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
 #include <time.h>
+#include <stdarg.h>
+#include <stdlib.h>
 
 // Web server on port 80
 WebServer server(80);
 
 static volatile bool refreshAllInProgress = false;
+
+bool isWebRefreshAllInProgress() {
+    return refreshAllInProgress;
+}
 
 // Preferences for storing settings (defined in main .ino)
 extern Preferences preferences;
@@ -58,8 +66,6 @@ extern bool ntpConfigured;
 extern bool heartbeatPaused;
 
 // Forward declarations for handlers
-void handleScanNetworks();
-void handleSelectNetwork();
 void handleErrorLog();
 void handleClearErrorLog();
 
@@ -666,8 +672,110 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
     
     .sim-actions {
       display: flex;
+      flex-wrap: wrap;
       gap: 4px;
       margin-top: 8px;
+    }
+
+    .sim-ussd {
+      font-size: 10px;
+      margin-top: 6px;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+    .sim-ussd.ok { color: var(--success); }
+    .sim-ussd.err { color: var(--danger); }
+    .sim-ussd.pending { color: var(--muted); }
+    .sim-card.ussd-checking {
+      outline: 2px solid var(--primary);
+      outline-offset: -2px;
+    }
+
+    .ussd-bulk-panel { margin-bottom: 12px; }
+    .ussd-bulk-head { cursor: pointer; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 12px 16px; }
+    .ussd-bulk-head h4 { margin: 0; font-size: 14px; flex: 1; }
+    .ussd-bulk-panel.collapsed .ussd-bulk-collapse { display: none; }
+    #ussdBulkChevron { font-size: 12px; color: var(--muted); }
+    .ussd-bulk-ok { color: var(--success); }
+    .ussd-bulk-fail { color: var(--danger); }
+    .ussd-bulk-line { font-size: 12px; margin: 4px 0; font-family: 'SF Mono', Consolas, monospace; }
+
+    /* Settings — service rows with status pills */
+    .settings-card .card-header { margin-bottom: 4px; }
+    .settings-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 0;
+      border-bottom: 1px solid var(--card-border);
+    }
+    .settings-row:last-child { border-bottom: none; padding-bottom: 0; }
+    .settings-row-title { font-size: 13px; font-weight: 600; color: var(--text); }
+    .settings-row-desc { font-size: 12px; color: var(--muted); margin-top: 4px; line-height: 1.45; max-width: 440px; }
+    .settings-row-side {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 11px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .status-pill.on { background: rgba(34, 197, 94, 0.14); color: var(--success); }
+    .status-pill.off { background: rgba(148, 163, 184, 0.12); color: var(--muted); }
+    .status-pill.warn { background: rgba(234, 179, 8, 0.14); color: var(--warning); }
+    .status-pill .status-dot { width: 7px; height: 7px; animation: none; flex-shrink: 0; }
+
+    /* SIM tab toolbar */
+    .sim-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+      padding-bottom: 14px;
+      border-bottom: 1px solid var(--card-border);
+    }
+    .sim-stat-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      border-radius: 8px;
+      background: var(--bg);
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .sim-stat-pill .stat-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--success);
+      flex-shrink: 0;
+    }
+    .sim-stat-pill.warn .stat-dot { background: var(--warning); }
+    .sim-toolbar-actions { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+    .action-group { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .action-group-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      font-weight: 600;
+      margin-right: 2px;
     }
 
     /* Session info inside SIM card */
@@ -1246,7 +1354,6 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
         </div>
         <div class="btn-group">
           <button class="btn sm secondary" id="registerDeviceBtn">Register Device</button>
-          <button class="btn sm secondary" id="registerAllSimsBtn">Register All SIMs</button>
           <button class="btn sm danger" id="logoutBtn">Logout</button>
         </div>
       </div>
@@ -1259,12 +1366,33 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
         <p class="page-subtitle">Manage your SIM cards</p>
       </div>
 
-      <div class="card">
-        <div class="card-header">
-          <span class="text-sm muted" id="simCount">0 active</span>
-          <div class="btn-group">
-            <button class="btn xs secondary" id="checkAllBtn">Check All</button>
-            <button class="btn xs secondary" id="pausePollingBtn">Pause Polling</button>
+      <div class="card ussd-bulk-panel" id="ussdBulkPanel">
+        <div class="ussd-bulk-head" id="ussdBulkHead" onclick="toggleUssdBulkPanel()">
+          <h4>*143# bulk results</h4>
+          <span id="ussdBulkSummary" class="muted text-sm"></span>
+          <span id="ussdBulkChevron">▼</span>
+        </div>
+        <div id="ussdBulkCollapse" class="ussd-bulk-collapse">
+          <div id="ussdBulkBody" class="muted text-sm" style="padding:0 16px 14px;">*143# All: slots with a number only (Off OK).</div>
+        </div>
+      </div>
+
+      <div class="card sim-slots-card">
+        <div class="sim-toolbar">
+          <span class="sim-stat-pill" id="simCountPill">
+            <span class="stat-dot" id="simCountDot"></span>
+            <span id="simCount">0 active slots</span>
+          </span>
+          <div class="sim-toolbar-actions">
+            <div class="action-group">
+              <span class="action-group-label">Slots</span>
+              <button class="btn sm secondary" id="checkAllBtn" title="Re-scan signal, registration, and numbers for every slot">Refresh slots</button>
+              <button class="btn sm danger" id="disableAllSimsBtn" title="Turn off every SIM slot">Disable all</button>
+            </div>
+            <div class="action-group">
+              <span class="action-group-label">Balance</span>
+              <button class="btn sm secondary" id="ussdBulkBtn" title="Dial *143# on each slot that has a number">*143# all</button>
+            </div>
           </div>
         </div>
         <div class="sim-grid" id="simGrid"></div>
@@ -1312,11 +1440,14 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
         <p class="page-subtitle">Configure your gateway</p>
       </div>
       
-      <div class="card">
+      <div class="card settings-card">
         <div class="card-header">
-          <div class="card-title">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
-            Backend Configuration
+          <div>
+            <div class="card-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+              Backend
+            </div>
+            <p class="card-subtitle">OTPocket agent URL, API path, and device identity</p>
           </div>
         </div>
         
@@ -1333,34 +1464,88 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
           <input id="deviceId" placeholder="SIM800-XXXXXX (auto-generated if empty)" />
           <p class="muted" style="font-size:12px;margin-top:4px;">Used for heartbeat and backend registration. Save after editing.</p>
         </div>
-        <button class="btn full" id="saveConfigBtn">Save Configuration</button>
+        <button class="btn full" id="saveConfigBtn">Save backend settings</button>
       </div>
-      
-      <div class="card">
+
+      <div class="card settings-card">
         <div class="card-header">
-          <div class="card-title">Heartbeat</div>
-          <button class="btn xs secondary" id="pauseHeartbeatBtn">Pause HB</button>
+          <div>
+            <div class="card-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+              Gateway services
+            </div>
+            <p class="card-subtitle">Heartbeat, SMS polling, and missed-call forwarding</p>
+          </div>
+        </div>
+
+        <div class="settings-row">
+          <div class="settings-row-main">
+            <div class="settings-row-title">Heartbeat</div>
+            <p class="settings-row-desc">Reports slot status and health to the backend on a schedule.</p>
+          </div>
+          <div class="settings-row-side">
+            <span class="status-pill on" id="heartbeatStatusPill"><span class="status-dot ok"></span> Active</span>
+            <button class="btn sm secondary" id="pauseHeartbeatBtn">Pause heartbeat</button>
+          </div>
+        </div>
+
+        <div class="settings-row">
+          <div class="settings-row-main">
+            <div class="settings-row-title">SMS polling</div>
+            <p class="settings-row-desc">Reads incoming SMS from enabled SIM slots. Pause temporarily stops reads (5 min per toggle).</p>
+          </div>
+          <div class="settings-row-side">
+            <span class="status-pill on" id="smsPollingStatusPill"><span class="status-dot ok"></span> Active</span>
+            <button class="btn sm secondary" id="pausePollingBtn">Pause SMS polling</button>
+          </div>
+        </div>
+
+        <div class="settings-row">
+          <div class="settings-row-main">
+            <div class="settings-row-title">Missed-call forwarding</div>
+            <p class="settings-row-desc">Forwards missed calls as Viber SMS (last 6 digits) during an active OTP session only. Queued up to 10 minutes before a session starts.</p>
+          </div>
+          <div class="settings-row-side">
+            <span class="status-pill off" id="missedCallStatusPill"><span class="status-dot"></span> Off</span>
+            <button class="btn sm success" id="toggleMissedCallBtn">Enable forwarding</button>
+          </div>
         </div>
       </div>
-      
-      <div class="card">
+
+      <div class="card settings-card" id="firmwareCard">
         <div class="card-header">
-          <div class="card-title">Firmware (OTA)</div>
+          <div>
+            <div class="card-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              Firmware update
+            </div>
+            <p class="card-subtitle">Manual OTA from GitHub — also checked every 12 hours</p>
+          </div>
+          <span class="status-pill off" id="firmwareStatusPill"><span class="status-dot"></span> Not checked</span>
         </div>
-        <p class="muted" style="margin-bottom: 12px; font-size: 13px;">
-          Installed: <strong id="fwVersion">-</strong>
-          <span id="fwRemoteWrap" class="hide"> · Latest: <strong id="fwRemoteVersion">-</strong></span>
-        </p>
-        <div class="form-group">
-          <label for="otaUrl">Firmware URL (.bin)</label>
-          <input id="otaUrl" placeholder="https://github.com/user/repo/releases/latest/download/firmware.bin" />
+
+        <div class="settings-row">
+          <div class="settings-row-main">
+            <div class="settings-row-title">Installed version</div>
+            <p class="settings-row-desc">Bump <code style="font-size:11px;">FIRMWARE_VERSION</code> in config.h each release; match <code style="font-size:11px;">firmware/version.txt</code> on GitHub.</p>
+          </div>
+          <div class="settings-row-side">
+            <span class="text-sm" id="fwVersion" style="font-family:monospace;font-weight:600;">-</span>
+          </div>
         </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
-          <button class="btn secondary" id="saveOtaUrlBtn">Save URL</button>
-          <button class="btn secondary" id="checkFwBtn">Check Update</button>
-          <button class="btn" id="updateFwBtn">Install Update</button>
+
+        <div class="settings-row">
+          <div class="settings-row-main">
+            <div class="settings-row-title">Latest on GitHub</div>
+            <p class="settings-row-desc" id="fwRemoteVersion" style="font-family:monospace;">-</p>
+          </div>
+          <div class="settings-row-side">
+            <button class="btn sm secondary" id="checkFirmwareBtn">Check for updates</button>
+            <button class="btn sm warning" id="installFirmwareBtn" disabled>Install update</button>
+          </div>
         </div>
-        <p class="muted" id="fwStatus" style="margin-top:12px;font-size:12px;"></p>
+
+        <p class="muted" style="font-size:11px;margin:0;line-height:1.45;">Download URL:<br><span id="otaUrlDisplay" style="font-family:monospace;word-break:break-all;">-</span></p>
       </div>
       
       <div class="card" style="border-color: var(--danger);">
@@ -1401,19 +1586,6 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
   </div>
     </main>
   </div><!-- app-layout -->
-  
-  <!-- Network Selection Modal -->
-  <div id="networkModal" class="modal hide">
-    <div class="modal-content">
-      <div class="modal-header">
-        <h3 class="modal-title">Network Selection</h3>
-        <button class="modal-close" onclick="closeNetworkModal()">×</button>
-      </div>
-      <div id="networkList">
-        <div class="muted text-center">Loading...</div>
-      </div>
-    </div>
-  </div>
   
   <!-- Toast -->
   <div id="toast" class="toast hide"></div>
@@ -1668,15 +1840,10 @@ async function refreshStatus() {
     if ($('statFailed')) $('statFailed').textContent = s.total_failed || 0;
     if ($('statPending')) $('statPending').textContent = s.pending_sms || 0;
     
-    // Heartbeat pause button
-    const hbBtn = $('pauseHeartbeatBtn');
-    if (hbBtn) {
-      hbBtn.textContent = s.heartbeat_paused ? 'Resume HB' : 'Pause HB';
-      hbBtn.className = s.heartbeat_paused ? 'btn xs warning' : 'btn xs secondary';
-    }
+    updateGatewayServicesUi(s);
     
     if ($('fwVersion')) $('fwVersion').textContent = s.firmware_version || '-';
-    if ($('otaUrl') && s.ota_url && !$('otaUrl').value) $('otaUrl').value = s.ota_url;
+    if ($('otaUrlDisplay') && s.ota_url) $('otaUrlDisplay').textContent = s.ota_url;
     
     // Active sessions card in SIM Slots tab
     const sessionsCard = $('sessionsCard');
@@ -1707,8 +1874,12 @@ async function refreshStatus() {
       }
     }
 
-    // Refresh SIM cards to show session timers
-    refreshSims();
+    // Refresh SIM cards — skip full rebuild while USSD is running (avoids stale error flash)
+    if (window.ussdManualBusy || window.ussdPendingSlot != null || window.ussdBulkPolling) {
+      updateSimCardTimers();
+    } else {
+      refreshSims();
+    }
 
   } catch(e) {
     console.error('Status error:', e);
@@ -1945,14 +2116,69 @@ async function disconnectWifi() {
   setTimeout(refreshStatus, 1000);
 }
 
+function toggleUssdBulkPanel() {
+  const p = $('ussdBulkPanel');
+  const ch = $('ussdBulkChevron');
+  if (!p) return;
+  p.classList.toggle('collapsed');
+  if (ch) ch.textContent = p.classList.contains('collapsed') ? '▶' : '▼';
+}
+
+function ussdSecLabel(sec) {
+  if (sec == null || sec <= 0) return '';
+  return ' · ' + sec + 's';
+}
+
+function escHtml(str) {
+  if (str == null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function updateUssdBulkButton(s) {
+  const bulkBtn = $('ussdBulkBtn');
+  const active = s.ussd_bulk_active || window.ussdBulkPolling;
+  if (!bulkBtn) return;
+  bulkBtn.disabled = !!active;
+  bulkBtn.textContent = active ? 'Checking…' : '*143# All';
+}
+
+function setUssdBulkRunningUi(st) {
+  const summary = $('ussdBulkSummary');
+  const body = $('ussdBulkBody');
+  const panel = $('ussdBulkPanel');
+  if (panel) panel.classList.remove('collapsed');
+  const ch = $('ussdBulkChevron');
+  if (ch) ch.textContent = '▼';
+  const cur = st.current_sim || '?';
+  const done = st.done != null ? st.done : 0;
+  const total = st.total != null ? st.total : '?';
+  if (summary) {
+    summary.innerHTML = '<span class="spinner"></span> SIM <strong>' + cur + '</strong> (' + done + '/' + total + ')';
+  }
+  if (body) body.innerHTML = '';
+}
+
 async function refreshSims() {
+  const grid = $('simGrid');
+  if (!grid) return;
   try {
     const s = await get('/sim-config');
-    const grid = $('simGrid');
-    if (!grid) return;
+    if (!s || s.success === false) {
+      throw new Error((s && s.error) ? s.error : 'sim-config failed');
+    }
+    if (!s.enabled || !Array.isArray(s.enabled)) {
+      throw new Error('Invalid sim-config response');
+    }
     grid.innerHTML = '';
 
     let activeCount = 0;
+    const bulkCurrent = (s.ussd_bulk_current != null) ? s.ussd_bulk_current : -1;
+    const pendingSlot = window.ussdPendingSlot;
 
     // Build session map by slot
     const sessionsBySlot = {};
@@ -1967,38 +2193,43 @@ async function refreshSims() {
     for (let i = 0; i < s.enabled.length; i++) {
       const div = document.createElement('div');
 
-      // Extract signal strength from CSQ
       let rssi = null;
       let bars = 0;
-      if (s.csq && s.csq[i]) {
+      if (s.csq_rssi && s.csq_rssi[i] != null && s.csq_rssi[i] >= 0) {
+        rssi = s.csq_rssi[i];
+      } else if (s.csq && s.csq[i]) {
         const csqMatch = s.csq[i].match(/\+CSQ:\s*(\d+)/);
-        if (csqMatch) {
-          rssi = parseInt(csqMatch[1]);
-          if (rssi === 99) bars = 0;
-          else if (rssi >= 20) bars = 4;
-          else if (rssi >= 15) bars = 3;
-          else if (rssi >= 10) bars = 2;
-          else if (rssi >= 5) bars = 1;
-        }
+        if (csqMatch) rssi = parseInt(csqMatch[1]);
+      }
+      if (rssi != null) {
+        if (rssi === 99) bars = 0;
+        else if (rssi >= 20) bars = 4;
+        else if (rssi >= 15) bars = 3;
+        else if (rssi >= 10) bars = 2;
+        else if (rssi >= 5) bars = 1;
       }
 
-      // Extract network from COPS
       let network = '-';
-      if (s.cops && s.cops[i]) {
+      if (s.operators && s.operators[i]) {
+        network = s.operators[i];
+      } else if (s.cops && s.cops[i]) {
         const copsMatch = s.cops[i].match(/"([^"]+)"/);
         if (copsMatch) network = copsMatch[1];
       }
 
       const num = s.numbers[i] || '-';
       const isResponsive = s.responsive && s.responsive[i];
-      const isBackendReg = s.backend_registered && s.backend_registered[i];
       const isEnabled = s.enabled[i];
+      const ussdSt = (s.ussd_status && s.ussd_status[i]) ? s.ussd_status[i] : 0;
+      const ussdMsg = (s.ussd_result && s.ussd_result[i]) ? s.ussd_result[i] : '';
+      const ussdSec = (s.ussd_duration_sec && s.ussd_duration_sec[i] != null) ? s.ussd_duration_sec[i] : 0;
 
       if (isEnabled && isResponsive) activeCount++;
 
       // Card classes
+      const isManualOff = s.user_disabled && s.user_disabled[i];
       let cardClass = 'sim-card';
-      if (!isEnabled) cardClass += ' disabled';
+      if (!isEnabled || isManualOff) cardClass += ' disabled';
       else if (isResponsive && s.registered[i]) cardClass += ' active';
 
       // Status dot
@@ -2022,7 +2253,7 @@ async function refreshSims() {
       const battery = (s.battery_pct && s.battery_pct[i] != null) ? s.battery_pct[i] : -1;
 
       // Copy button for number
-      const copyBtn = num !== '-' ? `<button class="copy-btn" onclick="copyText(this, '${num}')" title="Copy number"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>` : '';
+      const copyBtn = num !== '-' ? `<button class="copy-btn" data-copy="${escHtml(num)}" title="Copy number"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>` : '';
 
       // Session info for this slot
       const sess = sessionsBySlot[i];
@@ -2050,32 +2281,63 @@ async function refreshSims() {
           </div>`;
       }
 
-      div.className = cardClass;
+      const isChecking = (ussdSt === 3) || (pendingSlot === i) ||
+        ((s.ussd_bulk_active || window.ussdBulkPolling) && bulkCurrent === i);
+      let ussdHtml = '';
+      if (isChecking) {
+        ussdHtml = '<div class="sim-ussd pending">*143# checking…</div>';
+      } else if (ussdSt === 1) {
+        const bal = escHtml(ussdMsg || '');
+        ussdHtml = `<div class="sim-ussd ok">Balance: ${bal || '—'}${ussdSecLabel(ussdSec)}</div>`;
+      } else if (ussdSt === 2) {
+        const err = escHtml(ussdMsg || 'Error');
+        const label = err === 'No response' ? 'No response' : 'Error';
+        ussdHtml = `<div class="sim-ussd err">${label}${ussdSecLabel(ussdSec)}</div>`;
+      }
+
+      div.className = cardClass + (isChecking ? ' ussd-checking' : '');
       div.innerHTML = `
         <div class="sim-header">
           <span class="sim-slot">SIM ${i + 1}</span>
           <div class="${statusClass}"></div>
         </div>
-        <div class="sim-number">${num} ${copyBtn}</div>
+        <div class="sim-number">${escHtml(num)} ${copyBtn}</div>
+        ${isManualOff ? '<div class="sim-manual-off" style="font-size:11px;color:var(--warning);margin-top:4px;">Manual OFF — heartbeat will not re-enable</div>' : ''}
         <div class="sim-meta">
           ${signalHtml}
           <span title="Signal strength">${signalText}</span>
-          <span>${network}</span>
+          <span>${escHtml(network)}</span>
           ${battery >= 0 ? `<span>BAT ${battery}%</span>` : ''}
         </div>
         ${sessionHtml}
+        ${ussdHtml}
         <div class="sim-actions">
           <button class="btn xs ${isEnabled ? 'danger' : 'success'}" onclick="toggleSim(${i})">${isEnabled ? 'Off' : 'On'}</button>
-          ${isBackendReg ? '<span class="badge primary">Reg</span>' : (isResponsive && isEnabled && num !== '-') ? `<button class="btn xs secondary" id="regSimBtn${i}" onclick="registerSimSlot(${i})">Reg</button>` : ''}
-          ${isResponsive ? `<button class="btn xs secondary" onclick="showNetworkModal(${i})">Net</button>` : ''}
+          ${num !== '-' && !window.ussdManualBusy && !window.ussdBulkPolling ? `<button class="btn xs secondary" onclick="checkUssdSlot(${i})" title="Dial *143#">*143#</button>` : ''}
         </div>
       `;
       grid.appendChild(div);
     }
 
     // Update active count
-    $('simCount').textContent = activeCount + ' active';
-  } catch(e) {}
+    const simCountEl = $('simCount');
+    const simCountPill = $('simCountPill');
+    if (simCountEl) {
+      simCountEl.textContent = activeCount + (activeCount === 1 ? ' active slot' : ' active slots');
+    }
+    if (simCountPill) {
+      simCountPill.classList.toggle('warn', activeCount === 0);
+    }
+    updateUssdBulkButton(s);
+    grid.querySelectorAll('.copy-btn[data-copy]').forEach(btn => {
+      btn.onclick = () => copyText(btn, btn.getAttribute('data-copy'));
+    });
+  } catch(e) {
+    console.error('refreshSims failed:', e);
+    if (grid) {
+      grid.innerHTML = '<div class="muted" style="padding:16px;color:var(--danger);">SIM list failed to load. Retry or check serial log.<br><small>' + escHtml(e.message || String(e)) + '</small></div>';
+    }
+  }
 }
 
 // Copy text helper with checkmark animation
@@ -2182,34 +2444,151 @@ async function refreshSmsList() {
 }
 
 async function checkAllSims() {
-  $('checkAllBtn').innerHTML = '<span class="spinner"></span>';
+  const btn = $('checkAllBtn');
+  if (!btn) return;
+  btn.innerHTML = '<span class="spinner"></span>';
+  btn.disabled = true;
   try {
-    const r = await get('/check-all-sim');
+    await get('/check-all-sim');
     await refreshSims();
+    toast('Slot scan complete');
   } catch(e) {
-    toast('Refresh failed');
+    toast('Slot refresh failed');
   }
-  $('checkAllBtn').textContent = 'Refresh';
+  btn.textContent = 'Refresh slots';
+  btn.disabled = false;
+}
+
+function setStatusPill(el, state, label) {
+  if (!el) return;
+  el.className = 'status-pill ' + state;
+  const dotClass = state === 'on' ? 'ok' : (state === 'warn' ? 'warn' : '');
+  el.innerHTML = '<span class="status-dot' + (dotClass ? ' ' + dotClass : '') + '"></span> ' + label;
+}
+
+function updateGatewayServicesUi(s) {
+  if (!s) return;
+
+  const hbPaused = !!s.heartbeat_paused;
+  const pollPaused = !!s.sms_polling_paused;
+  const mcfOn = !!s.missed_call_forward;
+  const watchSim = s.missed_call_watch_sim || 0;
+
+  setStatusPill($('heartbeatStatusPill'), hbPaused ? 'off' : 'on', hbPaused ? 'Paused' : 'Active');
+  const hbBtn = $('pauseHeartbeatBtn');
+  if (hbBtn) {
+    hbBtn.textContent = hbPaused ? 'Resume heartbeat' : 'Pause heartbeat';
+    hbBtn.className = hbPaused ? 'btn sm warning' : 'btn sm secondary';
+  }
+
+  setStatusPill($('smsPollingStatusPill'), pollPaused ? 'warn' : 'on', pollPaused ? 'Paused' : 'Active');
+  const pollBtn = $('pausePollingBtn');
+  if (pollBtn) {
+    pollBtn.textContent = pollPaused ? 'Resume SMS polling' : 'Pause SMS polling';
+    pollBtn.className = pollPaused ? 'btn sm warning' : 'btn sm secondary';
+  }
+
+  let mcfState = mcfOn ? 'on' : 'off';
+  let mcfLabel = mcfOn ? 'On' : 'Off';
+  if (mcfOn && watchSim > 0) {
+    mcfState = 'on';
+    mcfLabel = 'On · SIM ' + watchSim;
+  }
+  setStatusPill($('missedCallStatusPill'), mcfState, mcfLabel);
+
+  const mcfBtn = $('toggleMissedCallBtn');
+  if (mcfBtn) {
+    mcfBtn.textContent = mcfOn ? 'Disable forwarding' : 'Enable forwarding';
+    mcfBtn.className = mcfOn ? 'btn sm warning' : 'btn sm success';
+  }
 }
 
 async function togglePollingPause() {
   try {
     const r = await post('/toggle-polling', {});
     if (r.success) {
-      toast(r.message || 'Toggled');
-      const btn = $('pausePollingBtn');
-      if (r.paused) {
-        btn.textContent = 'Resume SMS';
-        btn.className = 'btn xs warning';
-      } else {
-        btn.textContent = 'Pause SMS';
-        btn.className = 'btn xs secondary';
-      }
+      toast(r.message || 'SMS polling updated');
+      const st = await get('/status');
+      updateGatewayServicesUi(st);
     } else {
       toast(r.error || 'Failed');
     }
   } catch(e) {
-    toast('Failed to toggle');
+    toast('Failed to toggle SMS polling');
+  }
+}
+
+async function toggleMissedCallForward() {
+  try {
+    const s = await get('/status');
+    const turnOn = !s.missed_call_forward;
+    const r = await post('/toggle-missed-call', { enabled: turnOn ? 1 : 0 });
+    if (r.success) {
+      const st = await get('/status');
+      st.missed_call_forward = r.enabled;
+      updateGatewayServicesUi(st);
+      toast(r.message || (r.enabled ? 'Missed-call forwarding enabled' : 'Missed-call forwarding disabled'));
+    } else {
+      toast(r.error || 'Failed');
+    }
+  } catch (e) {
+    toast('Failed to toggle missed-call forwarding');
+  }
+}
+
+async function checkFirmwareUpdate() {
+  const btn = $('checkFirmwareBtn');
+  if (btn) {
+    btn.innerHTML = '<span class="spinner"></span>';
+    btn.disabled = true;
+  }
+  try {
+    const r = await get('/firmware-check');
+    if ($('fwVersion')) $('fwVersion').textContent = r.current || '-';
+    if ($('fwRemoteVersion')) {
+      $('fwRemoteVersion').textContent = r.remote ? ('v' + r.remote) : (r.message || 'Could not fetch');
+    }
+    const pill = $('firmwareStatusPill');
+    const installBtn = $('installFirmwareBtn');
+    if (r.success && r.update_available) {
+      setStatusPill(pill, 'warn', 'Update available');
+      if (installBtn) installBtn.disabled = false;
+      toast('Update available: v' + r.remote);
+    } else if (r.success) {
+      setStatusPill(pill, 'on', 'Up to date');
+      if (installBtn) installBtn.disabled = true;
+      toast('Firmware is up to date');
+    } else {
+      setStatusPill(pill, 'off', 'Check failed');
+      if (installBtn) installBtn.disabled = true;
+      toast(r.message || 'Could not check firmware');
+    }
+  } catch (e) {
+    setStatusPill($('firmwareStatusPill'), 'off', 'Check failed');
+    toast('Firmware check failed');
+  }
+  if (btn) {
+    btn.textContent = 'Check for updates';
+    btn.disabled = false;
+  }
+}
+
+async function installFirmwareUpdate() {
+  if (!confirm('Download firmware from GitHub and restart now?')) return;
+  const btn = $('installFirmwareBtn');
+  if (btn) {
+    btn.innerHTML = '<span class="spinner"></span>';
+    btn.disabled = true;
+  }
+  toast('Downloading firmware… device will restart');
+  try {
+    await post('/firmware-update', {});
+  } catch (e) {
+    toast('Update request failed');
+    if (btn) {
+      btn.textContent = 'Install update';
+      btn.disabled = false;
+    }
   }
 }
 
@@ -2217,20 +2596,176 @@ async function toggleHeartbeatPause() {
   try {
     const r = await post('/toggle-heartbeat', {});
     if (r.success) {
-      toast(r.message || 'Toggled');
-      const btn = $('pauseHeartbeatBtn');
-      if (r.paused) {
-        btn.textContent = 'Resume HB';
-        btn.className = 'btn xs warning';
-      } else {
-        btn.textContent = 'Pause HB';
-        btn.className = 'btn xs secondary';
-      }
+      toast(r.message || 'Heartbeat updated');
+      const st = await get('/status');
+      st.heartbeat_paused = r.paused;
+      updateGatewayServicesUi(st);
     } else {
       toast(r.error || 'Failed');
     }
   } catch(e) {
-    toast('Failed to toggle');
+    toast('Failed to toggle heartbeat');
+  }
+}
+
+let ussdManualPollTimer = null;
+
+async function checkUssdSlot(idx) {
+  if (window.ussdManualBusy) {
+    toast('*143# check already running');
+    return;
+  }
+  window.ussdManualBusy = true;
+  window.ussdPendingSlot = idx;
+  refreshSims();
+  try {
+    const r = await post('/ussd-check', { slot: idx });
+    if (!r.success || !r.started) {
+      window.ussdManualBusy = false;
+      window.ussdPendingSlot = null;
+      toast(r.error || 'Could not start USSD');
+      refreshSims();
+      return;
+    }
+    toast('Checking SIM ' + (idx + 1) + '…');
+    let polls = 0;
+    const maxPolls = 120;
+    if (ussdManualPollTimer) clearInterval(ussdManualPollTimer);
+    ussdManualPollTimer = setInterval(async () => {
+      polls++;
+      if (polls > maxPolls) {
+        clearInterval(ussdManualPollTimer);
+        ussdManualPollTimer = null;
+        window.ussdManualBusy = false;
+        window.ussdPendingSlot = null;
+        toast('USSD check timed out');
+        refreshSims();
+        return;
+      }
+      try {
+        const st = await get('/ussd-manual-status');
+        if (st.in_progress) {
+          if (st.slot != null) window.ussdPendingSlot = st.slot;
+          refreshSims();
+          return;
+        }
+        clearInterval(ussdManualPollTimer);
+        ussdManualPollTimer = null;
+        window.ussdManualBusy = false;
+        window.ussdPendingSlot = null;
+        const sec = st.duration_sec != null ? st.duration_sec : 0;
+        const simNum = st.sim != null ? st.sim : (idx + 1);
+        if (st.ok) {
+          toast('SIM ' + simNum + ': Balance ' + (st.message || '—') + ussdSecLabel(sec));
+        } else {
+          toast('SIM ' + simNum + ': ' + (st.message || 'Error') + ussdSecLabel(sec));
+        }
+        refreshSims();
+      } catch (e) {
+        console.error('ussd manual poll', e);
+      }
+    }, 800);
+  } catch (e) {
+    window.ussdManualBusy = false;
+    window.ussdPendingSlot = null;
+    toast('Could not start USSD check');
+    refreshSims();
+  }
+}
+
+let ussdBulkPollTimer = null;
+
+function renderUssdBulkResults(data) {
+  const panel = $('ussdBulkPanel');
+  const body = $('ussdBulkBody');
+  const summary = $('ussdBulkSummary');
+  if (!panel || !body) return;
+  panel.classList.remove('collapsed');
+  const ch = $('ussdBulkChevron');
+  if (ch) ch.textContent = '▼';
+
+  const okN = data.ok_count != null ? data.ok_count : (data.results ? data.results.filter(x => x.ok).length : 0);
+  const failN = data.fail_count != null ? data.fail_count : (data.results ? data.results.filter(x => !x.ok).length : 0);
+  if (summary) summary.textContent = okN + ' OK · ' + failN + ' failed';
+
+  if (!data.results || data.results.length === 0) {
+    body.innerHTML = '<span class="muted">No results.</span>';
+    return;
+  }
+
+  const okList = data.results.filter(x => x.ok);
+  const failList = data.results.filter(x => !x.ok);
+
+  let html = '';
+
+  if (okList.length) {
+    html += '<p class="ussd-bulk-ok" style="margin-top:10px;font-weight:600;">Success</p>';
+    okList.forEach(r => {
+      html += `<div class="ussd-bulk-line ussd-bulk-ok">SIM ${r.sim} · ${escHtml(r.number)} · Balance ${escHtml(r.message || '—')}${ussdSecLabel(r.duration_sec)}</div>`;
+    });
+  }
+  if (failList.length) {
+    html += '<p class="ussd-bulk-fail" style="margin-top:10px;font-weight:600;">Failed</p>';
+    failList.forEach(r => {
+      const fl = r.message === 'No response' ? 'No response' : 'Error';
+      html += `<div class="ussd-bulk-line ussd-bulk-fail">SIM ${r.sim} · ${escHtml(r.number)} · ${fl}${ussdSecLabel(r.duration_sec)}</div>`;
+    });
+  }
+  body.innerHTML = html;
+}
+
+async function bulkCheckUssd() {
+  if (ussdBulkPollTimer) {
+    toast('Bulk *143# already running');
+    return;
+  }
+  try {
+    const r = await post('/ussd-bulk', {});
+    if (!r.success) {
+      toast(r.error || 'Could not start bulk check');
+      return;
+    }
+    window.ussdBulkPolling = true;
+    window.ussdBulkTotal = r.total || 0;
+    window.ussdBulkDone = 0;
+    const panel = $('ussdBulkPanel');
+    const body = $('ussdBulkBody');
+    const summary = $('ussdBulkSummary');
+    if (panel) { panel.classList.remove('collapsed'); }
+    const ch = $('ussdBulkChevron');
+    if (ch) ch.textContent = '▼';
+    if (summary) summary.innerHTML = '<span class="spinner"></span> Starting (' + (r.total || '?') + ' SIMs)…';
+    if (body) body.innerHTML = '';
+    refreshSims();
+
+    ussdBulkPollTimer = setInterval(async () => {
+      try {
+        const st = await get('/ussd-bulk-status');
+        if (st.in_progress) {
+          window.ussdBulkDone = st.done || 0;
+          window.ussdBulkTotal = st.total || window.ussdBulkTotal;
+          window.ussdBulkCurrentSim = st.current_sim || null;
+          setUssdBulkRunningUi(st);
+          refreshSims();
+          return;
+        }
+        clearInterval(ussdBulkPollTimer);
+        ussdBulkPollTimer = null;
+        window.ussdBulkPolling = false;
+        window.ussdBulkCurrentSim = null;
+        renderUssdBulkResults(st);
+        refreshSims();
+        toast('Bulk *143# done: ' + (st.ok_count || 0) + ' OK, ' + (st.fail_count || 0) + ' failed');
+      } catch (e) {
+        clearInterval(ussdBulkPollTimer);
+        ussdBulkPollTimer = null;
+        window.ussdBulkPolling = false;
+        console.error('ussd bulk poll', e);
+      }
+    }, 1500);
+  } catch (e) {
+    window.ussdBulkPolling = false;
+    toast('Bulk *143# failed to start');
   }
 }
 
@@ -2239,108 +2774,34 @@ async function toggleSim(idx) {
   const newEnabled = !s.enabled[idx];
   const r = await post('/sim-enable', { slot: idx, enabled: newEnabled ? 1 : 0 });
   if (r.success) {
-    toast('SIM ' + idx + ' ' + (newEnabled ? 'enabled' : 'disabled'));
+    toast('SIM ' + (idx + 1) + ' ' + (newEnabled ? 'enabled' : 'disabled'));
     await refreshSims();
   } else {
     toast('Failed: ' + (r.error || 'Unknown error'));
   }
 }
 
-// Network selection modal
-let currentNetSimIdx = -1;
-
-function showNetworkModal(idx) {
-  currentNetSimIdx = idx;
-  const modal = $('networkModal');
-  modal.classList.remove('hide');
-  scanCellNetworks(); // Auto-scan when opening
-}
-
-function closeNetworkModal() {
-  $('networkModal').classList.add('hide');
-  currentNetSimIdx = -1;
-}
-
-async function scanCellNetworks() {
-  if (currentNetSimIdx < 0) return;
-  
-  const list = $('networkList');
-  list.innerHTML = '<div class="muted text-center"><span class="spinner"></span><br>Scanning... (10-20s)</div>';
-  
-  try {
-    const r = await post('/scan-networks', { slot: currentNetSimIdx });
-    
-    if (!r.success) {
-      list.innerHTML = '<div class="muted" style="color:var(--danger)">Error: ' + (r.error || 'Scan failed') + '</div>';
-      return;
-    }
-    
-    if (!r.networks || r.networks.length === 0) {
-      list.innerHTML = '<div class="muted text-center">No networks found</div>';
-      return;
-    }
-    
-    list.innerHTML = '';
-    r.networks.forEach(n => {
-      const div = document.createElement('div');
-      div.className = 'net-item' + (n.current ? ' selected' : '');
-      div.innerHTML = `
-        <div class="net-info">
-          <span class="net-name">${n.name}</span>
-          <span class="net-signal">${n.current ? 'Current' : (n.status === 1 ? 'Available' : (n.status === 3 ? 'Forbidden' : 'Unknown'))}</span>
-        </div>
-        <span class="badge ${n.current ? 'success' : 'muted'}">${n.current ? 'Current' : 'Select'}</span>
-      `;
-      if (!n.current) {
-        div.onclick = () => selectNetwork(n.name);
-      }
-      list.appendChild(div);
-    });
-  } catch(e) {
-    list.innerHTML = '<div class="muted" style="color:var(--danger)">Connection error</div>';
+async function disableAllSims() {
+  if (!confirm('Disable all SIM slots? They will stop polling and reporting until turned on again.')) return;
+  const btn = $('disableAllSimsBtn');
+  if (btn) {
+    btn.innerHTML = '<span class="spinner"></span>';
+    btn.disabled = true;
   }
-}
-
-async function selectNetwork(networkName) {
-  if (currentNetSimIdx < 0) return;
-  
-  const list = $('networkList');
-  list.innerHTML = '<div class="muted text-center"><span class="spinner"></span><br>Selecting ' + networkName + '...</div>';
-  
   try {
-    const r = await post('/select-network', { slot: currentNetSimIdx, network: networkName });
-    
+    const r = await post('/sim-disable-all', {});
     if (r.success) {
-      toast('Network selected: ' + networkName);
-      closeNetworkModal();
+      toast(r.message || 'All SIMs disabled');
       await refreshSims();
     } else {
-      list.innerHTML = '<div class="muted" style="color:var(--danger)">Error: ' + (r.error || 'Selection failed') + '</div>';
+      toast(r.error || 'Failed');
     }
-  } catch(e) {
-    list.innerHTML = '<div class="muted" style="color:var(--danger)">Connection error</div>';
+  } catch (e) {
+    toast('Failed to disable all SIMs');
   }
-}
-
-async function setAutoNetwork() {
-  if (currentNetSimIdx < 0) return;
-  
-  const list = $('networkList');
-  list.innerHTML = '<div class="muted text-center"><span class="spinner"></span><br>Setting auto mode...</div>';
-  
-  try {
-    const r = await post('/select-network', { slot: currentNetSimIdx, network: '' });
-    
-    if (r.success) {
-      toast('Auto network mode enabled');
-      closeNetworkModal();
-      await refreshSims();
-    } else {
-      toast('Setting auto mode...');
-      closeNetworkModal();
-    }
-  } catch(e) {
-    list.innerHTML = '<div class="muted" style="color:var(--danger)">Connection error</div>';
+  if (btn) {
+    btn.textContent = 'Disable All';
+    btn.disabled = false;
   }
 }
 
@@ -2452,11 +2913,6 @@ async function doRegisterDevice() {
   checkAuthStatus();
 }
 
-async function doRegisterSim() {
-  // Kept for backward compatibility (old button removed)
-  await doRegisterAllSims();
-}
-
 async function registerSimSlot(idx) {
   const btn = $('regSimBtn' + idx);
   if (btn) {
@@ -2475,26 +2931,6 @@ async function registerSimSlot(idx) {
   }
   await refreshSims();
   checkAuthStatus();
-}
-
-async function doRegisterAllSims() {
-  $('registerAllSimsBtn').innerHTML = '<span class="spinner"></span>';
-  $('registerAllSimsBtn').disabled = true;
-  try {
-    const s = await get('/sim-config');
-    for (let i = 0; i < s.enabled.length; i++) {
-      if (!s.enabled[i]) continue;
-      if (!s.responsive || !s.responsive[i]) continue;
-      if (!s.numbers || !s.numbers[i] || s.numbers[i] === '-') continue;
-      if (s.backend_registered && s.backend_registered[i]) continue;
-      await registerSimSlot(i);
-      await new Promise(r => setTimeout(r, 500));
-    }
-  } catch(e) {
-    toast('Register all failed');
-  }
-  $('registerAllSimsBtn').textContent = 'Register All SIMs';
-  $('registerAllSimsBtn').disabled = false;
 }
 
 async function checkAuthStatus() {
@@ -2521,14 +2957,9 @@ async function checkAuthStatus() {
         $('deviceBadge').className = s.device_registered ? 'badge success' : 'badge warning';
       }
       
-      // Heartbeat pause button
-      const hbBtn = $('pauseHeartbeatBtn');
-      if (hbBtn) {
-        hbBtn.textContent = s.heartbeat_paused ? 'Resume HB' : 'Pause HB';
-        hbBtn.className = s.heartbeat_paused ? 'btn xs warning' : 'btn xs secondary';
-      }
-      
-      // Count registered SIMs
+    updateGatewayServicesUi(s);
+    
+    // Count registered SIMs
       try {
         const simConfig = await get('/sim-config');
         const regCount = simConfig.backend_registered ? simConfig.backend_registered.filter(Boolean).length : 0;
@@ -2651,82 +3082,26 @@ async function loginConnectWifi() {
   }
 }
 
-async function saveOtaUrl() {
-  const url = ($('otaUrl')?.value || '').trim();
-  const st = $('fwStatus');
-  const btn = $('saveOtaUrlBtn');
-  if (btn) btn.disabled = true;
-  try {
-    const r = await post('/firmware-config', { url });
-    if (st) st.textContent = r.success ? 'Firmware URL saved.' : (r.message || 'Save failed');
-  } catch (e) {
-    if (st) st.textContent = 'Save failed: ' + e.message;
-  }
-  if (btn) btn.disabled = false;
-}
-
-async function checkFirmware() {
-  const st = $('fwStatus');
-  const btn = $('checkFwBtn');
-  if (btn) btn.disabled = true;
-  if (st) st.textContent = 'Checking for updates...';
-  try {
-    const r = await get('/firmware-check');
-    if ($('fwRemoteVersion')) $('fwRemoteVersion').textContent = r.remote || '-';
-    if ($('fwRemoteWrap')) $('fwRemoteWrap').classList.toggle('hide', !r.remote);
-    if (r.success) {
-      if (r.update_available) {
-        if (st) st.textContent = 'Update available: v' + r.remote + ' (installed v' + r.current + ')';
-      } else if (r.remote) {
-        if (st) st.textContent = 'Up to date (v' + r.current + ')';
-      } else {
-        if (st) st.textContent = 'Could not read remote version file.';
-      }
-    } else {
-      if (st) st.textContent = r.message || 'Check failed';
-    }
-  } catch (e) {
-    if (st) st.textContent = 'Check failed: ' + e.message;
-  }
-  if (btn) btn.disabled = false;
-}
-
-async function installFirmware() {
-  if (!confirm('Download and install firmware? SMS polling will stop and the device will restart.')) return;
-  const st = $('fwStatus');
-  const btn = $('updateFwBtn');
-  const url = ($('otaUrl')?.value || '').trim();
-  if (btn) btn.disabled = true;
-  if (st) st.textContent = 'Starting OTA download...';
-  try {
-    const body = url ? { url } : {};
-    const r = await post('/firmware-update', body);
-    if (st) st.textContent = r.message || 'OTA started';
-  } catch (e) {
-    if (st) st.textContent = 'OTA failed: ' + e.message;
-    if (btn) btn.disabled = false;
-  }
-}
-
 // Event listeners - Dashboard (with null checks)
 function addClick(id, fn) { const el = $(id); if (el) el.onclick = fn; }
 
 addClick('scanBtn', scanNetworks);
 addClick('connectBtn', connectWifi);
 addClick('disconnectBtn', disconnectWifi);
+addClick('checkFirmwareBtn', checkFirmwareUpdate);
+addClick('installFirmwareBtn', installFirmwareUpdate);
+addClick('toggleMissedCallBtn', toggleMissedCallForward);
 addClick('checkAllBtn', checkAllSims);
+addClick('ussdBulkBtn', bulkCheckUssd);
+addClick('disableAllSimsBtn', disableAllSims);
 addClick('pausePollingBtn', togglePollingPause);
 addClick('pauseHeartbeatBtn', toggleHeartbeatPause);
 addClick('saveConfigBtn', saveConfig);
-addClick('saveOtaUrlBtn', saveOtaUrl);
-addClick('checkFwBtn', checkFirmware);
-addClick('updateFwBtn', installFirmware);
 addClick('clearLogBtn', clearLog);
 addClick('clearErrorLogBtn', function() { currentLogTab = 'errors'; clearLog(); });
 addClick('resetDeviceBtn', resetDevice);
 addClick('logoutBtn', doLogout);
 addClick('registerDeviceBtn', doRegisterDevice);
-addClick('registerAllSimsBtn', doRegisterAllSims);
 addClick('refreshSmsBtn', refreshSmsList);
 
 // Event listeners - Login page
@@ -2792,7 +3167,12 @@ void initWebUI() {
     server.on("/sim-config", HTTP_GET, handleSimConfig);
     server.on("/check-sim", HTTP_GET, handleCheckSim);
     server.on("/check-all-sim", HTTP_GET, handleCheckAllSim);
+    server.on("/ussd-check", HTTP_POST, handleUssdCheck);
+    server.on("/ussd-manual-status", HTTP_GET, handleUssdManualStatus);
+    server.on("/ussd-bulk", HTTP_POST, handleUssdBulk);
+    server.on("/ussd-bulk-status", HTTP_GET, handleUssdBulkStatus);
     server.on("/sim-enable", HTTP_POST, handleSimEnable);
+    server.on("/sim-disable-all", HTTP_POST, handleSimDisableAll);
     server.on("/calls", HTTP_GET, handleCalls);
     server.on("/clear-calls", HTTP_GET, handleClearCalls);
     server.on("/call", HTTP_POST, handleCall);
@@ -2806,11 +3186,10 @@ void initWebUI() {
     server.on("/refresh-token", HTTP_POST, handleRefreshToken);
     server.on("/register-device", HTTP_POST, handleRegisterDevice);
     server.on("/register-sim", HTTP_POST, handleRegisterSim);
-    server.on("/scan-networks", HTTP_POST, handleScanNetworks);
-    server.on("/select-network", HTTP_POST, handleSelectNetwork);
     server.on("/heartbeat", HTTP_POST, handleHeartbeatManual);
     server.on("/toggle-polling", HTTP_POST, handleTogglePolling);
     server.on("/toggle-heartbeat", HTTP_POST, handleToggleHeartbeat);
+    server.on("/toggle-missed-call", HTTP_POST, handleToggleMissedCall);
     server.on("/firmware-check", HTTP_GET, handleFirmwareCheck);
     server.on("/firmware-update", HTTP_POST, handleFirmwareUpdate);
     server.on("/firmware-config", HTTP_POST, handleFirmwareConfig);
@@ -2840,7 +3219,11 @@ void handleStatus() {
     server.send(200, "application/json", buf);
 }
 
+extern void pruneExpiredActiveSessions();
+
 void buildStatusJson(char* buf, size_t bufSize) {
+    pruneExpiredActiveSessions();
+
     // Get WiFi status
     bool staConnected = WiFi.isConnected();
     IPAddress staIp = WiFi.localIP();
@@ -2929,6 +3312,9 @@ void buildStatusJson(char* buf, size_t bufSize) {
         "\"device_id\":\"%s\","
         "\"bearer_token\":\"%s\","
         "\"heartbeat_paused\":%s,"
+        "\"sms_polling_paused\":%s,"
+        "\"missed_call_forward\":%s,"
+        "\"missed_call_watch_sim\":%d,"
         "\"firmware_version\":\"%s\","
         "\"ota_url\":\"%s\""
         "%s"
@@ -2953,6 +3339,9 @@ void buildStatusJson(char* buf, size_t bufSize) {
         agentDeviceId,
         hasBearerToken ? "(set)" : "",
         heartbeatPaused ? "true" : "false",
+        smsPollingPaused ? "true" : "false",
+        missedCallForwardEnabled ? "true" : "false",
+        getPriorityMissedCallSlot() + 1,
         FIRMWARE_VERSION,
         otaFirmwareUrl,
         sessionsBuf
@@ -3052,96 +3441,192 @@ void handleDisconnect() {
 // Route Handlers - SIM Management
 // -----------------------------------------------------------------------------
 
+static bool jsonAppendFmt(char* buf, size_t bufSize, size_t* pos, const char* fmt, ...) {
+    if (!buf || !pos || *pos >= bufSize) return false;
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(buf + *pos, bufSize - *pos, fmt, args);
+    va_end(args);
+    if (n < 0) return false;
+    if ((size_t)n >= bufSize - *pos) {
+        *pos = bufSize - 1;
+        buf[*pos] = '\0';
+        return false;
+    }
+    *pos += (size_t)n;
+    return true;
+}
+
+static void extractOperatorShort(const char* cops, char* out, size_t outSize) {
+    if (!out || outSize < 1) return;
+    out[0] = '\0';
+    if (!cops || !cops[0]) return;
+
+    const char* q1 = strchr(cops, '"');
+    if (q1) {
+        q1++;
+        const char* q2 = strchr(q1, '"');
+        if (q2 && q2 > q1) {
+            size_t len = (size_t)(q2 - q1);
+            if (len >= outSize) len = outSize - 1;
+            strncpy(out, q1, len);
+            out[len] = '\0';
+            return;
+        }
+    }
+
+    size_t j = 0;
+    for (size_t k = 0; cops[k] && j < outSize - 1; k++) {
+        char c = cops[k];
+        if (c == '\r' || c == '\n') break;
+        if ((unsigned char)c >= 0x20) out[j++] = c;
+    }
+    out[j] = '\0';
+}
+
 void handleSimConfig() {
-    static char buf[3072];  // Need enough for 16 SIMs config
-    buildSimConfigJson(buf, sizeof(buf));
+    char* buf = (char*)malloc(5120);
+    if (!buf) {
+        sendJsonError("Out of memory");
+        return;
+    }
+    buildSimConfigJson(buf, 5120);
     server.send(200, "application/json", buf);
+    free(buf);
 }
 
 void buildSimConfigJson(char* buf, size_t bufSize) {
+    if (!buf || bufSize < 64) return;
     size_t pos = 0;
-    
-    pos += snprintf(buf + pos, bufSize - pos,
-        "{\"success\":true,"
-        "\"active_slot\":%d,"
-        "\"selected_mux_slot\":%d,"
-        "\"enabled\":[",
-        getCurrentLogicalSlot(),
+    buf[0] = '\0';
+
+    const int muxSlot =
 #if !USE_DUAL_UART
-        logicalSlotToMuxChannel(getCurrentLogicalSlot())
+        logicalSlotToMuxChannel(getCurrentLogicalSlot());
 #else
-        getCurrentLogicalSlot()
+        getCurrentLogicalSlot();
 #endif
-    );
-    
-    for (int i = 0; i < SIM_COUNT; i++) {
-        if (i > 0) pos += snprintf(buf + pos, bufSize - pos, ",");
-        pos += snprintf(buf + pos, bufSize - pos, "%s", simStates[i].enabled ? "true" : "false");
-    }
-    
-    pos += snprintf(buf + pos, bufSize - pos, "],\"responsive\":[");
-    for (int i = 0; i < SIM_COUNT; i++) {
-        if (i > 0) pos += snprintf(buf + pos, bufSize - pos, ",");
-        pos += snprintf(buf + pos, bufSize - pos, "%s", simStates[i].responsive ? "true" : "false");
-    }
-    
-    pos += snprintf(buf + pos, bufSize - pos, "],\"registered\":[");
-    for (int i = 0; i < SIM_COUNT; i++) {
-        if (i > 0) pos += snprintf(buf + pos, bufSize - pos, ",");
-        pos += snprintf(buf + pos, bufSize - pos, "%s", simStates[i].registered ? "true" : "false");
+
+    if (!jsonAppendFmt(buf, bufSize, &pos,
+            "{\"success\":true,\"active_slot\":%d,\"selected_mux_slot\":%d,\"enabled\":[",
+            getCurrentLogicalSlot(), muxSlot)) {
+        snprintf(buf, bufSize, "{\"success\":false,\"error\":\"JSON buffer full\"}");
+        return;
     }
 
-    pos += snprintf(buf + pos, bufSize - pos, "],\"backend_registered\":[");
     for (int i = 0; i < SIM_COUNT; i++) {
-        if (i > 0) pos += snprintf(buf + pos, bufSize - pos, ",");
-        pos += snprintf(buf + pos, bufSize - pos, "%s", simStates[i].backendRegistered ? "true" : "false");
+        if (!jsonAppendFmt(buf, bufSize, &pos, "%s%s",
+                i > 0 ? "," : "", simStates[i].enabled ? "true" : "false")) {
+            goto json_fail;
+        }
     }
-    
-    pos += snprintf(buf + pos, bufSize - pos, "],\"numbers\":[");
+
+    if (!jsonAppendFmt(buf, bufSize, &pos, "],\"user_disabled\":[")) goto json_fail;
     for (int i = 0; i < SIM_COUNT; i++) {
-        if (i > 0) pos += snprintf(buf + pos, bufSize - pos, ",");
-        char escaped[64];
+        if (!jsonAppendFmt(buf, bufSize, &pos, "%s%s",
+                i > 0 ? "," : "", simStates[i].userDisabled ? "true" : "false")) {
+            goto json_fail;
+        }
+    }
+
+    if (!jsonAppendFmt(buf, bufSize, &pos, "],\"responsive\":[")) goto json_fail;
+    for (int i = 0; i < SIM_COUNT; i++) {
+        if (!jsonAppendFmt(buf, bufSize, &pos, "%s%s",
+                i > 0 ? "," : "", simStates[i].responsive ? "true" : "false")) {
+            goto json_fail;
+        }
+    }
+
+    if (!jsonAppendFmt(buf, bufSize, &pos, "],\"registered\":[")) goto json_fail;
+    for (int i = 0; i < SIM_COUNT; i++) {
+        if (!jsonAppendFmt(buf, bufSize, &pos, "%s%s",
+                i > 0 ? "," : "", simStates[i].registered ? "true" : "false")) {
+            goto json_fail;
+        }
+    }
+
+    if (!jsonAppendFmt(buf, bufSize, &pos, "],\"backend_registered\":[")) goto json_fail;
+    for (int i = 0; i < SIM_COUNT; i++) {
+        if (!jsonAppendFmt(buf, bufSize, &pos, "%s%s",
+                i > 0 ? "," : "", simStates[i].backendRegistered ? "true" : "false")) {
+            goto json_fail;
+        }
+    }
+
+    if (!jsonAppendFmt(buf, bufSize, &pos, "],\"numbers\":[")) goto json_fail;
+    for (int i = 0; i < SIM_COUNT; i++) {
+        char escaped[48];
         jsonEscape(simStates[i].number, escaped, sizeof(escaped));
-        pos += snprintf(buf + pos, bufSize - pos, "%s", escaped);
-    }
-    
-    pos += snprintf(buf + pos, bufSize - pos, "],\"creg\":[");
-    for (int i = 0; i < SIM_COUNT; i++) {
-        if (i > 0) pos += snprintf(buf + pos, bufSize - pos, ",");
-        char escaped[64];
-        jsonEscape(simStates[i].creg, escaped, sizeof(escaped));
-        pos += snprintf(buf + pos, bufSize - pos, "%s", escaped);
-    }
-    
-    pos += snprintf(buf + pos, bufSize - pos, "],\"cops\":[");
-    for (int i = 0; i < SIM_COUNT; i++) {
-        if (i > 0) pos += snprintf(buf + pos, bufSize - pos, ",");
-        char escaped[80];
-        jsonEscape(simStates[i].cops, escaped, sizeof(escaped));
-        pos += snprintf(buf + pos, bufSize - pos, "%s", escaped);
-    }
-    
-    pos += snprintf(buf + pos, bufSize - pos, "],\"csq\":[");
-    for (int i = 0; i < SIM_COUNT; i++) {
-        if (i > 0) pos += snprintf(buf + pos, bufSize - pos, ",");
-        char escaped[32];
-        jsonEscape(simStates[i].csq, escaped, sizeof(escaped));
-        pos += snprintf(buf + pos, bufSize - pos, "%s", escaped);
-    }
-    
-    pos += snprintf(buf + pos, bufSize - pos, "],\"battery_pct\":[");
-    for (int i = 0; i < SIM_COUNT; i++) {
-        if (i > 0) pos += snprintf(buf + pos, bufSize - pos, ",");
-        pos += snprintf(buf + pos, bufSize - pos, "%d", simStates[i].batteryPercent);
+        if (!jsonAppendFmt(buf, bufSize, &pos, "%s%s", i > 0 ? "," : "", escaped)) {
+            goto json_fail;
+        }
     }
 
-    pos += snprintf(buf + pos, bufSize - pos, "],\"battery_mv\":[");
+    if (!jsonAppendFmt(buf, bufSize, &pos, "],\"operators\":[")) goto json_fail;
     for (int i = 0; i < SIM_COUNT; i++) {
-        if (i > 0) pos += snprintf(buf + pos, bufSize - pos, ",");
-        pos += snprintf(buf + pos, bufSize - pos, "%d", simStates[i].batteryMv);
+        char op[24];
+        extractOperatorShort(simStates[i].cops, op, sizeof(op));
+        char escaped[48];
+        jsonEscape(op, escaped, sizeof(escaped));
+        if (!jsonAppendFmt(buf, bufSize, &pos, "%s%s", i > 0 ? "," : "", escaped)) {
+            goto json_fail;
+        }
     }
-    
-    pos += snprintf(buf + pos, bufSize - pos, "]}");
+
+    if (!jsonAppendFmt(buf, bufSize, &pos, "],\"csq_rssi\":[")) goto json_fail;
+    for (int i = 0; i < SIM_COUNT; i++) {
+        int rssi = simStates[i].signalStrength;
+        if (rssi < 0) rssi = extractSignalQuality(simStates[i].csq);
+        if (!jsonAppendFmt(buf, bufSize, &pos, "%s%d", i > 0 ? "," : "", rssi)) {
+            goto json_fail;
+        }
+    }
+
+    if (!jsonAppendFmt(buf, bufSize, &pos, "],\"battery_pct\":[")) goto json_fail;
+    for (int i = 0; i < SIM_COUNT; i++) {
+        if (!jsonAppendFmt(buf, bufSize, &pos, "%s%d", i > 0 ? "," : "", simStates[i].batteryPercent)) {
+            goto json_fail;
+        }
+    }
+
+    if (!jsonAppendFmt(buf, bufSize, &pos, "],\"battery_mv\":[")) goto json_fail;
+    for (int i = 0; i < SIM_COUNT; i++) {
+        if (!jsonAppendFmt(buf, bufSize, &pos, "%s%d", i > 0 ? "," : "", simStates[i].batteryMv)) {
+            goto json_fail;
+        }
+    }
+
+    if (!jsonAppendFmt(buf, bufSize, &pos, "],\"ussd_status\":[")) goto json_fail;
+    for (int i = 0; i < SIM_COUNT; i++) {
+        if (!jsonAppendFmt(buf, bufSize, &pos, "%s%d", i > 0 ? "," : "", (int)simStates[i].ussdStatus)) {
+            goto json_fail;
+        }
+    }
+
+    if (!jsonAppendFmt(buf, bufSize, &pos, "],\"ussd_result\":[")) goto json_fail;
+    for (int i = 0; i < SIM_COUNT; i++) {
+        char escaped[64];
+        jsonEscape(simStates[i].ussdLastResult, escaped, sizeof(escaped));
+        if (!jsonAppendFmt(buf, bufSize, &pos, "%s%s", i > 0 ? "," : "", escaped)) {
+            goto json_fail;
+        }
+    }
+
+    if (!jsonAppendFmt(buf, bufSize, &pos, "],\"ussd_duration_sec\":[")) goto json_fail;
+    for (int i = 0; i < SIM_COUNT; i++) {
+        if (!jsonAppendFmt(buf, bufSize, &pos, "%s%u", i > 0 ? "," : "",
+                (unsigned)simStates[i].ussdLastDurationSec)) {
+            goto json_fail;
+        }
+    }
+
+    jsonAppendFmt(buf, bufSize, &pos, "],\"ussd_bulk_active\":%s,\"ussd_bulk_current\":%d}",
+        ussdBulkInProgress() ? "true" : "false",
+        ussdBulkInProgress() ? ussdBulkCurrentSlot() : -1);
+    return;
+
+json_fail:
+    snprintf(buf, bufSize, "{\"success\":false,\"error\":\"JSON buffer full\"}");
 }
 
 void handleCheckSim() {
@@ -3190,6 +3675,73 @@ void handleCheckSim() {
         simIdx, cregEsc, copsEsc, csqEsc
     );
     
+    server.send(200, "application/json", buf);
+}
+
+void handleUssdCheck() {
+    if (ussdBulkInProgress()) {
+        sendJsonError("Bulk *143# in progress");
+        return;
+    }
+    if (ussdManualInProgress()) {
+        sendJsonError("USSD check already running");
+        return;
+    }
+
+    int slot = server.hasArg("slot") ? server.arg("slot").toInt() : 0;
+    if (slot < 0 || slot >= SIM_COUNT) {
+        sendJsonError("Invalid SIM slot");
+        return;
+    }
+
+    if (charBufIsEmpty(simStates[slot].number)) {
+        sendJsonError("No SIM number on this slot");
+        return;
+    }
+
+    if (!ussdStartManual(slot)) {
+        sendJsonError("Could not start USSD check");
+        return;
+    }
+
+    char buf[96];
+    snprintf(buf, sizeof(buf),
+        "{\"success\":true,\"started\":true,\"slot\":%d,\"sim\":%d}",
+        slot, slot + 1);
+    server.send(200, "application/json", buf);
+}
+
+void handleUssdManualStatus() {
+    char buf[512];
+    ussdWriteManualStatusJson(buf, sizeof(buf));
+    server.send(200, "application/json", buf);
+}
+
+void handleUssdBulk() {
+    if (refreshAllInProgress) {
+        sendJsonError("Refresh in progress");
+        return;
+    }
+    if (ussdManualInProgress()) {
+        sendJsonError("Manual USSD check in progress");
+        return;
+    }
+    if (ussdBulkInProgress()) {
+        sendJsonError("Bulk *143# already running");
+        return;
+    }
+
+    ussdStartBulk();
+
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+        "{\"success\":true,\"message\":\"Started\",\"total\":%d}", ussdBulkTotalCount());
+    server.send(200, "application/json", buf);
+}
+
+void handleUssdBulkStatus() {
+    char buf[4096];
+    ussdWriteBulkStatusJson(buf, sizeof(buf));
     server.send(200, "application/json", buf);
 }
 
@@ -3313,6 +3865,36 @@ void handleCheckAllSim() {
     server.send(200, "application/json", buf);
 }
 
+extern void setSimUserDisabled(int simIdx, bool disabled);
+
+static void disableSimSlot(int simIdx) {
+    setSimUserDisabled(simIdx, true);
+    simStates[simIdx].responsive = false;
+    simStates[simIdx].registered = false;
+    simStates[simIdx].backendRegistered = false;
+    simStates[simIdx].basicInitDone = false;
+    charBufClear(simStates[simIdx].creg, sizeof(simStates[simIdx].creg));
+    charBufClear(simStates[simIdx].cops, sizeof(simStates[simIdx].cops));
+    charBufClear(simStates[simIdx].csq, sizeof(simStates[simIdx].csq));
+    simStates[simIdx].batteryPercent = 0;
+    simStates[simIdx].batteryMv = 0;
+}
+
+void handleSimDisableAll() {
+    if (isSimBusy()) {
+        sendJsonError("SIM busy");
+        return;
+    }
+    for (int i = 0; i < SIM_COUNT; i++) {
+        disableSimSlot(i);
+    }
+    logMsg2Val("[SIM]", "all", "disabled", "");
+    appendMonitorLog("[SIM] All slots disabled");
+    char msg[64];
+    snprintf(msg, sizeof(msg), "All %d SIM slots disabled", SIM_COUNT);
+    sendJsonSuccess(msg);
+}
+
 void handleSimEnable() {
     int slot = server.hasArg("slot") ? server.arg("slot").toInt() : 0;
     int simIdx = slot;
@@ -3324,19 +3906,11 @@ void handleSimEnable() {
     }
     
     if (!enabled) {
+        setSimUserDisabled(simIdx, true);
         simStates[simIdx].enabled = false;
-        // Clear state
-        simStates[simIdx].responsive = false;
-        simStates[simIdx].registered = false;
-        simStates[simIdx].backendRegistered = false;
-        simStates[simIdx].basicInitDone = false;
-        charBufClear(simStates[simIdx].number, sizeof(simStates[simIdx].number));
-        charBufClear(simStates[simIdx].creg, sizeof(simStates[simIdx].creg));
-        charBufClear(simStates[simIdx].cops, sizeof(simStates[simIdx].cops));
-        charBufClear(simStates[simIdx].csq, sizeof(simStates[simIdx].csq));
-        simStates[simIdx].batteryPercent = 0;
-        simStates[simIdx].batteryMv = 0;
+        appendMonitorLogVal("[SIM] Manual OFF ", String(slot).c_str());
     } else {
+        setSimUserDisabled(simIdx, false);
         // Only enable if SIM responds and can be initialized
         if (isSimBusy()) {
             sendJsonError("SIM busy");
@@ -4086,96 +4660,107 @@ void handleRefreshToken() {
     }
 }
 
-void handleRegisterDevice() {
-    // Register device with backend
-    if (charBufIsEmpty(agentBaseUrl)) {
-        sendJsonError("No base URL configured");
-        return;
+bool registerDeviceWithBackend() {
+    if (charBufIsEmpty(agentBaseUrl) || charBufIsEmpty(agentBearerToken)) {
+        return false;
     }
-    
-    if (charBufIsEmpty(agentBearerToken)) {
-        sendJsonError("Not logged in");
-        return;
+    if (httpsBusy) {
+        return false;
     }
-    
+
     if (charBufIsEmpty(agentDeviceId)) {
-        // Generate default device ID
         snprintf(agentDeviceId, sizeof(agentDeviceId), "SIM800-%06X", (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF));
         preferences.begin("agent", false);
         preferences.putString("dev", agentDeviceId);
         preferences.end();
     }
-    
+
     char url[256];
     snprintf(url, sizeof(url), "%s/api/agent/devices", agentBaseUrl);
-    
+
     char payload[256];
     snprintf(payload, sizeof(payload),
         "{\"device_id\":\"%s\",\"name\":\"%s\"}",
-        agentDeviceId, agentDeviceId
-    );
-    
+        agentDeviceId, agentDeviceId);
+
     HTTPClient http;
     WiFiClientSecure clientSecure;
     WiFiClient client;
-    bool isHttps = (strncmp(url, "https://", 8) == 0);
-    
-    // Wait for other HTTPS operations
-    if (httpsBusy) {
-        sendJsonError("HTTPS busy, try again");
-        return;
-    }
+    const bool isHttps = (strncmp(url, "https://", 8) == 0);
+
     httpsBusy = true;
-    
+
+    bool begun = false;
     if (isHttps) {
         clientSecure.setInsecure();
-        http.begin(clientSecure, url);
+        clientSecure.setTimeout(12000);
+        begun = http.begin(clientSecure, url);
     } else {
-        http.begin(client, url);
+        begun = http.begin(client, url);
     }
-    
+    if (!begun) {
+        httpsBusy = false;
+        return false;
+    }
+
     http.addHeader("Content-Type", "application/json");
     http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
-    http.setTimeout(10000);
-    
+    http.setTimeout(12000);
+
     int code = http.POST(payload);
     http.end();
 
-    if (code == 401) {
-        // Stop previous connection before refresh
+    if (code == 401 && refreshAgentToken()) {
         clientSecure.stop();
         client.stop();
-        delay(100);  // Let TCP fully close
-        
-        if (refreshAgentToken()) {
-            if (isHttps) {
-                clientSecure.setInsecure();
-                http.begin(clientSecure, url);
-            } else {
-                http.begin(client, url);
-            }
-            http.addHeader("Content-Type", "application/json");
-            http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
-            http.setTimeout(10000);
-            code = http.POST(payload);
-            http.end();
+        delay(100);
+        if (isHttps) {
+            clientSecure.setInsecure();
+            http.begin(clientSecure, url);
+        } else {
+            http.begin(client, url);
         }
+        http.addHeader("Content-Type", "application/json");
+        http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
+        http.setTimeout(12000);
+        code = http.POST(payload);
+        http.end();
     }
-    
-    if (code >= 200 && code < 300) {
-        deviceRegistered = true;
-        logMsg("[REGISTER] Device registered");
-        appendMonitorLog("[REGISTER] Device registered");
-        sendJsonSuccess("Device registered");
+
+    if (isHttps) {
+        clientSecure.stop();
     } else {
-        logMsgInt("[REGISTER] Device registration failed, code", code);
-        appendMonitorLogInt("[REGISTER] Device failed", code);
-        sendJsonError("Registration failed");
+        client.stop();
     }
-    clientSecure.stop();
-    client.stop();
     delay(50);
     httpsBusy = false;
+
+    if (code >= 200 && code < 300) {
+        deviceRegistered = true;
+        logMsg2Val("[REGISTER] Device OK", agentDeviceId, "", "");
+        appendMonitorLogVal("[REGISTER] Device OK ", agentDeviceId);
+        return true;
+    }
+
+    logMsgInt("[REGISTER] Device failed, code", code);
+    appendMonitorLogInt("[REGISTER] Device failed", code);
+    return false;
+}
+
+void handleRegisterDevice() {
+    if (charBufIsEmpty(agentBaseUrl)) {
+        sendJsonError("No base URL configured");
+        return;
+    }
+    if (charBufIsEmpty(agentBearerToken)) {
+        sendJsonError("Not logged in");
+        return;
+    }
+    if (registerDeviceWithBackend()) {
+        sendJsonSuccess("Device registered");
+    } else {
+        sendJsonError("Registration failed");
+    }
 }
 
 void handleRegisterSim() {
@@ -4302,178 +4887,6 @@ void handleRegisterSim() {
 }
 
 // -----------------------------------------------------------------------------
-// Network Selection Handlers
-// -----------------------------------------------------------------------------
-
-void handleScanNetworks() {
-    // Scan available networks for a specific SIM slot
-    if (!server.hasArg("slot")) {
-        sendJsonError("Missing slot parameter");
-        return;
-    }
-    
-    int slot = server.arg("slot").toInt();
-    int simIdx = slot - 1;
-    
-    if (simIdx < 0 || simIdx >= SIM_COUNT) {
-        sendJsonError("Invalid SIM slot");
-        return;
-    }
-    
-    if (!simStates[simIdx].responsive) {
-        sendJsonError("SIM not responsive");
-        return;
-    }
-    
-    logMsgInt("[NET] Scanning networks for SIM", slot);
-    appendMonitorLogVal("[NET] Scan SIM ", String(slot).c_str());
-    
-    // Select the SIM
-    selectSIM(simIdx);
-    pauseSmsPolling(30000);
-    setSimYieldToWebServer(false);
-    
-    // Send AT+COPS=? to scan networks (takes 10-15 seconds)
-    sendATCapture("AT+COPS=?", 20000);
-    setSimYieldToWebServer(true);
-    
-    char* buf = getSimBuffer();
-    
-    // Parse response: +COPS: [list],,(stat)
-    // Example: +COPS: (2,"SMART","SMART","51503"), (2,"GLOBE","GLOBE","51502"),,0
-    
-    // Build JSON response
-    static char json[1024];
-    json[0] = '\0';
-    strcat(json, "{\"success\":true,\"networks\":[");
-    
-    const char* start = strstr(buf, "+COPS:");
-    bool first = true;
-    
-    if (start) {
-        start += 6; // Skip "+COPS:"
-        
-        // Parse each network in parentheses
-        const char* p = start;
-        while (*p) {
-            // Look for (stat,"long","short","numeric")
-            const char* openParen = strchr(p, '(');
-            if (!openParen) break;
-            
-            const char* closeParen = strchr(openParen, ')');
-            if (!closeParen) break;
-            
-            // Extract the content between parentheses
-            int len = (int)(closeParen - openParen - 1);
-            if (len > 0 && len < 100) {
-                static char netInfo[128];
-                strncpy(netInfo, openParen + 1, (size_t)len);
-                netInfo[len] = '\0';
-                
-                // Parse: stat,"long","short","numeric"
-                // stat: 0=unknown, 1=available, 2=current, 3=forbidden
-                int stat = 0;
-                char longName[32] = "";
-                char shortName[32] = "";
-                
-                // Simple parse: find quoted strings
-                const char* q1 = strchr(netInfo, '"');
-                if (q1) {
-                    q1++;
-                    const char* q2 = strchr(q1, '"');
-                    if (q2 && (q2 - q1) < 32) {
-                        strncpy(longName, q1, (size_t)(q2 - q1));
-                        longName[q2 - q1] = '\0';
-                    }
-                }
-                
-                // Get status (first number before comma)
-                stat = atoi(netInfo);
-                
-                if (strlen(longName) > 0) {
-                    if (!first) strcat(json, ",");
-                    first = false;
-                    
-                    char netJson[128];
-                    snprintf(netJson, sizeof(netJson), 
-                        "{\"name\":\"%s\",\"status\":%d,\"current\":%s}",
-                        longName, stat, (stat == 2) ? "true" : "false");
-                    strcat(json, netJson);
-                }
-            }
-            
-            p = closeParen + 1;
-        }
-    }
-    
-    strcat(json, "]}");
-    
-    logMsgVal("[NET] Scan result", json);
-    server.send(200, "application/json", json);
-}
-
-void handleSelectNetwork() {
-    // Manually select a network for a SIM slot
-    if (!server.hasArg("slot")) {
-        sendJsonError("Missing slot parameter");
-        return;
-    }
-    
-    int slot = server.arg("slot").toInt();
-    String network = server.hasArg("network") ? server.arg("network") : "";
-    int simIdx = slot - 1;
-    
-    if (simIdx < 0 || simIdx >= SIM_COUNT) {
-        sendJsonError("Invalid SIM slot");
-        return;
-    }
-    
-    if (!simStates[simIdx].responsive) {
-        sendJsonError("SIM not responsive");
-        return;
-    }
-    
-    // Select the SIM
-    selectSIM(simIdx);
-    pauseSmsPolling(30000);
-    setSimYieldToWebServer(false);
-    
-    char cmd[64];
-    
-    // If network is empty, set auto mode (AT+COPS=0)
-    if (network.length() == 0) {
-        logMsgInt("[NET] Setting auto network mode for SIM", slot);
-        appendMonitorLogVal("[NET] Auto SIM ", String(slot).c_str());
-        strcpy(cmd, "AT+COPS=0");
-    } else {
-        logMsg2Val("[NET] Selecting network for SIM", String(slot).c_str(), "network", network.c_str());
-        appendMonitorLogVal("[NET] Select ", network.c_str());
-        snprintf(cmd, sizeof(cmd), "AT+COPS=1,0,\"%s\"", network.c_str());
-    }
-    
-    sendATCapture(cmd, 15000);
-    setSimYieldToWebServer(true);
-    
-    char* buf = getSimBuffer();
-    
-    // Check for OK or ERROR
-    if (strstr(buf, "OK") != NULL) {
-        logMsg("[NET] Network selected successfully");
-        // Update COPS in state
-        delay(2000); // Wait for registration
-        sendATCapture("AT+COPS?", 1500);
-        charBufSet(simStates[simIdx].cops, sizeof(simStates[simIdx].cops), getSimBuffer());
-        sendJsonSuccess("Network selected");
-    } else if (strstr(buf, "ERROR") != NULL || strstr(buf, "+CME ERROR") != NULL) {
-        logMsgVal("[NET] Selection failed", buf);
-        sendJsonError("Network selection failed - SIM may not allow this network");
-    } else {
-        logMsgVal("[NET] Selection response", buf);
-        sendJsonError("Unknown response from modem");
-    }
-}
-
-// -----------------------------------------------------------------------------
 // Manual Heartbeat (for debugging)
 // -----------------------------------------------------------------------------
 
@@ -4550,6 +4963,29 @@ void handleToggleHeartbeat() {
         "{\"success\":true,\"paused\":%s,\"message\":\"Heartbeat %s\"}",
         heartbeatPaused ? "true" : "false",
         heartbeatPaused ? "paused" : "resumed"
+    );
+    server.send(200, "application/json", buf);
+}
+
+void handleToggleMissedCall() {
+    if (server.hasArg("enabled")) {
+        const String v = server.arg("enabled");
+        missedCallForwardEnabled = (v == "1" || v == "true");
+    } else {
+        missedCallForwardEnabled = !missedCallForwardEnabled;
+    }
+
+    preferences.begin("agent", false);
+    preferences.putBool("mcall", missedCallForwardEnabled);
+    preferences.end();
+
+    applyMissedCallModemToAllSims();
+
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+        "{\"success\":true,\"enabled\":%s,\"message\":\"Missed call forward %s\"}",
+        missedCallForwardEnabled ? "true" : "false",
+        missedCallForwardEnabled ? "enabled" : "disabled"
     );
     server.send(200, "application/json", buf);
 }

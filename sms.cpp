@@ -5,6 +5,7 @@
 #include "sms.h"
 #include "sim800.h"
 #include "mux.h"
+#include "calls.h"
 #include "logger.h"
 #include "utils.h"
 #include "config.h"
@@ -997,8 +998,8 @@ void pollSIMsForSMS() {
     for (int i = 0; i < SIM_COUNT; i++) {
         int slot = (currentPollSim + i) % SIM_COUNT;
         
-        // Skip disabled SIMs
-        if (!simStates[slot].enabled) {
+        // Skip backend-disabled SIMs (manual heartbeat-off slots still polled)
+        if (!simStates[slot].userDisabled && !simStates[slot].enabled) {
             continue;
         }
         
@@ -1026,6 +1027,12 @@ void pollSIMsForSMS() {
             sendATCapture("AT+CPMS=\"SM\",\"SM\",\"SM\"", 800);
             // Enable new SMS indications - store to SIM
             sendATCapture("AT+CNMI=2,1,0,0,0", 800);
+            if (missedCallForwardEnabled) {
+                configureModemForMissedCallDetect();
+            } else {
+                sendATCapture("AT+CLIP=0", 800);
+                sendATCapture("AT+GSMBUSY=1", 800);
+            }
             // Set character set to GSM for proper sender decoding
             sendATCapture("AT+CSCS=\"GSM\"", 800);
             
@@ -1046,6 +1053,12 @@ void pollSIMsForSMS() {
         sendATCapture("AT+CMGL=\"ALL\"", 8000);  // 8 second timeout for reliability
         
         char* buf = getSimBuffer();
+        if (missedCallForwardEnabled) {
+            processCallUrcFromBuffer(slot, buf);
+#if MISSED_CALL_URC_LISTEN_MS > 0
+            listenForCallUrc(slot, MISSED_CALL_URC_LISTEN_MS);
+#endif
+        }
         
         // Debug: show raw response (first 200 chars)
         logMsg("[SMS] Raw response:");

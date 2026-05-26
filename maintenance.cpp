@@ -1,0 +1,347 @@
+// Scheduled restart + periodic firmware update check (via backend maintenance API)
+
+#include "maintenance.h"
+#include "config.h"
+#include "ota.h"
+#include "logger.h"
+#include "utils.h"
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+#include <esp_system.h>
+#include <time.h>
+
+extern ActiveSession activeSessions[8];
+extern int activeSessionCount;
+
+extern char agentBaseUrl[128];
+extern char agentDeviceId[64];
+extern char agentBearerToken[1024];
+extern volatile bool httpsBusy;
+extern bool heartbeatPaused;
+extern bool smsPollingPaused;
+
+static unsigned long scheduledRestartAtMs = 0;
+static unsigned long lastMaintenancePollMs = 0;
+static unsigned long lastFirmwareCheckMs = 0;
+static bool sessionsUpdatedSincePoll = false;
+static bool restartInProgress = false;
+
+static unsigned long parseIso8601UtcToMs(const char* iso) {
+    if (!iso || !iso[0]) return 0;
+    int year = 0, month = 0, day = 0, hour = 0, min = 0, sec = 0;
+    if (sscanf(iso, "%d-%d-%dT%d:%d:%d", &year, &month, &day, &hour, &min, &sec) < 6) {
+        return 0;
+    }
+    static const int daysInMonth[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    long days = 0;
+    for (int y = 1970; y < year; y++) {
+        days += 365;
+        if ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)) days += 1;
+    }
+    for (int m = 1; m < month; m++) {
+        days += daysInMonth[m - 1];
+        if (m == 2 && ((year % 4 == 0 && year % 100 != 0) || (year % 400 == 0))) days += 1;
+    }
+    days += day - 1;
+    const time_t ts = days * 86400L + hour * 3600L + min * 60L + sec;
+    if (ts <= 0) return 0;
+    return (unsigned long)ts * 1000UL;
+}
+
+static void extractJsonStringValue(const char* json, const char* key, char* out, size_t outSize) {
+    if (!out || outSize < 1) return;
+    out[0] = '\0';
+    if (!json || !key) return;
+
+    char needle[48];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char* p = strstr(json, needle);
+    if (!p) return;
+    p = strchr(p, ':');
+    if (!p) return;
+    p++;
+    while (*p == ' ' || *p == '\n' || *p == '\r') p++;
+    if (*p == '"') {
+        p++;
+        size_t j = 0;
+        while (*p && *p != '"' && j < outSize - 1) {
+            out[j++] = *p++;
+        }
+        out[j] = '\0';
+        return;
+    }
+    if (strncmp(p, "null", 4) == 0) {
+        return;
+    }
+    size_t j = 0;
+    while (*p && *p != ',' && *p != '}' && *p != ']' && j < outSize - 1) {
+        out[j++] = *p++;
+    }
+    while (j > 0 && (out[j - 1] == ' ' || out[j - 1] == '\n')) j--;
+    out[j] = '\0';
+}
+
+static bool extractJsonBool(const char* json, const char* key, bool defaultVal) {
+    char buf[12];
+    extractJsonStringValue(json, key, buf, sizeof(buf));
+    if (!buf[0]) return defaultVal;
+    return (strcmp(buf, "true") == 0 || strcmp(buf, "1") == 0);
+}
+
+static unsigned long nowUtcMs() {
+    const time_t nowSecs = time(nullptr);
+    if (nowSecs <= 1600000000L) return 0;
+    return (unsigned long)nowSecs * 1000UL;
+}
+
+static unsigned long latestActiveSessionExpiryMs() {
+    pruneExpiredActiveSessions();
+    unsigned long latest = 0;
+    for (int i = 0; i < activeSessionCount; i++) {
+        if (activeSessions[i].expiresAtMs > latest) {
+            latest = activeSessions[i].expiresAtMs;
+        }
+    }
+    return latest;
+}
+
+static bool maintenanceHttpPost(const char* body, char* respOut, size_t respSize) {
+    if (!respOut || respSize < 2) return false;
+    respOut[0] = '\0';
+    if (charBufIsEmpty(agentBaseUrl) || charBufIsEmpty(agentDeviceId)) return false;
+    if (!WiFi.isConnected() || httpsBusy) return false;
+
+    static char url[280];
+    snprintf(url, sizeof(url), "%s/api/agent/device-maintenance", agentBaseUrl);
+
+    const bool isHttps = (strncmp(url, "https://", 8) == 0);
+    HTTPClient http;
+    WiFiClientSecure clientSecure;
+    WiFiClient client;
+
+    httpsBusy = true;
+
+    if (isHttps) {
+        clientSecure.setInsecure();
+        clientSecure.setTimeout(20000);
+        if (!http.begin(clientSecure, url)) {
+            httpsBusy = false;
+            return false;
+        }
+    } else {
+        if (!http.begin(client, url)) {
+            httpsBusy = false;
+            return false;
+        }
+    }
+
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(20000);
+    if (!charBufIsEmpty(agentBearerToken)) {
+        http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
+    }
+
+    int code = http.POST(body);
+    if (code > 0 && respSize > 1) {
+        String resp = http.getString();
+        if (resp.length() > 0) {
+            strncpy(respOut, resp.c_str(), respSize - 1);
+            respOut[respSize - 1] = '\0';
+        }
+    }
+    http.end();
+    clientSecure.stop();
+    client.stop();
+    httpsBusy = false;
+
+    if (code == 401) {
+        if (refreshAgentToken()) {
+            return maintenanceHttpPost(body, respOut, respSize);
+        }
+    }
+
+    return code >= 200 && code < 300;
+}
+
+static void applyMaintenancePollResponse(const char* resp) {
+    if (!resp || !resp[0]) return;
+
+    char restartIso[40];
+    extractJsonStringValue(resp, "scheduled_restart_at", restartIso, sizeof(restartIso));
+    if (restartIso[0]) {
+        scheduledRestartAtMs = parseIso8601UtcToMs(restartIso);
+    } else if (strstr(resp, "\"scheduled_restart_at\":null") != nullptr ||
+               strstr(resp, "\"scheduled_restart_at\": null") != nullptr) {
+        scheduledRestartAtMs = 0;
+    }
+
+    const bool fwAvail = extractJsonBool(resp, "firmware_update_available", false);
+    if (fwAvail) {
+        char remoteVer[32];
+        extractJsonStringValue(resp, "firmware_remote_version", remoteVer, sizeof(remoteVer));
+        char detail[80];
+        snprintf(detail, sizeof(detail), "%s (local %s)", remoteVer[0] ? remoteVer : "?",
+            FIRMWARE_VERSION);
+        logMsg2Val("[MAINT] Firmware update available", detail, "", "");
+        appendMonitorLogVal("[MAINT] Update available", detail);
+    }
+}
+
+static void maintenancePollBackend() {
+    static char body[192];
+    static char resp[768];
+
+    snprintf(body, sizeof(body),
+        "{\"device_id\":\"%s\",\"firmware_version\":\"%s\",\"action\":\"poll\"}",
+        agentDeviceId, FIRMWARE_VERSION);
+
+    if (maintenanceHttpPost(body, resp, sizeof(resp))) {
+        applyMaintenancePollResponse(resp);
+        lastMaintenancePollMs = millis();
+    }
+}
+
+static bool maintenancePostAction(const char* action, const char* extraJsonFields) {
+    static char body[320];
+    static char resp[256];
+
+    if (extraJsonFields && extraJsonFields[0]) {
+        snprintf(body, sizeof(body),
+            "{\"device_id\":\"%s\",\"firmware_version\":\"%s\",\"action\":\"%s\",%s}",
+            agentDeviceId, FIRMWARE_VERSION, action, extraJsonFields);
+    } else {
+        snprintf(body, sizeof(body),
+            "{\"device_id\":\"%s\",\"firmware_version\":\"%s\",\"action\":\"%s\"}",
+            agentDeviceId, FIRMWARE_VERSION, action);
+    }
+
+    return maintenanceHttpPost(body, resp, sizeof(resp));
+}
+
+static void maintenanceDeferRestart(unsigned long deferredUntilMs) {
+    const time_t sec = (time_t)(deferredUntilMs / 1000UL);
+    struct tm tmUtc;
+    gmtime_r(&sec, &tmUtc);
+
+    char iso[40];
+    snprintf(iso, sizeof(iso), "%04d-%02d-%02dT%02d:%02d:%02d",
+        tmUtc.tm_year + 1900, tmUtc.tm_mon + 1, tmUtc.tm_mday,
+        tmUtc.tm_hour, tmUtc.tm_min, tmUtc.tm_sec);
+
+    char fields[96];
+    snprintf(fields, sizeof(fields), "\"deferred_until\":\"%s\"", iso);
+
+    if (maintenancePostAction("defer_restart", fields)) {
+        scheduledRestartAtMs = deferredUntilMs;
+        char logLine[64];
+        snprintf(logLine, sizeof(logLine), "until %s (active session)", iso);
+        logMsg2Val("[MAINT] Restart deferred", logLine, "", "");
+        appendMonitorLogVal("[MAINT] Restart deferred", iso);
+    }
+}
+
+static void maintenancePrepareScheduledRestart() {
+    Preferences prefs;
+    prefs.begin("agent", false);
+    prefs.putBool("hb_pause", false);
+    prefs.putBool("maint_boot", true);
+    prefs.end();
+
+    heartbeatPaused = false;
+    smsPollingPaused = false;
+}
+
+static void maintenancePerformRestart() {
+    if (restartInProgress) return;
+    restartInProgress = true;
+
+    logMsg("[MAINT] Scheduled restart — acknowledging backend");
+    appendMonitorLog("[MAINT] Scheduled restart");
+
+    maintenancePostAction("restart_ack", nullptr);
+    maintenancePrepareScheduledRestart();
+
+    delay(300);
+    ESP.restart();
+}
+
+static void maintenanceMaybeRunScheduledRestart() {
+    if (restartInProgress || scheduledRestartAtMs == 0) return;
+
+    const unsigned long nowMs = nowUtcMs();
+    if (nowMs == 0) return;
+    if (nowMs < scheduledRestartAtMs) return;
+
+    pruneExpiredActiveSessions();
+    const unsigned long latestExpiry = latestActiveSessionExpiryMs();
+    if (latestExpiry > nowMs) {
+        const unsigned long deferredUntil = latestExpiry + (5UL * 60UL * 1000UL);
+        if (deferredUntil > scheduledRestartAtMs) {
+            maintenanceDeferRestart(deferredUntil);
+        }
+        return;
+    }
+
+    maintenancePerformRestart();
+}
+
+static void maintenanceLocalFirmwareCheck() {
+#if OTA_ENABLED
+    bool updateAvailable = false;
+    char remoteVer[32];
+    if (otaCheckForUpdate(&updateAvailable, remoteVer, sizeof(remoteVer)) && updateAvailable) {
+        char detail[72];
+        snprintf(detail, sizeof(detail), "%s (local %s)", remoteVer, FIRMWARE_VERSION);
+        logMsg2Val("[MAINT] Firmware update available", detail, "", "");
+        appendMonitorLogVal("[MAINT] Update available", detail);
+    }
+#else
+    (void)0;
+#endif
+    lastFirmwareCheckMs = millis();
+}
+
+void maintenanceOnBoot() {
+    Preferences prefs;
+    prefs.begin("agent", true);
+    const bool maintBoot = prefs.getBool("maint_boot", false);
+    prefs.end();
+
+    if (!maintBoot) return;
+
+    prefs.begin("agent", false);
+    prefs.putBool("maint_boot", false);
+    prefs.putBool("hb_pause", false);
+    prefs.end();
+
+    heartbeatPaused = false;
+    smsPollingPaused = false;
+
+    logMsg("[MAINT] Post-restart defaults restored (HB on, SMS polling on)");
+    appendMonitorLog("[MAINT] Defaults restored after scheduled restart");
+}
+
+void maintenanceOnHeartbeatSuccess() {
+    sessionsUpdatedSincePoll = false;
+    maintenancePollBackend();
+}
+
+void maintenanceOnSessionsUpdated() {
+    sessionsUpdatedSincePoll = true;
+    maintenanceMaybeRunScheduledRestart();
+}
+
+void maintenanceTick(unsigned long nowMs) {
+    if (charBufIsEmpty(agentBaseUrl) || !WiFi.isConnected()) return;
+
+    if (lastFirmwareCheckMs == 0 ||
+        (nowMs - lastFirmwareCheckMs) >= (unsigned long)FIRMWARE_CHECK_INTERVAL_MS) {
+        maintenanceLocalFirmwareCheck();
+        if ((nowMs - lastMaintenancePollMs) >= (unsigned long)MAINTENANCE_POLL_MIN_INTERVAL_MS) {
+            maintenancePollBackend();
+        }
+    }
+}

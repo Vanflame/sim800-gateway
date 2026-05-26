@@ -53,6 +53,9 @@ int normalizePhNumber(const char* input, char* output, size_t outputSize);
 // Check if string looks like a phone number
 bool isPhoneNumber(const char* str);
 
+// Extract the last N digits from a phone string (digits only). Returns digit count or 0.
+int extractLastDigits(const char* input, int count, char* output, size_t outputSize);
+
 // -----------------------------------------------------------------------------
 // JSON Escaping
 // -----------------------------------------------------------------------------
@@ -224,6 +227,25 @@ inline bool isPhoneNumber(const char* str) {
         str++;
     }
     return true;
+}
+
+inline int extractLastDigits(const char* input, int count, char* output, size_t outputSize) {
+    if (!input || !output || outputSize < 2 || count < 1) return 0;
+
+    char digits[32];
+    int n = 0;
+    for (const char* p = input; *p && n < (int)sizeof(digits) - 1; p++) {
+        if (*p >= '0' && *p <= '9') {
+            digits[n++] = *p;
+        }
+    }
+    digits[n] = '\0';
+    if (n < count) return 0;
+
+    const char* start = digits + n - count;
+    strncpy(output, start, outputSize - 1);
+    output[outputSize - 1] = '\0';
+    return count;
 }
 
 inline size_t jsonEscape(const char* input, char* output, size_t outputSize) {

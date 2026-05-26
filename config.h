@@ -53,14 +53,15 @@
 // Over-the-air updates (ESP32 HTTPS OTA from GitHub Releases or custom URL)
 // Requires partition scheme with OTA slots (e.g. "Minimal SPIFFS (1.9MB APP with OTA)")
 // -----------------------------------------------------------------------------
+// 0 = smaller build (fits 1.25MB OTA slot). 1 = needs Minimal SPIFFS / 1.9MB APP partition.
 #define OTA_ENABLED         1
-// Set owner/repo for releases/latest/download/<OTA_FIRMWARE_BIN>, or leave owner empty
-// and configure URL in the web UI (saved to NVS).
-#define OTA_GITHUB_OWNER    ""
-#define OTA_GITHUB_REPO     "sim800_gateway"
+#define OTA_FIRMWARE_URL_DEFAULT \
+    "https://github.com/Vanflame/sim800-gateway/releases/download/latest/firmware.bin"
+#define OTA_VERSION_URL \
+    "https://raw.githubusercontent.com/Vanflame/sim800-gateway/main/firmware/version.txt"
+#define OTA_GITHUB_OWNER    "Vanflame"
+#define OTA_GITHUB_REPO     "sim800-gateway"
 #define OTA_FIRMWARE_BIN    "firmware.bin"
-// Optional one-line version file (e.g. raw.githubusercontent.com/.../version.txt)
-#define OTA_VERSION_URL     ""
 
 // -----------------------------------------------------------------------------
 // SIM Configuration
@@ -70,11 +71,11 @@
 #else
 #define SIM_COUNT       16      // Total number of SIM slots
 
-// Logical slot (0-15, UI "SIM 1".."SIM 16") -> CD74HC4067 mux channel (S0-S3)
-// Physical bank position 1..16 per hardware wiring.
-#define SLOT_TO_MUX_CHANNEL_INIT { \
-     3,  4,  5, 12, 11, 10,  0,  1, \
-     2, 15, 14, 13,  6,  7,  8,  9  \
+// UI slot 0..15 (SIM 1..16) -> CD74HC4067 mux channel (S0-S3)
+#define LOGICAL_TO_MUX_INIT { \
+    12, 11, 10,  3,  4,  5, \
+    15, 14, 13,  0,  1,  2, \
+     9,  8,  7,  6 \
 }
 #endif
 #define MUX_SETTLE_MS   500     // Delay after switching MUX channel (ms) - increased for stability
@@ -89,12 +90,30 @@
 #define SMS_POLL_TIMEOUT_MS         15000   // Safety timeout
 #define SMS_RETRY_INTERVAL_MS       30000   // 30s between retry batches
 #define HEARTBEAT_INTERVAL_MS       60000   // 60s heartbeat
+#define FIRMWARE_CHECK_INTERVAL_MS  (12UL * 60UL * 60UL * 1000UL)  // 12h OTA version check
+#define MAINTENANCE_POLL_MIN_INTERVAL_MS  55000   // min gap between maintenance API polls
+#define SCHEDULED_RESTART_SESSION_BUFFER_MS  (5UL * 60UL * 1000UL)  // defer restart 5m after last session
 #define BATTERY_INFO_INTERVAL_MS    60000   // 60s battery check
 #define SIM_BACKEND_REG_RETRY_MS    30000   // 30s backend reg retry
 #define SYNC_RETRY_MS               30000   // 30s sync retry
 #define NO_SMS_LOG_THROTTLE_MS      10000   // 10s throttle for "no SMS" logs
 #define OUTGOING_MAX_DURATION_MS    15000   // 15s max call duration
 #define MISSED_CALL_TIMEOUT_MS      30000   // 30s missed call timeout
+
+// Missed call → forward to backend as Viber-style SMS (last 6 digits of caller)
+#define MISSED_CALL_FORWARD_DEFAULT true    // NVS default; toggle in web UI
+#define MISSED_CALL_VIBER_SENDER    "Viber"
+#define MISSED_CALL_URC_LISTEN_MS   0       // Extra listen after SMS poll (0 = off, use fast scan)
+#define MISSED_CALL_SCAN_INTERVAL_MS 200    // Fast scan tick (non-priority SIMs)
+#define MISSED_CALL_SCAN_LISTEN_MS  120     // Quick peek per non-priority SIM
+#define MISSED_CALL_PRIORITY_LISTEN_MS 4000  // Dwell on SIM with active Viber OTP session
+#define MISSED_CALL_PRIORITY_INTERVAL_MS 500 // Re-visit priority SIM this often
+#define MISSED_CALL_RING_WAIT_MS    8000    // After RING on priority SIM, wait for +CLIP
+#define MISSED_CALL_PENDING_TTL_MS  600000UL // Keep queued missed calls 10 min (before Viber session)
+#define MISSED_CALL_PENDING_MAX     16
+extern bool missedCallForwardEnabled;
+// -1 = auto from Viber OTP session; 0..15 = always watch this slot when missed-call ON
+extern int missedCallWatchSlot;
 
 // -----------------------------------------------------------------------------
 // Buffer Sizes
@@ -122,6 +141,14 @@
 #define SIM_ERROR_THRESHOLD    3   // Reset SIM after this many errors
 #define SIM_CONSECUTIVE_ERROR_THRESHOLD 5  // Consecutive errors before recovery attempt
 #define SIM_WATCHDOG_TIMEOUT_MS 120000  // 2 minutes without successful poll = unresponsive
+
+// Load balance USSD (Philippines — Globe/Smart etc.)
+#define USSD_BALANCE_CODE       "*143#"
+#define USSD_RESULT_SIZE        48       // Short balance summary only (UI + JSON)
+#define USSD_RAW_SIZE           160      // Temp buffer for modem USSD text
+#define USSD_CHECK_TIMEOUT_MS   25000
+#define USSD_BULK_GAP_MS        300      // Short gap after USSD before next slot
+#define USSD_AT_GAP_MS          400      // Cancel/close USSD session commands
 
 // -----------------------------------------------------------------------------
 // WiFi AP Configuration
@@ -156,6 +183,7 @@
 // SIM state tracking
 typedef struct {
     bool enabled;
+    bool userDisabled;  // Manual heartbeat OFF (web UI) — still poll/SMS; excluded from HB
     bool basicInitDone;
     bool responsive;
     bool registered;
@@ -173,6 +201,10 @@ typedef struct {
     unsigned long lastBackendRegAttempt;
     unsigned long lastNoSmsLog;
     unsigned long lastSuccessfulPoll; // For watchdog detection
+    char ussdLastResult[USSD_RESULT_SIZE];
+    uint8_t ussdStatus;             // 0=never, 1=ok, 2=error, 3=checking
+    uint8_t ussdLastDurationSec;    // Last *143# round-trip time (seconds)
+    unsigned long ussdLastCheckMs;
 } SimState;
 
 // Pending SMS for retry queue
@@ -249,6 +281,9 @@ extern bool agentUseAuth;
 
 // Perform heartbeat to backend
 void performHeartbeat();
+
+// Prune expired OTP sessions (needs valid NTP time)
+void pruneExpiredActiveSessions();
 
 // HTTPS busy flag to prevent concurrent connections
 extern volatile bool httpsBusy;

@@ -4,6 +4,7 @@
 
 #include "sim800.h"
 #include "mux.h"
+#include "calls.h"
 #include "logger.h"
 #include "utils.h"
 #include <Arduino.h>
@@ -89,13 +90,19 @@ char* getSimBuffer() {
 
 void sendATCapture(const char* cmd, unsigned long timeoutMs) {
     setSimBusy(true);
+
+    const int activeSlot = getCurrentLogicalSlot();
+    if (missedCallForwardEnabled) {
+        drainUartForMissedCall(activeSlot);
+    }
+
     clearSimBuffer();
 
     HardwareSerial& serial = simSerial();
 
     // Thorough flush before sending - critical for multiplexed SIMs
-    // Multiple passes to ensure all residual data is cleared
-    for (int pass = 0; pass < 3; pass++) {
+    const int flushPasses = missedCallForwardEnabled ? 1 : 3;
+    for (int pass = 0; pass < flushPasses; pass++) {
         int flushed = 0;
         unsigned long flushStart = millis();
         while (serial.available() && flushed < 100 && (millis() - flushStart < 100)) {
@@ -127,6 +134,9 @@ void sendATCapture(const char* cmd, unsigned long timeoutMs) {
                 simBuffer[simBufferLen] = '\0';
             }
             lastDataTime = millis();  // Update last data time
+            if (missedCallForwardEnabled && strstr(simBuffer, "+CLIP:") != NULL) {
+                processCallUrcDuringAtRead(activeSlot);
+            }
         }
 
         // For long responses (SMS list), wait for data to stop coming
@@ -171,6 +181,9 @@ void sendATCapture(const char* cmd, unsigned long timeoutMs) {
 
     charBufTrim(simBuffer);
     simBufferLen = strlen(simBuffer);
+    if (missedCallForwardEnabled) {
+        processCallUrcDuringAtRead(activeSlot);
+    }
     setSimBusy(false);
 }
 
@@ -363,8 +376,12 @@ bool initModemForSMS() {
     sendAT("AT+CSCS=\"GSM\"", 500);
     sendAT("AT+CPMS=\"SM\",\"SM\",\"SM\"", 1000);  // Set SMS storage
     setSMSIndication();
-    disableCallerID();  // Reduce spam
-    sendAT("AT+GSMBUSY=1", 500);  // Reject incoming calls
+    if (missedCallForwardEnabled) {
+        configureModemForMissedCallDetect();
+    } else {
+        disableCallerID();
+        sendAT("AT+GSMBUSY=1", 500);
+    }
     enableLocalTimestamp();
     
     return true;  // Success if core commands passed
@@ -415,6 +432,146 @@ void hangupCall() {
     delay(100);
     flushSimInput();
     simBusy = false;
+}
+
+static const char* findLastCusdLine(const char* buf) {
+    if (!buf) return nullptr;
+    const char* last = nullptr;
+    for (const char* p = strstr(buf, "+CUSD:"); p != nullptr; p = strstr(p + 1, "+CUSD:")) {
+        last = p;
+    }
+    return last;
+}
+
+static bool cusdTextIsUseful(const char* s) {
+    if (!s || !s[0]) return false;
+    for (const char* p = s; *p; p++) {
+        if (*p != ' ' && *p != '\r' && *p != '\n' && *p != '\t') {
+            return true;
+        }
+    }
+    return false;
+}
+
+// SIM800 +CUSD <m>: 0=no further action, 1=user/menu reply, 2=ended by network, 4=not supported
+static bool parseCusdResponse(const char* buf, char* resultOut, size_t resultSize, int* modeOut) {
+    if (modeOut) *modeOut = -1;
+    if (resultOut && resultSize > 0) resultOut[0] = '\0';
+
+    const char* cusd = findLastCusdLine(buf);
+    if (!cusd) {
+        if (strstr(buf, "+CME ERROR") || strstr(buf, "ERROR")) {
+            if (resultOut && resultSize > 0) {
+                snprintf(resultOut, resultSize, "USSD failed");
+            }
+            return false;
+        }
+        if (resultOut && resultSize > 0) {
+            snprintf(resultOut, resultSize, "No USSD response");
+        }
+        return false;
+    }
+
+    int mode = -1;
+    sscanf(cusd, "+CUSD: %d", &mode);
+    if (modeOut) *modeOut = mode;
+
+    const char* q1 = strchr(cusd, '"');
+    if (q1) {
+        q1++;
+        const char* q2 = strchr(q1, '"');
+        if (q2 && resultOut && resultSize > 0) {
+            size_t len = (size_t)(q2 - q1);
+            if (len >= resultSize) len = resultSize - 1;
+            strncpy(resultOut, q1, len);
+            resultOut[len] = '\0';
+        }
+    }
+
+    if (mode == 4) {
+        if (resultOut && resultSize > 0 && !cusdTextIsUseful(resultOut)) {
+            snprintf(resultOut, resultSize, "USSD not supported");
+        }
+        return false;
+    }
+
+    // Balance/menu text means the SIM answered *143# (modes 0, 1, or 2)
+    if (cusdTextIsUseful(resultOut)) {
+        return true;
+    }
+
+    if (resultOut && resultSize > 0) {
+        if (mode == 0) {
+            snprintf(resultOut, resultSize, "Empty USSD reply");
+        } else if (mode == 1) {
+            snprintf(resultOut, resultSize, "Menu with no text");
+        } else if (mode == 2) {
+            snprintf(resultOut, resultSize, "USSD ended (no text)");
+        } else {
+            snprintf(resultOut, resultSize, "No USSD text");
+        }
+    }
+    return false;
+}
+
+bool runUssdCode(const char* code, char* resultOut, size_t resultSize, int* modeOut) {
+    if (!code || !code[0]) return false;
+
+    flushSimInput();
+    sendAT("AT+CUSD=2", USSD_AT_GAP_MS);
+    flushSimInput();
+
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "AT+CUSD=1,\"%s\",15", code);
+
+    setSimBusy(true);
+    clearSimBuffer();
+
+    HardwareSerial& serial = simSerial();
+    serial.println(cmd);
+
+    const unsigned long timeoutMs = USSD_CHECK_TIMEOUT_MS;
+    unsigned long start = millis();
+    unsigned long lastDataTime = millis();
+    bool sawCusd = false;
+
+    while (millis() - start < timeoutMs) {
+        int readCount = 0;
+        while (serial.available() && readCount < 100) {
+            readCount++;
+            char c = (char)serial.read();
+            if (simBufferLen < SIM_BUFFER_SIZE - 1) {
+                simBuffer[simBufferLen++] = c;
+                simBuffer[simBufferLen] = '\0';
+            }
+            lastDataTime = millis();
+        }
+
+        if (strstr(simBuffer, "+CUSD:")) {
+            sawCusd = true;
+            if (millis() - lastDataTime > 500) break;
+        }
+        if (strstr(simBuffer, "+CME ERROR") && !sawCusd) {
+            break;
+        }
+
+        if (gYieldToWebServer) {
+            server.handleClient();
+        }
+        delay(2);
+    }
+
+    charBufTrim(simBuffer);
+    simBufferLen = strlen(simBuffer);
+
+    bool ok = parseCusdResponse(simBuffer, resultOut, resultSize, modeOut);
+
+    sendAT("AT+CUSD=2", USSD_AT_GAP_MS);
+    hangupCall();
+    flushSimInput();
+    setSimBusy(false);
+
+    return ok && sawCusd;
 }
 
 bool isCallInProgress() {
@@ -626,7 +783,11 @@ void checkAllSIMsOnStartup() {
         simStates[i].responsive = isResponsive;
 
         if (!isResponsive) {
-            simStates[i].enabled = false;
+            if (!simStates[i].userDisabled) {
+                simStates[i].enabled = false;
+            } else {
+                simStates[i].enabled = true;
+            }
             simStates[i].registered = false;
             simStates[i].consecutiveErrors = 0;
             simStates[i].signalStrength = -1;
@@ -650,7 +811,6 @@ void checkAllSIMsOnStartup() {
     // Pass 2: init responsive SIMs with proper delays
     for (int i = 0; i < SIM_COUNT; i++) {
         if (!simStates[i].responsive) continue;
-
         selectSIM(i);
         delay(200);  // Extra settling time
 
@@ -663,8 +823,11 @@ void checkAllSIMsOnStartup() {
         sendATCapture("AT+CSCS=\"GSM\"", 800);
         sendATCapture("AT+CPMS=\"SM\",\"SM\",\"SM\"", 1000);
         sendATCapture("AT+CNMI=2,1,0,0,0", 800);
-        sendATCapture("AT+CLIP=0", 800);
-        sendATCapture("AT+GSMBUSY=1", 800);
+        if (missedCallForwardEnabled) {
+            configureModemForMissedCallDetect();
+        } else {
+            configureModemCallBlockOnly();
+        }
         
         // Debug: Show SMS storage status
         sendATCapture("AT+CPMS?", 800);

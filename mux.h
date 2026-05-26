@@ -28,13 +28,14 @@ inline void initMux() {}
 // Channel Selection
 // -----------------------------------------------------------------------------
 
-// Map logical slot (0-15) to mux channel (0-15) per SLOT_TO_MUX_CHANNEL wiring
+// Default 1:1 — SIM 1 = slot 0 = mux channel 0.
 #if !USE_DUAL_UART
 int logicalSlotToMuxChannel(int logicalSlot);
+int muxChannelToLogicalSlot(int muxChannel);
+int muxUiSimNumber(int slot);
 #endif
 
-// Select SIM by logical slot (0-15 in mux mode, 0-1 in dual-UART mode)
-// In mux mode: maps slot -> mux channel, waits MUX_SETTLE_MS, flushes UART
+// Select SIM by slot (0-15 in mux mode); drives mux channel = slot
 // In dual-UART mode: calls setActiveSimSlot() to switch UART and flushes buffer
 #if !USE_DUAL_UART
 void selectSIM(int logicalSlot);
@@ -59,7 +60,7 @@ inline void selectSIM(int channel) {
 }
 #endif
 
-// Get currently selected logical slot (not raw mux channel)
+// Get currently selected slot (0-15)
 #if !USE_DUAL_UART
 int getCurrentLogicalSlot();
 inline int getCurrentMuxChannel() { return getCurrentLogicalSlot(); }
