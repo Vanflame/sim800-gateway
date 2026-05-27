@@ -770,13 +770,13 @@ void checkAllSIMsOnStartup() {
         selectSIM(i);
         delay(200);  // Extra settling time on first probe
         
-        // Try multiple times to detect SIM
+        // Quick probe (empty mux channels fail fast)
         bool isResponsive = false;
-        for (int retry = 0; retry < 3 && !isResponsive; retry++) {
-            sendATCapture("AT", 800);  // Longer timeout
+        for (int retry = 0; retry < 2 && !isResponsive; retry++) {
+            sendATCapture("AT", 400);
             isResponsive = (strstr(getSimBuffer(), "OK") != NULL);
             if (!isResponsive) {
-                delay(200);
+                delay(100);
             }
         }
         

@@ -5,7 +5,6 @@
 #include "webui.h"
 #include "ota.h"
 #include "calls.h"
-#include "mux.h"
 #include "config.h"
 #include "sim800.h"
 #include "mux.h"
@@ -13,6 +12,7 @@
 #include "logger.h"
 #include "utils.h"
 #include "ussd.h"
+#include "maintenance.h"
 #include <WiFi.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
@@ -20,12 +20,17 @@
 #include <Preferences.h>
 #include <time.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 
 // Web server on port 80
 WebServer server(80);
 
 static volatile bool refreshAllInProgress = false;
+static char webJsonBuf[5120];
+
+#define WEB_MESSAGES_LOG_PATH "/littlefs/messages.log"
+extern bool webLittleFsReady();
 
 bool isWebRefreshAllInProgress() {
     return refreshAllInProgress;
@@ -76,7 +81,7 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SIM800 Gateway | OTPocket Agent</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect fill='%233b82f6' x='10' y='10' width='80' height='80' rx='15'/><text x='50' y='68' font-size='50' font-weight='bold' fill='white' text-anchor='middle'>OT</text></svg>">
+  <link rel="icon" href="data:,">
   <style>
     /* OTPocket Design System */
     :root {
@@ -96,7 +101,7 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
       --input-bg: rgba(255,255,255,0.05);
       --radius: 0.75rem;
       --shadow: 0 4px 6px -1px rgba(0,0,0,0.3), 0 2px 4px -2px rgba(0,0,0,0.2);
-      --sidebar-width: 240px;
+      --sidebar-width: 200px;
     }
     
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -108,24 +113,6 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
       min-height: 100vh;
       line-height: 1.5;
       -webkit-font-smoothing: antialiased;
-    }
-    
-    /* Background with gradient and glow */
-    .bg-wrapper {
-      position: fixed;
-      inset: 0;
-      pointer-events: none;
-      z-index: 0;
-      background: linear-gradient(180deg, #06122b 0%, #0b1a3a 45%, #040b1f 100%);
-    }
-    
-    .bg-wrapper::before {
-      content: '';
-      position: absolute;
-      inset: 0;
-      background: radial-gradient(1100px 700px at 18% 18%, rgba(59,130,246,0.15), transparent 60%),
-                  radial-gradient(1000px 680px at 82% 24%, rgba(124,58,237,0.12), transparent 62%),
-                  radial-gradient(1200px 820px at 50% 100%, rgba(59,130,246,0.08), transparent 62%);
     }
     
     /* Layout */
@@ -153,87 +140,13 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
     
     .sidebar.open { transform: translateX(0); }
     
-    /* Desktop: show sidebar always, allow collapse */
+    /* Desktop: show sidebar always */
     @media (min-width: 768px) {
       .sidebar { transform: translateX(0); }
-      .sidebar.collapsed { 
-        transform: translateX(0);
-        width: 60px;
-      }
-      .sidebar.collapsed .logo-text { display: none !important; }
-      .sidebar.collapsed .sidebar-header { 
-        padding: 12px; 
-        justify-content: center; 
-      }
-      .sidebar.collapsed .sidebar-header .logo { 
-        justify-content: center; 
-        margin: 0;
-      }
-      .sidebar.collapsed .sidebar-toggle { 
-        position: absolute;
-        right: -16px;
-        top: 12px;
-        margin-left: 0;
-      }
-      .sidebar.collapsed .nav-item {
-        justify-content: center;
-        padding: 12px 8px;
-        gap: 0;
-        position: relative;
-      }
-      .sidebar.collapsed .nav-item svg {
-        margin: 0;
-        flex-shrink: 0;
-      }
-      /* Show badge as small dot on icon when collapsed */
-      .sidebar.collapsed .nav-item .nav-badge {
-        position: absolute;
-        top: 8px;
-        right: 12px;
-        min-width: 6px;
-        height: 6px;
-        padding: 0;
-        font-size: 0;
-        border-radius: 50%;
-        background: var(--success);
-      }
-      .main-content { margin-left: var(--sidebar-width); }
-      .main-content.expanded { margin-left: 60px; }
+      .main-content { margin-left: var(--sidebar-width); transition: margin-left 0.3s ease; }
       .mobile-header { display: none !important; }
       .overlay.show { opacity: 0 !important; pointer-events: none !important; }
-      .sidebar-toggle { display: flex !important; }
     }
-    
-    /* Hide text in nav items when collapsed (desktop only) */
-    @media (min-width: 768px) {
-      .sidebar.collapsed .nav-item {
-        font-size: 0;
-        overflow: hidden;
-      }
-    }
-    
-    /* Sidebar toggle button (desktop only) */
-    .sidebar-toggle {
-      display: none;
-      width: 32px;
-      height: 32px;
-      background: rgba(255,255,255,0.05);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      align-items: center;
-      justify-content: center;
-      cursor: pointer;
-      color: var(--text-secondary);
-      transition: transform 0.3s ease, color 0.2s, background 0.2s;
-      margin-left: auto;
-      flex-shrink: 0;
-    }
-    
-    .sidebar-toggle:hover { 
-      background: rgba(255,255,255,0.1); 
-      color: var(--text); 
-    }
-    .sidebar-toggle svg { width: 16px; height: 16px; }
     
     .sidebar-header {
       padding: 16px;
@@ -245,15 +158,118 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
     
     .sidebar-nav {
       flex: 1;
-      padding: 8px;
+      padding: 6px;
       overflow-y: auto;
     }
+
+    .nav-restart {
+      display: none;
+      align-items: center;
+      gap: 10px;
+      margin: 6px 8px 10px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: rgba(245, 158, 11, 0.12);
+      border: 1px solid rgba(245, 158, 11, 0.35);
+      color: #fbbf24;
+      font-size: 11px;
+    }
+    .nav-restart.show { display: flex; }
+    .nav-restart.overdue {
+      background: rgba(239, 68, 68, 0.12);
+      border-color: rgba(239, 68, 68, 0.4);
+      color: #f87171;
+    }
+    .nav-restart svg { width: 18px; height: 18px; flex-shrink: 0; }
+    .nav-restart-label { font-weight: 600; line-height: 1.2; }
+    .nav-restart-timer {
+      font-family: 'SF Mono', Consolas, monospace;
+      font-size: 15px;
+      font-weight: 700;
+      margin-top: 2px;
+    }
+    .sidebar.collapsed .nav-restart { display: none !important; }
+
+    /* Mobile restart strip — glued directly under the sticky header */
+    .mobile-restart-strip {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 14px;
+      background: rgba(245, 158, 11, 0.14);
+      border-bottom: 1px solid rgba(245, 158, 11, 0.35);
+      font-size: 12px;
+      font-weight: 600;
+      color: #fbbf24;
+      position: sticky;
+      top: 49px;
+      z-index: 49;
+    }
+    .mobile-restart-strip.show { display: flex; }
+    .mobile-restart-strip.overdue { background: rgba(239, 68, 68, 0.14); border-color: rgba(239, 68, 68, 0.4); color: #f87171; }
+    .mobile-restart-strip svg { width: 14px; height: 14px; flex-shrink: 0; }
+    .mobile-restart-strip-timer { font-family: 'SF Mono', Consolas, monospace; font-weight: 700; margin-left: 4px; }
+    @media (min-width: 768px) { .mobile-restart-strip { display: none !important; } }
+
+    /* Sidebar collapse toggle (desktop) */
+    .sidebar-collapse-btn {
+      display: none;
+      background: none;
+      border: none;
+      color: var(--muted);
+      cursor: pointer;
+      padding: 4px;
+      border-radius: 6px;
+      margin-left: auto;
+      line-height: 0;
+      transition: color 0.2s, background 0.2s;
+    }
+    .sidebar-collapse-btn:hover { color: var(--text); background: rgba(255,255,255,0.07); }
+    .sidebar-collapse-btn svg { width: 18px; height: 18px; }
+    @media (min-width: 768px) { .sidebar-collapse-btn { display: flex; align-items: center; } }
+
+    /* Collapsed sidebar */
+    @media (min-width: 768px) {
+      .sidebar.collapsed { width: 52px; }
+      .sidebar.collapsed .logo-text { display: none; }
+      .sidebar.collapsed .nav-item { justify-content: center; padding: 9px 0; }
+      .sidebar.collapsed .nav-item span,
+      .sidebar.collapsed .nav-item-label { display: none; }
+      .sidebar.collapsed .nav-badge { display: none !important; }
+      .sidebar.collapsed .sidebar-collapse-btn { margin-left: 0; }
+      .main-content.sidebar-collapsed { margin-left: 52px; }
+    }
+
+    /* Mask URL field */
+    .url-field-wrap { position: relative; }
+    .url-field-wrap input { padding-right: 72px; font-family: 'SF Mono', Consolas, monospace; font-size: 12px; letter-spacing: 0.04em; }
+    .url-field-actions {
+      position: absolute;
+      right: 6px;
+      top: 50%;
+      transform: translateY(-50%);
+      display: flex;
+      gap: 4px;
+    }
+    .url-field-btn {
+      background: rgba(255,255,255,0.07);
+      border: none;
+      color: var(--muted);
+      cursor: pointer;
+      padding: 4px 6px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      transition: background 0.15s, color 0.15s;
+      line-height: 1;
+    }
+    .url-field-btn:hover { background: rgba(255,255,255,0.13); color: var(--text); }
     
     .nav-item {
       display: flex;
       align-items: center;
-      gap: 12px;
-      padding: 12px 16px;
+      gap: 10px;
+      padding: 9px 12px;
       border-radius: 8px;
       color: var(--text-secondary);
       text-decoration: none;
@@ -371,8 +387,8 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
     .overlay.show { opacity: 1; pointer-events: auto; }
     
     .container {
-      padding: 16px;
-      padding-bottom: 100px;
+      padding: 12px 14px;
+      padding-bottom: 72px;
       max-width: 1200px;
       margin: 0 auto;
     }
@@ -443,17 +459,17 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
     
     /* Page header */
     .page-header {
-      margin-bottom: 16px;
+      margin-bottom: 10px;
     }
     
     .page-title {
-      font-size: 20px;
+      font-size: 18px;
       font-weight: 600;
-      margin-bottom: 4px;
+      margin-bottom: 2px;
     }
     
     .page-subtitle {
-      font-size: 13px;
+      font-size: 12px;
       color: var(--muted);
     }
     
@@ -462,8 +478,8 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
       background: var(--card);
       border: 1px solid var(--card-border);
       border-radius: var(--radius);
-      padding: 16px;
-      margin-bottom: 12px;
+      padding: 12px 14px;
+      margin-bottom: 8px;
       box-shadow: var(--shadow);
     }
     
@@ -611,7 +627,7 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
       background: var(--input-bg);
       border: 1px solid var(--border);
       border-radius: 8px;
-      padding: 10px;
+      padding: 8px;
       transition: all 0.15s ease;
     }
     
@@ -707,8 +723,8 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
       flex-wrap: wrap;
       align-items: flex-start;
       justify-content: space-between;
-      gap: 12px;
-      padding: 14px 0;
+      gap: 10px;
+      padding: 10px 0;
       border-bottom: 1px solid var(--card-border);
     }
     .settings-row:last-child { border-bottom: none; padding-bottom: 0; }
@@ -838,56 +854,171 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
     .signal.s3 i:nth-child(-n+3) { background: var(--success); }
     .signal.s4 i:nth-child(-n+4) { background: var(--success); }
     
-    /* Log section */
+    /* Logs */
+    .log-panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
     .log-tabs {
       display: flex;
-      gap: 4px;
-      margin-bottom: 12px;
+      gap: 6px;
+      background: var(--bg);
+      padding: 4px;
+      border-radius: 8px;
+      border: 1px solid var(--card-border);
     }
-    
     .log-tab {
-      flex: 1;
-      padding: 8px;
+      padding: 8px 16px;
       font-size: 12px;
-      font-weight: 500;
-      text-align: center;
-      background: var(--input-bg);
-      border: 1px solid var(--border);
+      font-weight: 600;
       border-radius: 6px;
       cursor: pointer;
       transition: all 0.15s ease;
-      color: var(--text-secondary);
+      color: var(--muted);
+      border: none;
+      background: transparent;
     }
-    
-    .log-tab:hover { background: rgba(255,255,255,0.1); }
+    .log-tab:hover { color: var(--text); background: rgba(255,255,255,0.05); }
     .log-tab.active {
-      background: var(--primary);
-      border-color: var(--primary);
-      color: white;
+      background: var(--card);
+      color: var(--text);
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
     }
-    
-    .log-content {
-      background: rgba(0,0,0,0.3);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 12px;
-      max-height: 250px;
+    .log-tab-badge {
+      display: inline-block;
+      min-width: 18px;
+      padding: 1px 6px;
+      margin-left: 6px;
+      font-size: 10px;
+      font-weight: 700;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.08);
+    }
+    .log-tab.active .log-tab-badge { background: rgba(99, 102, 241, 0.25); color: var(--primary); }
+    .log-viewport {
+      background: #0a0e14;
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      max-height: min(52vh, 480px);
+      min-height: 280px;
       overflow-y: auto;
+      overflow-x: hidden;
+    }
+    .log-line {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 7px 14px;
       font-family: 'SF Mono', Consolas, monospace;
       font-size: 11px;
-      line-height: 1.6;
-      white-space: pre-wrap;
-      word-break: break-all;
+      line-height: 1.45;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
     }
-    
+    .log-line:last-child { border-bottom: none; }
+    .log-line:hover { background: rgba(255,255,255,0.02); }
+    .log-tag {
+      flex-shrink: 0;
+      color: #64748b;
+      font-weight: 600;
+      min-width: 64px;
+    }
+    .log-msg { flex: 1; word-break: break-word; color: #cbd5e1; }
+    .log-line.ok .log-msg { color: #4ade80; }
+    .log-line.err .log-msg { color: #f87171; }
+    .log-line.warn .log-msg { color: #fbbf24; }
+    .log-line.info .log-msg { color: #94a3b8; }
+    .log-empty {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 200px;
+      color: #64748b;
+      font-size: 13px;
+    }
     .log-footer {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      margin-top: 8px;
-      font-size: 11px;
-      color: var(--muted);
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid var(--card-border);
     }
+    .log-footer-meta { font-size: 12px; color: var(--muted); }
+    .fw-lead { margin: 0 0 14px; line-height: 1.5; }
+    .fw-notice {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 10px 12px;
+      margin-bottom: 14px;
+      border-radius: 8px;
+      background: rgba(234, 179, 8, 0.1);
+      border: 1px solid rgba(234, 179, 8, 0.35);
+      font-size: 12px;
+      line-height: 1.45;
+      color: var(--text);
+    }
+    .fw-notice.hide { display: none !important; }
+    .fw-hero {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .fw-hero-box {
+      padding: 14px 12px;
+      background: var(--bg);
+      border-radius: 10px;
+      border: 1px solid var(--card-border);
+      text-align: center;
+    }
+    .fw-hero-box.highlight { border-color: var(--primary); box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.25); }
+    .fw-hero-label {
+      display: block;
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .fw-hero-version {
+      display: block;
+      font-size: 22px;
+      font-weight: 700;
+      font-family: 'SF Mono', Consolas, monospace;
+      color: var(--text);
+      line-height: 1.2;
+    }
+    .fw-hero-arrow { font-size: 18px; color: var(--muted); text-align: center; }
+    .fw-status-line { margin: 0 0 14px; min-height: 1.25em; }
+    .fw-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+    .fw-meta { margin: 0 0 12px; line-height: 1.5; }
+    .fw-advanced {
+      border-top: 1px solid var(--card-border);
+      padding-top: 10px;
+      margin-top: 4px;
+    }
+    .fw-advanced summary {
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      user-select: none;
+      list-style: none;
+    }
+    .fw-advanced summary::-webkit-details-marker { display: none; }
+    .fw-advanced summary::before { content: '▸ '; }
+    .fw-advanced[open] summary::before { content: '▾ '; }
+    .fw-advanced-body { margin-top: 12px; }
+    .fw-advanced-body label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 6px; }
+    .fw-advanced-body input { width: 100%; margin-bottom: 8px; font-size: 12px; }
+    .fw-advanced-hint { margin: 6px 0 0; font-size: 11px; line-height: 1.45; color: var(--muted); }
     
     /* Modal */
     .modal {
@@ -1003,103 +1134,133 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
     .net-name { font-weight: 500; }
     .net-signal { font-size: 11px; color: var(--muted); }
     
-    /* SMS List */
-    .sms-list { display: flex; flex-direction: column; gap: 8px; }
-    
-    .sms-item {
-      background: var(--input-bg);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 12px;
-      transition: all 0.15s ease;
-    }
-    
-    .sms-item:hover { border-color: var(--primary); }
-    
-    .sms-header {
+    /* Messages tab */
+    .msg-toolbar {
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      margin-bottom: 8px;
+      gap: 8px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
     }
-    
+    .msg-search-wrap {
+      position: relative;
+      flex: 1;
+      min-width: 160px;
+    }
+    .msg-search-wrap svg {
+      position: absolute;
+      left: 10px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 15px;
+      height: 15px;
+      color: var(--muted);
+      pointer-events: none;
+    }
+    .msg-search-wrap input {
+      width: 100%;
+      padding-left: 32px;
+      margin: 0;
+    }
+    .msg-count { font-size: 12px; color: var(--muted); white-space: nowrap; }
+
+    .sms-list { display: flex; flex-direction: column; gap: 1px; }
+
+    .sms-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      padding: 12px 14px;
+      background: var(--card);
+      border-bottom: 1px solid var(--card-border);
+      cursor: default;
+      transition: background 0.12s;
+    }
+    .sms-item:first-child { border-radius: 8px 8px 0 0; }
+    .sms-item:last-child { border-bottom: none; border-radius: 0 0 8px 8px; }
+    .sms-item:only-child { border-radius: 8px; border-bottom: none; }
+    .sms-item:hover { background: rgba(59,130,246,0.06); }
+
+    .sms-avatar {
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      background: rgba(59,130,246,0.18);
+      color: var(--primary);
+      font-weight: 700;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      margin-top: 1px;
+    }
+    .sms-main { flex: 1; min-width: 0; }
+    .sms-row1 {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 2px;
+    }
     .sms-sender {
       font-weight: 600;
       font-size: 13px;
-      color: var(--primary);
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
-    
+    .sms-time {
+      font-size: 11px;
+      color: var(--muted);
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .sms-row2 {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 4px;
+    }
     .sms-slot {
       font-size: 10px;
       color: var(--muted);
       background: rgba(255,255,255,0.05);
-      padding: 2px 6px;
+      border: 1px solid var(--card-border);
+      padding: 1px 6px;
       border-radius: 4px;
+      white-space: nowrap;
+      flex-shrink: 0;
     }
-    
-    .sms-time {
-      font-size: 10px;
-      color: var(--muted);
-      margin-bottom: 8px;
-    }
-    
+    .sms-number { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .sms-body {
       font-size: 13px;
       line-height: 1.5;
-      color: var(--text);
-      white-space: pre-wrap;
+      color: var(--text-secondary);
       word-break: break-word;
+      white-space: pre-wrap;
     }
-    
     .sms-actions {
       display: flex;
-      gap: 8px;
-      margin-top: 10px;
-      padding-top: 10px;
-      border-top: 1px solid var(--border);
-    }
-    
-    .sms-copy-btn {
-      font-size: 11px;
-      color: var(--primary);
-      background: none;
-      border: none;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
+      flex-direction: column;
       gap: 4px;
+      flex-shrink: 0;
     }
-    
-    .sms-copy-btn:hover { text-decoration: underline; }
-    
-    /* Stats Grid */
-    .stats-grid {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 8px;
-    }
-    
-    .stat-item {
-      text-align: center;
-      padding: 12px 8px;
-      background: var(--input-bg);
-      border-radius: 8px;
-    }
-    
-    .stat-value {
-      font-size: 24px;
-      font-weight: 700;
-      color: var(--text);
-      line-height: 1;
-    }
-    
-    .stat-label {
-      font-size: 10px;
+    .sms-copy-btn {
+      background: none;
+      border: 1px solid var(--card-border);
       color: var(--muted);
-      margin-top: 4px;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
+      cursor: pointer;
+      padding: 4px 8px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
+      transition: all 0.15s;
     }
+    .sms-copy-btn:hover { border-color: var(--primary); color: var(--primary); background: rgba(59,130,246,0.08); }
+    .sms-highlight { background: rgba(234,179,8,0.25); border-radius: 2px; }
     
     .stat-item.success .stat-value { color: var(--success); }
     .stat-item.warning .stat-value { color: var(--warning); }
@@ -1140,7 +1301,6 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <div class="bg-wrapper"></div>
   <div class="overlay" id="overlay" onclick="toggleSidebar()"></div>
   
   <div class="app-layout">
@@ -1151,51 +1311,59 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
           <div class="logo-icon">OT</div>
           <div class="logo-text">OTPocket<span>Agent</span></div>
         </div>
-        <button class="sidebar-toggle" id="sidebarToggle" onclick="toggleSidebarDesktop()">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+        <button class="sidebar-collapse-btn" id="sidebarCollapseBtn" onclick="toggleSidebarCollapse()" title="Collapse sidebar">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>
         </button>
       </div>
       <nav class="sidebar-nav">
-        <div class="nav-item active" data-tab="dashboard" onclick="switchTab('dashboard')">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
-          Dashboard
-        </div>
-        <div class="nav-item" data-tab="sims" onclick="switchTab('sims')">
+        <div class="nav-item active" data-tab="sims" onclick="switchTab('sims')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.01M10 8h.01"/></svg>
-          SIM Slots
+          <span class="nav-item-label">SIM Slots</span>
           <span class="nav-badge" id="sessionsNavBadge" style="display:none;">0</span>
         </div>
         <div class="nav-item" data-tab="messages" onclick="switchTab('messages')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-          Messages
+          <span class="nav-item-label">Messages</span>
           <span class="nav-badge" id="msgBadge">0</span>
         </div>
         <div class="nav-item" data-tab="settings" onclick="switchTab('settings')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
-          Settings
+          <span class="nav-item-label">Settings</span>
         </div>
         <div class="nav-item" data-tab="logs" onclick="switchTab('logs')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-          Logs
+          <span class="nav-item-label">Logs</span>
         </div>
       </nav>
+      <div class="nav-restart" id="navRestartBanner">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+        <div>
+          <div class="nav-restart-label">Scheduled restart</div>
+          <div class="nav-restart-timer" id="navRestartTimer">—</div>
+        </div>
+      </div>
     </aside>
     
     <!-- Main Content -->
     <main class="main-content" id="mainContent">
       <!-- Mobile Header -->
-    <header class="mobile-header">
-      <button class="menu-btn" onclick="toggleSidebar()">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
-      </button>
-      <div class="logo">
-        <div class="logo-icon" style="width:28px;height:28px;font-size:14px;">OT</div>
-        <span style="font-weight:600;">OTPocket Agent</span>
+      <header class="mobile-header">
+        <button class="menu-btn" onclick="toggleSidebar()">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+        </button>
+        <div class="logo">
+          <div class="logo-icon" style="width:28px;height:28px;font-size:14px;">OT</div>
+          <span style="font-weight:600;">OTPocket Agent</span>
+        </div>
+        <div class="header-status">
+          <div class="status-dot" id="statusDot"></div>
+        </div>
+      </header>
+      <!-- Mobile restart strip (shown below header when restart is pending) -->
+      <div class="mobile-restart-strip" id="mobileRestartStrip">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+        Scheduled restart in <span class="mobile-restart-strip-timer" id="mobileRestartTimer">—</span>
       </div>
-      <div class="header-status">
-        <div class="status-dot" id="statusDot"></div>
-      </div>
-    </header>
     
     <!-- Login Page (shown when not logged in) -->
     <div id="loginPage" class="container login-container">
@@ -1234,133 +1402,16 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
           <button class="btn full" id="loginBtn" style="margin-top:8px;">Sign In</button>
         </form>
         
-        <div style="margin-top:24px;text-align:center;">
-          <p class="muted text-sm">Don't have an account? <a href="https://otpocket.app/register" style="color:var(--primary);text-decoration:none;">Sign up</a></p>
-        </div>
-      </div>
-      
-      <!-- WiFi Quick Setup (shown on login page) -->
-      <div class="card" style="margin-top:16px;">
-        <div class="card-header">
-          <div class="card-title">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>
-            WiFi Setup
-          </div>
-          <span class="badge danger" id="loginWifiBadge">Disconnected</span>
-        </div>
-        <div id="loginWifiConnected" class="hide">
-          <div class="row mb-2">
-            <span class="muted text-sm">Connected to</span>
-            <span class="text-sm" id="loginWifiSsid">-</span>
-          </div>
-        </div>
-        <div id="loginWifiSetup">
-          <button class="btn secondary full mb-2" id="loginScanBtn">Scan Networks</button>
-          <div id="loginScanResults" class="grid mb-2"></div>
-          <div class="divider"></div>
-          <form onsubmit="return false;">
-            <input id="loginManualSsid" placeholder="Network name (SSID)" style="margin-bottom:8px;" autocomplete="off" />
-            <input id="loginManualPw" type="password" placeholder="Password" style="margin-bottom:8px;" autocomplete="new-password" />
-            <button class="btn full" id="loginConnectBtn">Connect</button>
-          </form>
-        </div>
+        <p class="muted text-sm" style="margin-top:12px;text-align:center;">Configure WiFi in Settings after sign in.</p>
       </div>
     </div>
   </div>
   
-  <!-- Dashboard Page (shown when logged in) -->
+  <!-- Main app (shown when logged in) -->
   <div id="dashboardPage" class="container hide">
     
-    <!-- Dashboard Tab -->
-    <div class="tab-content active" id="tab-dashboard">
-      <div class="page-header">
-        <h1 class="page-title">Dashboard</h1>
-        <p class="page-subtitle">Overview of your SIM gateway</p>
-      </div>
-      
-      <!-- Stats -->
-      <div class="card">
-        <div class="stats-grid">
-          <div class="stat-item success">
-            <div class="stat-value" id="statReceived">0</div>
-            <div class="stat-label">Received</div>
-          </div>
-          <div class="stat-item success">
-            <div class="stat-value" id="statForwarded">0</div>
-            <div class="stat-label">Forwarded</div>
-          </div>
-          <div class="stat-item danger">
-            <div class="stat-value" id="statFailed">0</div>
-            <div class="stat-label">Failed</div>
-          </div>
-          <div class="stat-item warning">
-            <div class="stat-value" id="statPending">0</div>
-            <div class="stat-label">Pending</div>
-          </div>
-        </div>
-      </div>
-      
-      <!-- WiFi Card -->
-      <div class="card" id="wifiCard">
-        <div class="card-header">
-          <div class="card-title">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/></svg>
-            WiFi
-          </div>
-          <span class="badge danger" id="wifiBadge">Disconnected</span>
-        </div>
-        
-        <div id="wifiConnected" class="hide">
-          <div class="row mb-2">
-            <span class="muted text-sm">Network</span>
-            <span class="text-sm" id="wifiSsid">-</span>
-          </div>
-          <div class="row mb-4">
-            <span class="muted text-sm">IP Address</span>
-            <span class="text-sm" id="wifiIp">-</span>
-          </div>
-          <button class="btn secondary sm" id="disconnectBtn">Disconnect</button>
-        </div>
-        
-        <div id="wifiSetup">
-          <button class="btn secondary full mb-2" id="scanBtn">Scan Networks</button>
-          <div id="scanResults" class="grid mb-4"></div>
-          <div class="divider"></div>
-          <form onsubmit="return false;">
-            <input id="manualSsid" placeholder="Network name (SSID)" style="margin-bottom:8px;" autocomplete="off" />
-            <input id="manualPw" type="password" placeholder="Password" style="margin-bottom:8px;" autocomplete="new-password" />
-            <button class="btn full" id="connectBtn">Connect</button>
-          </form>
-        </div>
-      </div>
-      
-      <!-- Auth Card -->
-      <div class="card" id="authCard">
-        <div class="card-header">
-          <div class="card-title">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-            Authentication
-          </div>
-          <span class="badge success" id="authBadge">Logged In</span>
-        </div>
-        
-        <div class="row mb-2">
-          <span class="muted text-sm">Device</span>
-          <span class="badge primary" id="deviceBadge">-</span>
-        </div>
-        <div class="row mb-4">
-          <span class="muted text-sm">SIMs Registered</span>
-          <span class="text-sm" id="simsRegCount">-</span>
-        </div>
-        <div class="btn-group">
-          <button class="btn sm secondary" id="registerDeviceBtn">Register Device</button>
-          <button class="btn sm danger" id="logoutBtn">Logout</button>
-        </div>
-      </div>
-    </div>
-    
     <!-- SIM Slots Tab -->
-    <div class="tab-content" id="tab-sims">
+    <div class="tab-content active" id="tab-sims">
       <div class="page-header">
         <h1 class="page-title">SIM Slots</h1>
         <p class="page-subtitle">Manage your SIM cards</p>
@@ -1415,20 +1466,22 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
     <div class="tab-content" id="tab-messages">
       <div class="page-header">
         <h1 class="page-title">Messages</h1>
-        <p class="page-subtitle">View received SMS messages</p>
       </div>
-      
-      <div class="card">
-        <div class="card-header">
-          <span class="text-sm muted" id="smsCount">0 messages</span>
-          <button class="btn xs secondary" id="refreshSmsBtn">Refresh</button>
+
+      <div class="msg-toolbar">
+        <div class="msg-search-wrap">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input id="smsSearch" type="search" placeholder="Search messages or senders…" oninput="filterMessages()" autocomplete="off" />
         </div>
-        <div class="sms-list" id="smsList">
-          <div class="empty-state">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-            <p>No messages yet</p>
-            <p class="text-sm">Received SMS will appear here</p>
-          </div>
+        <span class="msg-count" id="smsCount">—</span>
+        <button class="btn xs secondary" id="refreshSmsBtn">Refresh</button>
+        <button class="btn xs danger" id="clearSmsBtn">Clear all</button>
+      </div>
+
+      <div class="sms-list" id="smsList">
+        <div class="empty-state">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+          <p>No messages yet</p>
         </div>
       </div>
     </div>
@@ -1437,7 +1490,38 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
     <div class="tab-content" id="tab-settings">
       <div class="page-header">
         <h1 class="page-title">Settings</h1>
-        <p class="page-subtitle">Configure your gateway</p>
+      </div>
+
+      <div class="card" id="wifiCard">
+        <div class="card-header">
+          <div class="card-title">WiFi</div>
+          <span class="badge danger" id="wifiBadge">Disconnected</span>
+        </div>
+        <div id="wifiConnected" class="hide">
+          <div class="row mb-2"><span class="muted text-sm">Network</span><span class="text-sm" id="wifiSsid">-</span></div>
+          <div class="row mb-2"><span class="muted text-sm">IP</span><span class="text-sm" id="wifiIp">-</span></div>
+          <button class="btn secondary sm" id="disconnectBtn">Disconnect</button>
+        </div>
+        <div id="wifiSetup">
+          <button class="btn secondary full mb-2" id="scanBtn">Scan</button>
+          <div id="scanResults" class="grid mb-2"></div>
+          <input id="manualSsid" placeholder="SSID" style="margin-bottom:8px;" autocomplete="off" />
+          <input id="manualPw" type="password" placeholder="Password" style="margin-bottom:8px;" />
+          <button class="btn full" id="connectBtn">Connect</button>
+        </div>
+      </div>
+
+      <div class="card" id="authCard">
+        <div class="card-header">
+          <div class="card-title">Account</div>
+          <span class="badge success" id="authBadge">Logged In</span>
+        </div>
+        <div class="row mb-2"><span class="muted text-sm">Device</span><span class="badge primary" id="deviceBadge">-</span></div>
+        <div class="row mb-2"><span class="muted text-sm">SIMs</span><span class="text-sm" id="simsRegCount">-</span></div>
+        <div class="btn-group">
+          <button class="btn sm secondary" id="registerDeviceBtn">Register</button>
+          <button class="btn sm danger" id="logoutBtn">Logout</button>
+        </div>
       </div>
       
       <div class="card settings-card">
@@ -1447,7 +1531,6 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
               Backend
             </div>
-            <p class="card-subtitle">OTPocket agent URL, API path, and device identity</p>
           </div>
         </div>
         
@@ -1462,7 +1545,6 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
         <div class="form-group">
           <label for="deviceId">Device ID</label>
           <input id="deviceId" placeholder="SIM800-XXXXXX (auto-generated if empty)" />
-          <p class="muted" style="font-size:12px;margin-top:4px;">Used for heartbeat and backend registration. Save after editing.</p>
         </div>
         <button class="btn full" id="saveConfigBtn">Save backend settings</button>
       </div>
@@ -1474,14 +1556,12 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
               Gateway services
             </div>
-            <p class="card-subtitle">Heartbeat, SMS polling, and missed-call forwarding</p>
           </div>
         </div>
 
         <div class="settings-row">
           <div class="settings-row-main">
             <div class="settings-row-title">Heartbeat</div>
-            <p class="settings-row-desc">Reports slot status and health to the backend on a schedule.</p>
           </div>
           <div class="settings-row-side">
             <span class="status-pill on" id="heartbeatStatusPill"><span class="status-dot ok"></span> Active</span>
@@ -1492,7 +1572,6 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
         <div class="settings-row">
           <div class="settings-row-main">
             <div class="settings-row-title">SMS polling</div>
-            <p class="settings-row-desc">Reads incoming SMS from enabled SIM slots. Pause temporarily stops reads (5 min per toggle).</p>
           </div>
           <div class="settings-row-side">
             <span class="status-pill on" id="smsPollingStatusPill"><span class="status-dot ok"></span> Active</span>
@@ -1503,7 +1582,6 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
         <div class="settings-row">
           <div class="settings-row-main">
             <div class="settings-row-title">Missed-call forwarding</div>
-            <p class="settings-row-desc">Forwards missed calls as Viber SMS (last 6 digits) during an active OTP session only. Queued up to 10 minutes before a session starts.</p>
           </div>
           <div class="settings-row-side">
             <span class="status-pill off" id="missedCallStatusPill"><span class="status-dot"></span> Off</span>
@@ -1514,38 +1592,54 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
 
       <div class="card settings-card" id="firmwareCard">
         <div class="card-header">
-          <div>
-            <div class="card-title">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              Firmware update
+          <div class="card-title">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Software update
+          </div>
+          <span class="status-pill off" id="firmwareStatusPill"><span class="status-dot"></span> —</span>
+        </div>
+
+        <div class="fw-notice hide" id="fwRestartNotice">
+          <span>⏱</span>
+          <span id="fwRestartNoticeText">A restart is scheduled.</span>
+        </div>
+
+        <div class="fw-hero">
+          <div class="fw-hero-box" id="fwInstalledBox">
+            <span class="fw-hero-label">Installed</span>
+            <span class="fw-hero-version" id="fwVersion">—</span>
+          </div>
+          <div class="fw-hero-arrow" aria-hidden="true">→</div>
+          <div class="fw-hero-box" id="fwPublishedBox">
+            <span class="fw-hero-label">Published</span>
+            <span class="fw-hero-version" id="fwRemoteVersion">—</span>
+          </div>
+        </div>
+        <p class="fw-status-line muted text-sm" id="fwStatusLine">Checking version status…</p>
+
+        <div class="fw-actions">
+          <button class="btn sm secondary" id="checkFirmwareBtn">Check for updates</button>
+          <button class="btn sm warning" id="installFirmwareBtn" disabled>Install update</button>
+        </div>
+        <p class="muted text-sm hide" id="otaInstallNote" style="line-height:1.4;"></p>
+        <p class="fw-meta muted text-xs" id="fwMetaLine"></p>
+
+        <details class="fw-advanced">
+          <summary>Custom download URL</summary>
+          <div class="fw-advanced-body">
+            <label for="otaUrl">Update URL</label>
+            <div class="url-field-wrap">
+              <input id="otaUrl" type="password" autocomplete="off" spellcheck="false"
+                placeholder="https://…/firmware.bin" />
+              <div class="url-field-actions">
+                <button class="url-field-btn" id="otaUrlRevealBtn" onclick="toggleOtaUrlReveal()" title="Show/hide">👁</button>
+                <button class="url-field-btn" id="otaUrlCopyBtn" onclick="copyOtaUrl()" title="Copy">⎘</button>
+              </div>
             </div>
-            <p class="card-subtitle">Check GitHub version (12h). Install needs Custom partition + OTA build.</p>
+            <button class="btn sm secondary full" id="saveOtaUrlBtn" style="margin-top:6px;">Save URL</button>
+            <p class="fw-advanced-hint">Only change this if told to by support. Leave empty to use the default.</p>
           </div>
-          <span class="status-pill off" id="firmwareStatusPill"><span class="status-dot"></span> Not checked</span>
-        </div>
-
-        <div class="settings-row">
-          <div class="settings-row-main">
-            <div class="settings-row-title">Installed version</div>
-            <p class="settings-row-desc">Bump <code style="font-size:11px;">FIRMWARE_VERSION</code> in config.h each release; match <code style="font-size:11px;">firmware/version.txt</code> on GitHub.</p>
-          </div>
-          <div class="settings-row-side">
-            <span class="text-sm" id="fwVersion" style="font-family:monospace;font-weight:600;">-</span>
-          </div>
-        </div>
-
-        <div class="settings-row">
-          <div class="settings-row-main">
-            <div class="settings-row-title">Latest on GitHub</div>
-            <p class="settings-row-desc" id="fwRemoteVersion" style="font-family:monospace;">-</p>
-          </div>
-          <div class="settings-row-side">
-            <button class="btn sm secondary" id="checkFirmwareBtn">Check for updates</button>
-            <button class="btn sm warning" id="installFirmwareBtn" disabled>Install update</button>
-          </div>
-        </div>
-
-        <p class="muted" style="font-size:11px;margin:0;line-height:1.45;">Download URL:<br><span id="otaUrlDisplay" style="font-family:monospace;word-break:break-all;">-</span></p>
+        </details>
       </div>
       
       <div class="card" style="border-color: var(--danger);">
@@ -1566,20 +1660,22 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
     <!-- Logs Tab -->
     <div class="tab-content" id="tab-logs">
       <div class="page-header">
-        <h1 class="page-title">Logs</h1>
-        <p class="page-subtitle">System activity and errors</p>
+        <h1 class="page-title">Activity log</h1>
+        <p class="page-subtitle">Live gateway events and error history</p>
       </div>
       
       <div class="card">
-        <div class="log-tabs">
-          <div class="log-tab active" onclick="switchLogTab('live')">Live</div>
-          <div class="log-tab" onclick="switchLogTab('errors')">Errors</div>
+        <div class="log-panel-header">
+          <div class="log-tabs">
+            <button type="button" class="log-tab active" id="logTabLive" onclick="switchLogTab('live')">Activity<span class="log-tab-badge" id="monitorCount">0</span></button>
+            <button type="button" class="log-tab" id="logTabErrors" onclick="switchLogTab('errors')">Errors<span class="log-tab-badge" id="errorLogCount">0</span></button>
+          </div>
         </div>
-        <div class="log-content" id="monitor">Loading...</div>
-        <div class="log-content hide" id="errorLog">No errors logged</div>
+        <div class="log-viewport" id="monitor"><div class="log-empty">Loading…</div></div>
+        <div class="log-viewport hide" id="errorLog"><div class="log-empty">No errors recorded</div></div>
         <div class="log-footer">
-          <span id="monitorCount">0 entries</span>
-          <button class="btn xs secondary" id="clearLogBtn">Clear</button>
+          <span class="log-footer-meta" id="logFooterMeta">Activity log</span>
+          <button class="btn xs secondary" id="clearLogBtn">Clear log</button>
         </div>
       </div>
     </div>
@@ -1595,7 +1691,7 @@ let currentNetwork = null;
 let statusInterval;
 let statusSlowInterval;
 let currentLogTab = 'live';
-let currentTab = 'dashboard';
+let currentTab = 'sims';
 let smsMessages = [];
 
 function $(id) { return document.getElementById(id); }
@@ -1717,14 +1813,37 @@ function toggleSidebar() {
   if (overlay) overlay.classList.toggle('show');
 }
 
-// Sidebar toggle (desktop)
-function toggleSidebarDesktop() {
+// Sidebar collapse (desktop)
+function toggleSidebarCollapse() {
   const sidebar = $('sidebar');
-  const mainContent = $('mainContent');
+  const main = $('mainContent');
+  const btn = $('sidebarCollapseBtn');
   if (!sidebar) return;
-  
-  sidebar.classList.toggle('collapsed');
-  if (mainContent) mainContent.classList.toggle('expanded');
+  const collapsed = sidebar.classList.toggle('collapsed');
+  if (main) main.classList.toggle('sidebar-collapsed', collapsed);
+  if (btn) {
+    btn.title = collapsed ? 'Expand sidebar' : 'Collapse sidebar';
+    btn.innerHTML = collapsed
+      ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>'
+      : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg>';
+  }
+}
+
+// Firmware URL reveal/copy
+function toggleOtaUrlReveal() {
+  const input = $('otaUrl');
+  if (!input) return;
+  input.type = input.type === 'password' ? 'text' : 'password';
+}
+
+function copyOtaUrl() {
+  const input = $('otaUrl');
+  if (!input || !input.value) return;
+  navigator.clipboard.writeText(input.value).then(() => {
+    toast('URL copied');
+  }).catch(() => {
+    toast('Copy failed');
+  });
 }
 
 // Tab switching
@@ -1749,22 +1868,62 @@ function switchTab(tab) {
   if (tab === 'sims') refreshSims();
 }
 
+function classifyLogLine(line, forceError) {
+  if (forceError) return 'err';
+  const s = line.toLowerCase();
+  if (/\b(fail|failed|failure|error|timeout|dropped|denied|refused|invalid|cannot|could not|unauthorized|abort)\b/.test(s)) return 'err';
+  if (/\b(ok|success|forwarded|complete|connected|enabled|resumed|registered|mounted|ready)\b/.test(s)) return 'ok';
+  if (/\b(pause|paused|warn|warning|retry|pending|waiting)\b/.test(s)) return 'warn';
+  return 'info';
+}
+
+function parseLogLine(line) {
+  const m = line.match(/^\[([^\]]+)\]\s*(.*)$/);
+  if (m) return { tag: m[1], msg: m[2] };
+  return { tag: '', msg: line };
+}
+
+function renderLogViewport(el, text, forceError) {
+  if (!el) return;
+  const lines = (text || '').split('\n').filter(l => l.trim());
+  if (lines.length === 0) {
+    el.innerHTML = '<div class="log-empty">' + (forceError ? 'No errors recorded' : 'No activity yet') + '</div>';
+    return;
+  }
+  el.innerHTML = lines.map(line => {
+    const cls = classifyLogLine(line, forceError);
+    const { tag, msg } = parseLogLine(line);
+    const tagPart = tag ? '<span class="log-tag">[' + escHtml(tag) + ']</span>' : '';
+    const body = escHtml(tag ? msg : line);
+    return '<div class="log-line ' + cls + '">' + tagPart + '<span class="log-msg">' + body + '</span></div>';
+  }).join('');
+}
+
+function updateLogFooterMeta() {
+  const meta = $('logFooterMeta');
+  if (!meta) return;
+  meta.textContent = currentLogTab === 'errors' ? 'Error history (newest at bottom)' : 'Activity log (newest at bottom)';
+}
+
 function switchLogTab(tab) {
   currentLogTab = tab;
-  const tabs = document.querySelectorAll('.log-tab');
-  tabs.forEach((t, i) => t.classList.toggle('active', (i === 0 && tab === 'live') || (i === 1 && tab === 'errors')));
-  
+  const liveTab = $('logTabLive');
+  const errTab = $('logTabErrors');
+  if (liveTab) liveTab.classList.toggle('active', tab === 'live');
+  if (errTab) errTab.classList.toggle('active', tab === 'errors');
+
   const monitor = $('monitor');
   const errorLog = $('errorLog');
-  
+
   if (tab === 'live') {
-    monitor.classList.remove('hide');
-    errorLog.classList.add('hide');
+    if (monitor) monitor.classList.remove('hide');
+    if (errorLog) errorLog.classList.add('hide');
   } else {
-    monitor.classList.add('hide');
-    errorLog.classList.remove('hide');
+    if (monitor) monitor.classList.add('hide');
+    if (errorLog) errorLog.classList.remove('hide');
     refreshErrorLog();
   }
+  updateLogFooterMeta();
 }
 
 async function get(path) {
@@ -1834,16 +1993,10 @@ async function refreshStatus() {
     if ($('apiPath')) $('apiPath').value = s.api_path || '/api/agent/incoming-sms';
     if ($('deviceId')) $('deviceId').value = s.device_id || '';
     
-    // Stats
-    if ($('statReceived')) $('statReceived').textContent = s.total_received || 0;
-    if ($('statForwarded')) $('statForwarded').textContent = s.total_forwarded || 0;
-    if ($('statFailed')) $('statFailed').textContent = s.total_failed || 0;
-    if ($('statPending')) $('statPending').textContent = s.pending_sms || 0;
-    
     updateGatewayServicesUi(s);
+    updateScheduledRestartNav(s);
     
-    if ($('fwVersion')) $('fwVersion').textContent = s.firmware_version || '-';
-    if ($('otaUrlDisplay') && s.ota_url) $('otaUrlDisplay').textContent = s.ota_url;
+    updateFirmwareCard(s);
     
     // Active sessions card in SIM Slots tab
     const sessionsCard = $('sessionsCard');
@@ -1932,24 +2085,70 @@ function updateSessionsDisplay() {
   sessionsList.innerHTML = html;
 }
 
+function formatRestartCountdown(sec) {
+  if (sec == null || sec < 0) return '—';
+  if (sec === 0) return 'Restarting…';
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h > 0) return h + 'h ' + m + 'm';
+  if (m > 0) return m + 'm ' + s + 's';
+  return s + 's';
+}
+
+function updateScheduledRestartNav(s) {
+  const banner = $('navRestartBanner');
+  const timer = $('navRestartTimer');
+  const mStrip = $('mobileRestartStrip');
+  const mTimer = $('mobileRestartTimer');
+
+  if (!s || !s.scheduled_restart_pending) {
+    if (banner) banner.classList.remove('show', 'overdue');
+    if (mStrip) mStrip.classList.remove('show', 'overdue');
+    window.scheduledRestartInSec = null;
+    return;
+  }
+  const sec = s.scheduled_restart_in_sec;
+  window.scheduledRestartInSec = (sec != null && sec >= 0) ? sec : 0;
+  const overdue = window.scheduledRestartInSec === 0;
+  const label = formatRestartCountdown(window.scheduledRestartInSec);
+
+  if (banner) { banner.classList.add('show'); banner.classList.toggle('overdue', overdue); }
+  if (timer) timer.textContent = label;
+  if (mStrip) { mStrip.classList.add('show'); mStrip.classList.toggle('overdue', overdue); }
+  if (mTimer) mTimer.textContent = label;
+}
+
+function tickScheduledRestartCountdown() {
+  if (window.scheduledRestartInSec == null) return;
+  if (window.scheduledRestartInSec > 0) window.scheduledRestartInSec--;
+  const label = formatRestartCountdown(window.scheduledRestartInSec);
+  const overdue = window.scheduledRestartInSec === 0;
+  const banner = $('navRestartBanner');
+  const timer = $('navRestartTimer');
+  const mStrip = $('mobileRestartStrip');
+  const mTimer = $('mobileRestartTimer');
+  if (timer) timer.textContent = label;
+  if (banner) banner.classList.toggle('overdue', overdue);
+  if (mTimer) mTimer.textContent = label;
+  if (mStrip) mStrip.classList.toggle('overdue', overdue);
+}
+
 // Countdown timer - update every second
 let sessionsCountdownInterval = null;
 function startSessionsCountdown() {
   if (sessionsCountdownInterval) clearInterval(sessionsCountdownInterval);
   sessionsCountdownInterval = setInterval(() => {
+    tickScheduledRestartCountdown();
     const sessions = window.activeSessionsData || [];
-    if (sessions.length === 0) return;
-
-    // Decrement each session's expiresIn
-    sessions.forEach(s => {
-      if (s.expiresIn > 0) s.expiresIn--;
-    });
-
-    // Remove expired sessions
-    window.activeSessionsData = sessions.filter(s => s.expiresIn > 0);
-
-    updateSessionsDisplay();
-    updateSimCardTimers();
+    if (sessions.length > 0) {
+      sessions.forEach(sess => {
+        if (sess.expiresIn > 0) sess.expiresIn--;
+      });
+      window.activeSessionsData = sessions.filter(sess => sess.expiresIn > 0);
+      updateSessionsDisplay();
+      updateSimCardTimers();
+    }
   }, 1000);
 }
 
@@ -1979,41 +2178,42 @@ function updateSimCardTimers() {
   });
 }
 
+let lastMonitorRaw = '';
+
 async function refreshMonitor() {
   try {
-    const pre = $('monitor');
-    if (!pre) return;
-    const prev = pre.textContent;
+    const viewport = $('monitor');
+    if (!viewport) return;
     const next = await getText('/monitor');
-    if (next !== prev) {
-      const shouldStick = (pre.scrollTop + pre.clientHeight) >= (pre.scrollHeight - 10);
-      pre.textContent = next;
-      if (shouldStick) pre.scrollTop = pre.scrollHeight;
-    }
-    // Update log count
+    if (next === lastMonitorRaw) return;
+    lastMonitorRaw = next;
+    const shouldStick = (viewport.scrollTop + viewport.clientHeight) >= (viewport.scrollHeight - 24);
+    renderLogViewport(viewport, next, false);
+    if (shouldStick) viewport.scrollTop = viewport.scrollHeight;
     const countEl = $('monitorCount');
     if (countEl) {
-      const lines = next.split('\n').filter(l => l.trim()).length;
-      countEl.textContent = lines + ' entries';
+      const n = next.split('\n').filter(l => l.trim()).length;
+      countEl.textContent = String(n);
     }
-  } catch(e) {}
+  } catch (e) {}
 }
 
 async function refreshErrorLog() {
   try {
-    const pre = $('errorLog');
-    if (!pre) return;
+    const viewport = $('errorLog');
+    if (!viewport) return;
     const next = await getText('/error-log');
-    pre.textContent = next || 'No errors logged';
-    pre.scrollTop = pre.scrollHeight;
-    // Update count
+    renderLogViewport(viewport, next, true);
+    viewport.scrollTop = viewport.scrollHeight;
     const countEl = $('errorLogCount');
     if (countEl) {
-      const lines = next.split('\n').filter(l => l.trim()).length;
-      countEl.textContent = lines + ' errors';
+      const n = (next || '').split('\n').filter(l => l.trim()).length;
+      countEl.textContent = String(n);
     }
-  } catch(e) {
-    if ($('errorLog')) $('errorLog').textContent = 'Error loading log';
+  } catch (e) {
+    if ($('errorLog')) {
+      $('errorLog').innerHTML = '<div class="log-empty log-line err"><span class="log-msg">Could not load error log</span></div>';
+    }
   }
 }
 
@@ -2379,67 +2579,122 @@ function copyText(btn, text) {
 }
 
 // SMS List refresh - reads from persistent file
+let allMessages = [];
+
+function senderInitials(sender) {
+  if (!sender) return '?';
+  const clean = sender.replace(/[^a-zA-Z0-9+]/g, '');
+  if (!clean) return '?';
+  if (/^\+?[0-9]/.test(clean)) return '#';
+  return clean.slice(0, 2).toUpperCase();
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function highlightText(text, query) {
+  if (!query) return escHtml(text);
+  const re = new RegExp('(' + query.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + ')', 'gi');
+  return escHtml(text).replace(re, '<mark class="sms-highlight">$1</mark>');
+}
+
+function renderMessages(messages, query) {
+  const list = $('smsList');
+  if (!list) return;
+  if (messages.length === 0) {
+    list.innerHTML = `<div class="empty-state">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      <p>${query ? 'No messages match "' + escHtml(query) + '"' : 'No messages yet'}</p>
+    </div>`;
+    return;
+  }
+  list.innerHTML = messages.map(msg => {
+    const initials = senderInitials(msg.sender);
+    const senderH = highlightText(msg.sender || 'Unknown', query);
+    const bodyH = highlightText(msg.body, query);
+    const bodyEsc = escHtml(msg.body).replace(/'/g, '&#39;');
+    const senderEsc = escHtml(msg.sender || '').replace(/'/g, '&#39;');
+    return `<div class="sms-item">
+      <div class="sms-avatar">${initials}</div>
+      <div class="sms-main">
+        <div class="sms-row1">
+          <span class="sms-sender">${senderH}</span>
+          <span class="sms-time">${escHtml(msg.time)}</span>
+        </div>
+        <div class="sms-row2">
+          <span class="sms-slot">SIM ${msg.slot}</span>
+          <span class="sms-number">${escHtml(msg.number || '')}</span>
+        </div>
+        <div class="sms-body">${bodyH}</div>
+      </div>
+      <div class="sms-actions">
+        <button class="sms-copy-btn" onclick="copyText('${bodyEsc}')">Copy</button>
+        <button class="sms-copy-btn" onclick="copyText('${senderEsc}')">Sender</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function filterMessages() {
+  const q = ($('smsSearch') ? $('smsSearch').value.trim() : '').toLowerCase();
+  const filtered = q
+    ? allMessages.filter(m =>
+        (m.sender || '').toLowerCase().includes(q) ||
+        (m.body || '').toLowerCase().includes(q) ||
+        (m.number || '').toLowerCase().includes(q))
+    : allMessages;
+  const count = $('smsCount');
+  if (count) count.textContent = filtered.length + ' of ' + allMessages.length;
+  renderMessages(filtered, q);
+}
+
 async function refreshSmsList() {
   try {
     const data = await getText('/messages');
-    const list = $('smsList');
     const lines = data.split('\n').filter(l => l.trim());
-    
-    // Parse messages (format: timestamp|sim|number|sender|message)
-    const messages = [];
+    allMessages = [];
     for (const line of lines) {
       const parts = line.split('|');
       if (parts.length >= 5) {
-        messages.push({
+        allMessages.push({
           time: parts[0],
           slot: parseInt(parts[1]),
           number: parts[2],
           sender: parts[3],
-          body: parts.slice(4).join('|')  // Message may contain |
+          body: parts.slice(4).join('|')
         });
       }
     }
-    
-    // Update badge
-    $('msgBadge').textContent = messages.length;
-    $('smsCount').textContent = messages.length + ' messages';
-    
-    if (messages.length === 0) {
-      list.innerHTML = `
-        <div class="empty-state">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-          <p>No messages yet</p>
-          <p class="text-sm">Received SMS will appear here</p>
-        </div>
-      `;
-      return;
-    }
-    
-    list.innerHTML = '';
-    messages.reverse().forEach((msg, idx) => {
-      const div = document.createElement('div');
-      div.className = 'sms-item';
-      div.innerHTML = `
-        <div class="sms-header">
-          <span class="sms-sender">${msg.sender || 'Unknown'}</span>
-          <span class="sms-slot">SIM ${msg.slot} • ${msg.number || '-'}</span>
-        </div>
-        <div class="sms-time">${msg.time}</div>
-        <div class="sms-body">${msg.body}</div>
-        <div class="sms-actions">
-          <button class="sms-copy-btn" onclick="copyText(\`${msg.body.replace(/`/g, '\\`')}\`)">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-            Copy Message
-          </button>
-          <button class="sms-copy-btn" onclick="copyText('${msg.sender}')">
-            Copy Sender
-          </button>
-        </div>
-      `;
-      list.appendChild(div);
-    });
+    allMessages.reverse();
+    const badge = $('msgBadge');
+    if (badge) badge.textContent = allMessages.length;
+    const count = $('smsCount');
+    if (count) count.textContent = allMessages.length ? (allMessages.length + ' messages') : 'No messages';
+    filterMessages();
   } catch(e) {
     console.error('Failed to load SMS list', e);
+  }
+}
+
+async function clearMessages() {
+  if (!confirm('Delete all saved messages from this device?')) return;
+  try {
+    const r = await get('/clear-messages');
+    if (!r || r.success === false) {
+      toast((r && r.message) || 'Could not clear messages');
+      return;
+    }
+    allMessages = [];
+    const badge = $('msgBadge');
+    if (badge) badge.textContent = '0';
+    const count = $('smsCount');
+    if (count) count.textContent = 'No messages';
+    renderMessages([], ($('smsSearch') ? $('smsSearch').value.trim() : '').toLowerCase());
+    toast('Messages cleared');
+  } catch (e) {
+    console.error('Failed to clear messages', e);
+    toast('Could not clear messages');
   }
 }
 
@@ -2536,6 +2791,110 @@ async function toggleMissedCallForward() {
   }
 }
 
+function formatFwCheckAgo(secAgo) {
+  if (secAgo == null || secAgo < 0) return 'never';
+  if (secAgo < 60) return 'just now';
+  if (secAgo < 3600) return Math.floor(secAgo / 60) + 'm ago';
+  if (secAgo < 86400) return Math.floor(secAgo / 3600) + 'h ago';
+  return Math.floor(secAgo / 86400) + 'd ago';
+}
+
+function applyFirmwareUiState(opts) {
+  const pill = $('firmwareStatusPill');
+  const installBtn = $('installFirmwareBtn');
+  const statusLine = $('fwStatusLine');
+  const installedBox = $('fwInstalledBox');
+  const publishedBox = $('fwPublishedBox');
+  const otaEnabled = opts.ota_install_enabled !== false;
+
+  if ($('fwVersion') && opts.current) $('fwVersion').textContent = opts.current;
+  if ($('fwRemoteVersion')) {
+    $('fwRemoteVersion').textContent = opts.remote && opts.remote.length ? opts.remote : '—';
+  }
+  if (installedBox) installedBox.classList.remove('highlight');
+  if (publishedBox) publishedBox.classList.remove('highlight');
+
+  if (!opts.success) {
+    setStatusPill(pill, 'off', '—');
+    if (statusLine) statusLine.textContent = opts.message || 'Could not check for updates. Check WiFi and try again.';
+    if (installBtn) installBtn.disabled = true;
+    return;
+  }
+
+  if (opts.update_available) {
+    setStatusPill(pill, 'warn', 'Update available');
+    if (publishedBox) publishedBox.classList.add('highlight');
+    if (statusLine) statusLine.textContent = 'Version ' + opts.remote + ' is ready to install. Tap Install update below.';
+    if (installBtn) installBtn.disabled = !otaEnabled;
+  } else if (opts.local_ahead) {
+    setStatusPill(pill, 'on', 'Up to date');
+    if (statusLine) statusLine.textContent = 'Your device is running the latest software.';
+    if (installBtn) installBtn.disabled = true;
+  } else {
+    setStatusPill(pill, 'on', 'Up to date');
+    if (statusLine) statusLine.textContent = 'Your device is running the latest software.';
+    if (installBtn) installBtn.disabled = true;
+  }
+}
+
+function updateFirmwareOtaUi(s) {
+  const installBtn = $('installFirmwareBtn');
+  const note = $('otaInstallNote');
+  if (!installBtn) return;
+  if (s && s.ota_install_enabled === false) {
+    installBtn.disabled = true;
+    if (note) {
+      note.classList.remove('hide');
+      note.textContent = 'Wireless updates need to be enabled first. Please contact support to activate this feature on your device.';
+    }
+  } else if (note) {
+    note.classList.add('hide');
+  }
+}
+
+function updateFirmwareCard(s) {
+  if (!s) return;
+  if ($('otaUrl') && s.ota_url) $('otaUrl').value = s.ota_url;
+
+  const restartNotice = $('fwRestartNotice');
+  const restartText = $('fwRestartNoticeText');
+  if (restartNotice && restartText) {
+    if (s.scheduled_restart_pending) {
+      restartNotice.classList.remove('hide');
+      const sec = s.scheduled_restart_in_sec;
+      if (sec != null && sec >= 0) {
+        restartText.textContent = sec === 0
+          ? 'Restart due now — will happen automatically when safe.'
+          : 'Device restarts in ' + formatRestartCountdown(sec) + '.';
+      } else {
+        restartText.textContent = 'A restart has been scheduled.';
+      }
+    } else {
+      restartNotice.classList.add('hide');
+    }
+  }
+
+  const meta = $('fwMetaLine');
+  if (meta) {
+    const ago = s.firmware_last_check_sec_ago >= 0
+      ? 'Last checked ' + formatFwCheckAgo(s.firmware_last_check_sec_ago)
+      : 'Not checked yet';
+    meta.textContent = ago;
+  }
+
+  updateFirmwareOtaUi(s);
+
+  applyFirmwareUiState({
+    success: s.firmware_remote_version != null && s.firmware_remote_version.length > 0,
+    current: s.firmware_version || '—',
+    remote: s.firmware_remote_version || '',
+    update_available: !!s.firmware_update_available,
+    local_ahead: !!s.firmware_local_ahead,
+    ota_install_enabled: s.ota_install_enabled,
+    message: s.firmware_remote_version ? '' : 'Run Check for updates to fetch the published version.'
+  });
+}
+
 async function checkFirmwareUpdate() {
   const btn = $('checkFirmwareBtn');
   if (btn) {
@@ -2544,27 +2903,30 @@ async function checkFirmwareUpdate() {
   }
   try {
     const r = await get('/firmware-check');
-    if ($('fwVersion')) $('fwVersion').textContent = r.current || '-';
-    if ($('fwRemoteVersion')) {
-      $('fwRemoteVersion').textContent = r.remote ? ('v' + r.remote) : (r.message || 'Could not fetch');
-    }
-    const pill = $('firmwareStatusPill');
-    const installBtn = $('installFirmwareBtn');
+    const st = await get('/status').catch(() => ({}));
+    applyFirmwareUiState({
+      success: r.success,
+      current: r.current,
+      remote: r.remote,
+      update_available: r.update_available,
+      local_ahead: r.local_ahead,
+      ota_install_enabled: st.ota_install_enabled,
+      message: r.message
+    });
+    updateFirmwareOtaUi(st);
     if (r.success && r.update_available) {
-      setStatusPill(pill, 'warn', 'Update available');
-      if (installBtn) installBtn.disabled = false;
       toast('Update available: v' + r.remote);
+    } else if (r.success && r.local_ahead) {
+      toast('Installed v' + r.current + ' is ahead of published v' + r.remote);
     } else if (r.success) {
-      setStatusPill(pill, 'on', 'Up to date');
-      if (installBtn) installBtn.disabled = true;
-      toast('Firmware is up to date');
+      toast('Up to date with published v' + (r.remote || r.current));
     } else {
-      setStatusPill(pill, 'off', 'Check failed');
-      if (installBtn) installBtn.disabled = true;
-      toast(r.message || 'Could not check firmware');
+      toast(r.message || 'Could not reach update server');
     }
+    if (st.firmware_version) updateFirmwareCard(st);
   } catch (e) {
     setStatusPill($('firmwareStatusPill'), 'off', 'Check failed');
+    if ($('fwStatusLine')) $('fwStatusLine').textContent = 'Firmware check failed. Check WiFi and version URL.';
     toast('Firmware check failed');
   }
   if (btn) {
@@ -2573,8 +2935,36 @@ async function checkFirmwareUpdate() {
   }
 }
 
+async function saveOtaUrl() {
+  const input = $('otaUrl');
+  if (!input) return;
+  const url = input.value.trim();
+  try {
+    const btn = $('saveOtaUrlBtn');
+    if (btn) {
+      btn.innerHTML = '<span class="spinner"></span> Saving...';
+      btn.disabled = true;
+    }
+    const r = await post('/firmware-config', url ? { url } : {});
+    if (r && r.success) {
+      if (r.ota_url) input.value = r.ota_url;
+      toast('Firmware URL saved');
+      const st = await get('/status').catch(() => ({}));
+      updateFirmwareCard(st);
+    } else {
+      toast((r && r.error) || 'Failed to save firmware URL');
+    }
+    if (btn) {
+      btn.textContent = 'Save URL';
+      btn.disabled = false;
+    }
+  } catch (e) {
+    toast('Failed to save firmware URL');
+  }
+}
+
 async function installFirmwareUpdate() {
-  if (!confirm('Download firmware from GitHub and restart now?')) return;
+  if (!confirm('Install the latest software update and restart the gateway?')) return;
   const btn = $('installFirmwareBtn');
   if (btn) {
     btn.innerHTML = '<span class="spinner"></span>';
@@ -2582,7 +2972,10 @@ async function installFirmwareUpdate() {
   }
   toast('Downloading firmware… device will restart');
   try {
-    const r = await post('/firmware-update', {});
+    const otaInput = $('otaUrl');
+    const url = otaInput ? otaInput.value.trim() : '';
+    const payload = url ? { url } : {};
+    const r = await post('/firmware-update', payload);
     if (r && r.success === false) {
       toast(r.message || 'OTA not available in this build');
     }
@@ -2656,12 +3049,22 @@ async function checkUssdSlot(idx) {
         ussdManualPollTimer = null;
         window.ussdManualBusy = false;
         window.ussdPendingSlot = null;
+        // st.sim is set to the slot we actually ran on; idx is what was clicked.
+        // If the server never ran (manualLastSlot still -1) st.sim will be absent — skip toast.
+        if (st.sim == null) {
+          // No result available yet (cleared on new start) — silently ignore
+          refreshSims();
+          return;
+        }
         const sec = st.duration_sec != null ? st.duration_sec : 0;
-        const simNum = st.sim != null ? st.sim : (idx + 1);
+        const simNum = st.sim;
         if (st.ok) {
-          toast('SIM ' + simNum + ': Balance ' + (st.message || '—') + ussdSecLabel(sec));
+          toast('SIM ' + simNum + ': ' + (st.message || '—') + ussdSecLabel(sec));
         } else {
-          toast('SIM ' + simNum + ': ' + (st.message || 'Error') + ussdSecLabel(sec));
+          // Only show error toast if this result belongs to the slot we clicked
+          if (st.slot === idx) {
+            toast('SIM ' + simNum + ': ' + (st.message || 'No balance info') + ussdSecLabel(sec));
+          }
         }
         refreshSims();
       } catch (e) {
@@ -2829,20 +3232,20 @@ async function saveConfig() {
   }
 }
 
-async function testPush() {
-  const r = await get('/test-push');
-  toast(r.success ? 'Push OK' : r.error);
-}
-
 async function clearLog() {
   if (currentLogTab === 'live') {
     await fetch('/clear-monitor');
-    $('monitor').textContent = '';
-    $('monitorCount').textContent = '0 entries';
+    lastMonitorRaw = '';
+    const mon = $('monitor');
+    if (mon) renderLogViewport(mon, '', false);
+    const mc = $('monitorCount');
+    if (mc) mc.textContent = '0';
   } else {
     await fetch('/clear-error-log');
-    $('errorLog').textContent = 'No errors logged';
-    $('errorLogCount').textContent = '0 errors';
+    const el = $('errorLog');
+    if (el) renderLogViewport(el, '', true);
+    const ec = $('errorLogCount');
+    if (ec) ec.textContent = '0';
   }
   toast('Log cleared');
 }
@@ -2961,6 +3364,7 @@ async function checkAuthStatus() {
       }
       
     updateGatewayServicesUi(s);
+    updateScheduledRestartNav(s);
     
     // Count registered SIMs
       try {
@@ -2972,120 +3376,13 @@ async function checkAuthStatus() {
       if (loginPage) loginPage.classList.remove('hide');
       if (dashboardPage) dashboardPage.classList.add('hide');
       
-      // Update login page WiFi status
-      updateLoginWifiStatus(s);
     }
   } catch(e) {
     console.error('Auth check error:', e);
   }
 }
 
-// Login page WiFi status
-function updateLoginWifiStatus(s) {
-  const badge = $('loginWifiBadge');
-  const connected = $('loginWifiConnected');
-  const setup = $('loginWifiSetup');
-  
-  if (!badge || !connected || !setup) return;
-  
-  if (s.sta_connected) {
-    badge.className = 'badge success';
-    badge.textContent = 'Connected';
-    if ($('loginWifiSsid')) $('loginWifiSsid').textContent = s.sta_ssid || s.sta_ip;
-    connected.classList.remove('hide');
-    setup.classList.add('hide');
-  } else {
-    badge.className = 'badge danger';
-    badge.textContent = 'Disconnected';
-    connected.classList.add('hide');
-    setup.classList.remove('hide');
-  }
-}
-
-// Login page WiFi scan
-async function loginScanNetworks() {
-  const btn = $('loginScanBtn');
-  const list = $('loginScanResults');
-  if (!btn || !list) return;
-  
-  btn.innerHTML = '<span class="spinner"></span> Scanning...';
-  btn.disabled = true;
-  
-  try {
-    const nets = await get('/scan');
-    list.innerHTML = '';
-    
-    if (nets.length === 0) {
-      list.innerHTML = '<div class="muted text-center" style="padding:20px;">No networks found</div>';
-    } else {
-      nets.sort((a, b) => b.rssi - a.rssi);
-      nets.forEach(n => {
-        const div = document.createElement('div');
-        div.className = 'net-item';
-        div.innerHTML = `
-          <div class="net-info">
-            <div class="net-name">${n.ssid}</div>
-            <div class="net-signal">${n.rssi} dBm ${n.secure ? '• Secured' : '• Open'}</div>
-          </div>
-          <div class="net-icon">${signalBars(n.rssi)}</div>
-        `;
-        div.onclick = () => {
-          const ssidInput = $('loginManualSsid');
-          const pwInput = $('loginManualPw');
-          if (ssidInput) ssidInput.value = n.ssid;
-          if (pwInput) pwInput.focus();
-        };
-        list.appendChild(div);
-      });
-    }
-  } catch(e) {
-    toast('Scan failed');
-  }
-  
-  if (btn) {
-    btn.textContent = 'Scan Networks';
-    btn.disabled = false;
-  }
-}
-
-// Login page WiFi connect
-async function loginConnectWifi() {
-  const ssidInput = $('loginManualSsid');
-  const pwInput = $('loginManualPw');
-  const btn = $('loginConnectBtn');
-  
-  const ssid = ssidInput ? ssidInput.value.trim() : '';
-  const pw = pwInput ? pwInput.value : '';
-  
-  if (!ssid) {
-    toast('Enter network name');
-    return;
-  }
-  
-  if (btn) {
-    btn.innerHTML = '<span class="spinner"></span> Connecting...';
-    btn.disabled = true;
-  }
-  
-  try {
-    const r = await post('/save-wifi', { ssid: ssid, password: pw });
-    if (r.success) {
-      toast('Connected! Refreshing...');
-      setTimeout(() => location.reload(), 2000);
-    } else {
-      toast(r.error || 'Connection failed');
-    }
-  } catch(e) {
-    toast('Connection failed');
-  }
-  
-  if (btn) {
-    btn.textContent = 'Connect';
-    btn.disabled = false;
-  }
-}
-
-// Event listeners - Dashboard (with null checks)
+// Event listeners
 function addClick(id, fn) { const el = $(id); if (el) el.onclick = fn; }
 
 addClick('scanBtn', scanNetworks);
@@ -3093,6 +3390,7 @@ addClick('connectBtn', connectWifi);
 addClick('disconnectBtn', disconnectWifi);
 addClick('checkFirmwareBtn', checkFirmwareUpdate);
 addClick('installFirmwareBtn', installFirmwareUpdate);
+addClick('saveOtaUrlBtn', saveOtaUrl);
 addClick('toggleMissedCallBtn', toggleMissedCallForward);
 addClick('checkAllBtn', checkAllSims);
 addClick('ussdBulkBtn', bulkCheckUssd);
@@ -3106,16 +3404,14 @@ addClick('resetDeviceBtn', resetDevice);
 addClick('logoutBtn', doLogout);
 addClick('registerDeviceBtn', doRegisterDevice);
 addClick('refreshSmsBtn', refreshSmsList);
+addClick('clearSmsBtn', clearMessages);
 
 // Event listeners - Login page
 addClick('loginBtn', doLogin);
-addClick('loginScanBtn', loginScanNetworks);
-addClick('loginConnectBtn', loginConnectWifi);
 
-// Tab persistence with URL hash
 function getTabFromHash() {
   const hash = window.location.hash.slice(1);
-  return ['dashboard', 'sims', 'messages', 'settings', 'logs'].includes(hash) ? hash : 'dashboard';
+  return ['sims', 'messages', 'settings', 'logs'].includes(hash) ? hash : 'sims';
 }
 
 function updateHash(tab) {
@@ -3131,7 +3427,7 @@ switchTab = function(tab) {
 
 // Init
 const initialTab = getTabFromHash();
-if (initialTab !== 'dashboard') {
+if (initialTab !== 'sims') {
   switchTab(initialTab);
 }
 
@@ -3140,6 +3436,7 @@ refreshSims();
 checkAuthStatus();
 refreshSmsList();
 startSessionsCountdown();
+updateLogFooterMeta();
 statusInterval = setInterval(refreshMonitor, 2000);
 statusSlowInterval = setInterval(refreshStatus, 10000);
 setTimeout(refreshMonitor, 300);
@@ -3161,6 +3458,7 @@ void initWebUI() {
     server.on("/status", HTTP_GET, handleStatus);
     server.on("/monitor", HTTP_GET, handleMonitor);
     server.on("/messages", HTTP_GET, handleMessages);
+    server.on("/clear-messages", HTTP_GET, handleClearMessages);
     server.on("/clear-monitor", HTTP_GET, handleClearMonitor);
     server.on("/error-log", HTTP_GET, handleErrorLog);
     server.on("/clear-error-log", HTTP_GET, handleClearErrorLog);
@@ -3182,8 +3480,6 @@ void initWebUI() {
     server.on("/hangup", HTTP_POST, handleHangup);
     server.on("/send-sms", HTTP_POST, handleSendSms);
     server.on("/agent-config", HTTP_POST, handleAgentConfig);
-    server.on("/test-push", HTTP_GET, handleTestPush);
-    server.on("/battery", HTTP_GET, handleBattery);
     server.on("/login", HTTP_POST, handleLogin);
     server.on("/logout", HTTP_GET, handleLogout);
     server.on("/refresh-token", HTTP_POST, handleRefreshToken);
@@ -3217,7 +3513,7 @@ void handleRoot() {
 }
 
 void handleStatus() {
-    char buf[1536];
+    char buf[2048];
     buildStatusJson(buf, sizeof(buf));
     server.send(200, "application/json", buf);
 }
@@ -3254,11 +3550,6 @@ void buildStatusJson(char* buf, size_t bufSize) {
     }
     if (lowestBatterySim == 0) lowestBattery = batteryPercent;  // Fallback to global
     
-    // Get statistics
-    unsigned long totalReceived = getTotalSmsReceived();
-    unsigned long totalForwarded = getTotalSmsForwarded();
-    unsigned long totalFailed = getTotalSmsFailed();
-    
     // Get STA SSID
     String staSsid = WiFi.SSID();
     
@@ -3292,6 +3583,20 @@ void buildStatusJson(char* buf, size_t bufSize) {
         }
         strcat(sessionsBuf, "]");
     }
+
+    const bool restartPending = maintenanceHasScheduledRestart();
+    const long restartInSec = maintenanceGetScheduledRestartInSec();
+
+    char fwRemote[32];
+    bool fwUpdateAvail = false;
+    unsigned long fwLastCheckMs = 0;
+    maintenanceGetFirmwareCache(fwRemote, sizeof(fwRemote), &fwUpdateAvail, &fwLastCheckMs);
+    const bool fwLocalAhead =
+        fwRemote[0] && otaVersionIsNewer(FIRMWARE_VERSION, fwRemote);
+    long fwLastCheckSecAgo = -1;
+    if (fwLastCheckMs > 0) {
+        fwLastCheckSecAgo = (long)((millis() - fwLastCheckMs) / 1000UL);
+    }
     
     snprintf(buf, bufSize,
         "{"
@@ -3307,9 +3612,6 @@ void buildStatusJson(char* buf, size_t bufSize) {
         "\"device_registered\":%s,"
         "\"sim_registered\":%s,"
         "\"pending_sms\":%d,"
-        "\"total_received\":%lu,"
-        "\"total_forwarded\":%lu,"
-        "\"total_failed\":%lu,"
         "\"base_url\":\"%s\","
         "\"api_path\":\"%s\","
         "\"device_id\":\"%s\","
@@ -3319,7 +3621,20 @@ void buildStatusJson(char* buf, size_t bufSize) {
         "\"missed_call_forward\":%s,"
         "\"missed_call_watch_sim\":%d,"
         "\"firmware_version\":\"%s\","
-        "\"ota_url\":\"%s\""
+        "\"firmware_remote_version\":\"%s\","
+        "\"firmware_update_available\":%s,"
+        "\"firmware_local_ahead\":%s,"
+        "\"firmware_last_check_sec_ago\":%ld,"
+        "\"firmware_check_interval_h\":12,"
+        "\"firmware_auto_install\":false,"
+        "\"ota_url\":\"%s\","
+#if OTA_ENABLED
+        "\"ota_install_enabled\":true,"
+#else
+        "\"ota_install_enabled\":false,"
+#endif
+        "\"scheduled_restart_pending\":%s,"
+        "\"scheduled_restart_in_sec\":%ld"
         "%s"
         "}",
         staConnected ? "true" : "false",
@@ -3334,9 +3649,6 @@ void buildStatusJson(char* buf, size_t bufSize) {
         deviceRegistered ? "true" : "false",
         simRegistered ? "true" : "false",
         pendingSms,
-        totalReceived,
-        totalForwarded,
-        totalFailed,
         agentBaseUrl,
         agentApiPath,
         agentDeviceId,
@@ -3346,7 +3658,13 @@ void buildStatusJson(char* buf, size_t bufSize) {
         missedCallForwardEnabled ? "true" : "false",
         getPriorityMissedCallSlot() + 1,
         FIRMWARE_VERSION,
+        fwRemote,
+        fwUpdateAvail ? "true" : "false",
+        fwLocalAhead ? "true" : "false",
+        fwLastCheckSecAgo,
         otaFirmwareUrl,
+        restartPending ? "true" : "false",
+        restartInSec,
         sessionsBuf
     );
 }
@@ -3358,9 +3676,50 @@ void handleMonitor() {
 }
 
 void handleMessages() {
-    static char buf[4096];  // Increased to fit more messages
-    int count = readSmsFromFile(buf, sizeof(buf), 50);  // Last 50 messages
-    server.send(200, "text/plain", buf);
+    if (!webLittleFsReady()) {
+        server.send(200, "text/plain", "");
+        return;
+    }
+
+    FILE* file = fopen(WEB_MESSAGES_LOG_PATH, "r");
+    if (!file) {
+        server.send(200, "text/plain", "");
+        return;
+    }
+
+    char line[280];
+    int totalLines = 0;
+    while (fgets(line, sizeof(line), file)) {
+        if (line[0] != '\0') {
+            totalLines++;
+        }
+    }
+
+    const int maxMessages = 50;
+    const int skip = (totalLines > maxMessages) ? (totalLines - maxMessages) : 0;
+
+    rewind(file);
+    for (int i = 0; i < skip; i++) {
+        if (!fgets(line, sizeof(line), file)) {
+            fclose(file);
+            server.send(200, "text/plain", "");
+            return;
+        }
+    }
+
+    server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+    server.send(200, "text/plain", "");
+    while (fgets(line, sizeof(line), file)) {
+        server.sendContent(line);
+    }
+    server.sendContent("");
+    fclose(file);
+}
+
+void handleClearMessages() {
+    extern void clearMessagesLog();
+    clearMessagesLog();
+    sendJsonSuccess("Messages cleared");
 }
 
 void handleClearMonitor() {
@@ -3488,14 +3847,8 @@ static void extractOperatorShort(const char* cops, char* out, size_t outSize) {
 }
 
 void handleSimConfig() {
-    char* buf = (char*)malloc(5120);
-    if (!buf) {
-        sendJsonError("Out of memory");
-        return;
-    }
-    buildSimConfigJson(buf, 5120);
-    server.send(200, "application/json", buf);
-    free(buf);
+    buildSimConfigJson(webJsonBuf, sizeof(webJsonBuf));
+    server.send(200, "application/json", webJsonBuf);
 }
 
 void buildSimConfigJson(char* buf, size_t bufSize) {
@@ -4146,52 +4499,6 @@ void handleAgentConfig() {
     sendJsonSuccess();
 }
 
-void handleTestPush() {
-    // Test HTTP push to backend
-    if (charBufIsEmpty(agentBaseUrl)) {
-        sendJsonError("No base URL configured");
-        return;
-    }
-    
-    HTTPClient http;
-    char url[256];
-    snprintf(url, sizeof(url), "%s%s", agentBaseUrl, agentApiPath);
-    
-    http.begin(url);
-    http.addHeader("Content-Type", "application/json");
-    
-    if (!charBufIsEmpty(agentBearerToken)) {
-        http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
-    }
-    
-    char body[256];
-    snprintf(body, sizeof(body), "{\"test\":true,\"device_id\":\"%s\"}", agentDeviceId);
-    
-    int code = http.POST(body);
-    http.end();
-    
-    if (code > 0 && code < 400) {
-        logMsgInt("[TEST] Push OK, code", code);
-        sendJsonSuccess();
-    } else {
-        logMsgInt("[TEST] Push failed, code", code);
-        sendJsonError("Push failed");
-    }
-}
-
-// -----------------------------------------------------------------------------
-// Route Handlers - Battery
-// -----------------------------------------------------------------------------
-
-void handleBattery() {
-    char buf[128];
-    snprintf(buf, sizeof(buf),
-        "{\"success\":true,\"percent\":%d,\"mv\":%d}",
-        batteryPercent, batteryMv
-    );
-    server.send(200, "application/json", buf);
-}
-
 // -----------------------------------------------------------------------------
 // Route Handlers - Login/Auth
 // -----------------------------------------------------------------------------
@@ -4262,7 +4569,15 @@ void handleLogin() {
     WiFiClient client;
     bool isHttps = (strncmp(url, "https://", 8) == 0);
     
-    // Wait for other HTTPS operations to finish
+    // Wait briefly for other HTTPS operations to finish.
+    // Background HTTPS (heartbeat / maintenance / OTA) runs even when the user is not logged in,
+    // and it shares this global `httpsBusy` flag. Without a short wait, login can fail repeatedly.
+    if (httpsBusy) {
+        unsigned long t0 = millis();
+        while (httpsBusy && (millis() - t0) < 4000) {
+            delay(10);
+        }
+    }
     if (httpsBusy) {
         sendJsonError("HTTPS busy, try again");
         return;
@@ -4999,17 +5314,23 @@ void handleFirmwareCheck() {
     remote[0] = '\0';
 
     const bool ok = otaCheckForUpdate(&updateAvailable, remote, sizeof(remote));
-    char buf[192];
+    if (ok) {
+        maintenanceRecordFirmwareCheck(remote, updateAvailable);
+    }
+    const bool localAhead = ok && remote[0] && otaVersionIsNewer(FIRMWARE_VERSION, remote);
+    char buf[256];
     if (!ok) {
         snprintf(buf, sizeof(buf),
             "{\"success\":false,\"current\":\"%s\",\"message\":\"Could not fetch remote version\"}",
             FIRMWARE_VERSION);
     } else {
         snprintf(buf, sizeof(buf),
-            "{\"success\":true,\"current\":\"%s\",\"remote\":\"%s\",\"update_available\":%s}",
+            "{\"success\":true,\"current\":\"%s\",\"remote\":\"%s\","
+            "\"update_available\":%s,\"local_ahead\":%s}",
             FIRMWARE_VERSION,
             remote,
-            updateAvailable ? "true" : "false");
+            updateAvailable ? "true" : "false",
+            localAhead ? "true" : "false");
     }
     server.send(200, "application/json", buf);
 }
@@ -5028,8 +5349,9 @@ void handleFirmwareConfig() {
 void handleFirmwareUpdate() {
 #if !OTA_ENABLED
     server.send(200, "application/json",
-        "{\"success\":false,\"message\":\"OTA install disabled in this build. "
-        "Set OTA_ENABLED=1 and Partition Scheme Custom (partitions.csv), then USB flash once.\"}");
+        "{\"success\":false,\"message\":\"OTA install is disabled on this firmware build. "
+        "In Arduino IDE set Tools → Partition Scheme → Minimal SPIFFS (1.9MB APP with OTA), "
+        "compile, and upload via USB once. After that, Install update works from this page.\"}");
     return;
 #endif
     if (!WiFi.isConnected()) {

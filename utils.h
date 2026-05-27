@@ -80,6 +80,12 @@ void normalizeBaseUrl(char* buf, size_t size);
 // Normalize API path (ensure leading slash)
 void normalizeApiPath(char* buf, size_t size);
 
+// Build "Bearer <token>" without Arduino String (avoids heap fragmentation)
+inline void formatBearerHeader(char* out, size_t outSize, const char* token) {
+    if (!out || outSize < 8) return;
+    snprintf(out, outSize, "Bearer %s", (token && token[0]) ? token : "");
+}
+
 // URL encode a string
 size_t urlEncode(const char* input, char* output, size_t outputSize);
 

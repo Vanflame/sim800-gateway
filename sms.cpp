@@ -9,6 +9,7 @@
 #include "logger.h"
 #include "utils.h"
 #include "config.h"
+#include "webui.h"
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -36,9 +37,100 @@ static unsigned long totalFailed = 0;
 
 // Polling state
 static int currentPollSim = 0;
-static bool pollingInProgress = false;
 static unsigned long pollingPauseUntil = 0;
 static unsigned long lastPollMs = 0;
+static unsigned long lastSlotPollMs[SIM_COUNT];
+
+static bool smsSlotPollDue(int slot) {
+    if (slot < 0 || slot >= SIM_COUNT) return false;
+    return (millis() - lastSlotPollMs[slot]) >= (unsigned long)SMS_SLOT_POLL_COOLDOWN_MS;
+}
+
+static void cooperativeDelayMs(unsigned long ms) {
+    const unsigned long until = millis() + ms;
+    while ((long)(until - millis()) > 0) {
+        handleWebRequests();
+        yield();
+        delay(5);
+    }
+}
+
+static bool smsSlotEligibleForPoll(int slot) {
+    if (slot < 0 || slot >= SIM_COUNT) return false;
+    if (!simStates[slot].userDisabled && !simStates[slot].enabled) return false;
+    if (!simStates[slot].responsive) return false;
+    return true;
+}
+
+static void pollOneSimSlot(int slot) {
+    selectSIM(slot);
+
+    sendATCapture("AT", 300);
+    if (!strstr(getSimBuffer(), "OK")) {
+        logMsgInt("[SMS] SIM not responding during poll:", slot + 1);
+        simStates[slot].consecutiveErrors++;
+        simStates[slot].responsive = false;
+        if (!simStates[slot].userDisabled) {
+            simStates[slot].enabled = false;
+        }
+        simStates[slot].basicInitDone = false;
+        return;
+    }
+
+    if (!simStates[slot].basicInitDone) {
+        sendATCapture("AT", 500);
+        sendATCapture("AT+CMGF=1", 800);
+        sendATCapture("AT+CPMS=\"SM\",\"SM\",\"SM\"", 800);
+        sendATCapture("AT+CNMI=2,1,0,0,0", 800);
+        if (missedCallForwardEnabled) {
+            configureModemForMissedCallDetect();
+        } else {
+            sendATCapture("AT+CLIP=0", 800);
+            sendATCapture("AT+GSMBUSY=1", 800);
+        }
+        sendATCapture("AT+CSCS=\"GSM\"", 800);
+        simStates[slot].basicInitDone = true;
+        logMsgInt("[SMS] SIM initialized:", slot + 1);
+    }
+
+    sendATCapture("AT+CMGL=\"ALL\"", SMS_CMGL_TIMEOUT_MS);
+
+    char* buf = getSimBuffer();
+    if (missedCallForwardEnabled) {
+        processCallUrcFromBuffer(slot, buf);
+#if MISSED_CALL_URC_LISTEN_MS > 0
+        listenForCallUrc(slot, MISSED_CALL_URC_LISTEN_MS);
+#endif
+    }
+
+    if (strstr(buf, "+CMGL:") != NULL) {
+        simStates[slot].consecutiveErrors = 0;
+        simStates[slot].lastSuccessfulPoll = millis();
+
+        static SmsMessage messages[5];
+        const int count = parseSMSList(buf, messages, 5);
+        char line[56];
+        snprintf(line, sizeof(line), "[SMS] Poll SIM %d: %d message(s)", slot + 1, count);
+        logMsg(line);
+        for (int j = 0; j < count; j++) {
+            messages[j].simSlot = slot;
+            processIncomingSMS(slot, &messages[j]);
+        }
+    } else if (strstr(buf, "OK") != NULL) {
+        simStates[slot].consecutiveErrors = 0;
+        simStates[slot].lastSuccessfulPoll = millis();
+        char line[40];
+        snprintf(line, sizeof(line), "[SMS] Poll SIM %d: empty", slot + 1);
+        logMsg(line);
+    } else {
+        char line[40];
+        snprintf(line, sizeof(line), "[SMS] Poll SIM %d: error", slot + 1);
+        logMsg(line);
+        simStates[slot].consecutiveErrors++;
+    }
+
+    cooperativeDelayMs(80);
+}
 
 // Multipart SMS queue
 static MultipartSms multipartQueue[MAX_MULTIPART_QUEUE];
@@ -339,7 +431,7 @@ void clearPendingSms() {
 
 void processPendingSmsQueue() {
     // Check retry interval
-    if (millis() - lastRetryMs < SMS_RETRY_INTERVAL_MS) {
+    if (millis() - lastRetryMs < PENDING_SMS_PROCESS_GAP_MS) {
         return;
     }
     
@@ -658,9 +750,14 @@ void processIncomingSMS(int simSlot, const SmsMessage* msg) {
 
 // Forward SMS to backend (extracted for reuse by multipart)
 static void forwardSms(int simSlot, const char* senderDisplay, const SmsMessage* msg) {
-    // Forward to backend with normalized sender (extracted brand name)
     char fwdError[64] = "";
-    if (forwardSmsToBackendWithSender(msg, senderDisplay, fwdError, sizeof(fwdError))) {
+    extern volatile bool httpsBusy;
+
+    if (httpsBusy) {
+        enqueuePendingSms(simSlot, simStates[simSlot].number, senderDisplay, msg->message);
+        logMsg("[SMS] Queued (HTTPS busy)");
+        appendMonitorLog("[SMS] Queued during HTTPS");
+    } else if (forwardSmsToBackendWithSender(msg, senderDisplay, fwdError, sizeof(fwdError))) {
         totalForwarded++;
         persistentForwarded++;
         logMsg("[SMS] Forward success, deleting from SIM");
@@ -840,8 +937,10 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(15000);
 
+    static char authHdr[1100];
     if (agentUseAuth && !charBufIsEmpty(agentBearerToken)) {
-        http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
+        formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
+        http.addHeader("Authorization", authHdr);
     }
 
     // Try up to 2 times for connection errors
@@ -879,7 +978,8 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
             http.addHeader("Content-Type", "application/json");
             http.setTimeout(15000);
             if (agentUseAuth && !charBufIsEmpty(agentBearerToken)) {
-                http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
+                formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
+                http.addHeader("Authorization", authHdr);
             }
             continue;
         }
@@ -912,21 +1012,22 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
             http.addHeader("Content-Type", "application/json");
             http.setTimeout(15000);
             if (agentUseAuth && !charBufIsEmpty(agentBearerToken)) {
-                http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
+                formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
+                http.addHeader("Authorization", authHdr);
             }
             code = http.POST(payload);
             http.end();
         }
     }
-    
+
+    clientSecure.stop();
+    client.stop();
+    httpsBusy = false;
+
     if (code >= 200 && code < 300) {
         logMsgInt("[SMS] Forwarded OK, code", code);
         appendMonitorLogInt("[SMS] Forwarded OK, code", code);
-        http.end();
-        clientSecure.stop();
-        client.stop();
         delay(50);
-        httpsBusy = false;
         return true;
     } else {
         // Log detailed error
@@ -952,11 +1053,7 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
             logMsgInt("[SMS] Forward failed, HTTP code", code);
             if (errorOut) snprintf(errorOut, errorOutSize, "HTTP %d", code);
         }
-        http.end();
-        clientSecure.stop();
-        client.stop();
         delay(50);
-        httpsBusy = false;
         return false;
     }
 }
@@ -967,163 +1064,48 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
 
 void initSMSPolling() {
     currentPollSim = 0;
-    pollingInProgress = false;
     lastPollMs = 0;
     pollingPauseUntil = 0;
+    memset(lastSlotPollMs, 0, sizeof(lastSlotPollMs));
 }
 
 void pollSIMsForSMS() {
-    // Check multipart timeout first
     checkMultipartTimeout();
-    
-    // Check if paused
+
     if (millis() < pollingPauseUntil) {
         return;
     }
-    
-    // Check if busy
-    if (isSimBusy() || pollingInProgress) {
+    if (isSimBusy()) {
         return;
     }
-    
-    // Check poll interval
     if (millis() - lastPollMs < SMS_POLL_INTERVAL_MS) {
         return;
     }
-    
-    pollingInProgress = true;
-    lastPollMs = millis();
-    
-    // Poll each enabled SIM in round-robin
-    for (int i = 0; i < SIM_COUNT; i++) {
-        int slot = (currentPollSim + i) % SIM_COUNT;
-        
-        // Skip backend-disabled SIMs (manual heartbeat-off slots still polled)
-        if (!simStates[slot].userDisabled && !simStates[slot].enabled) {
-            continue;
-        }
-        
-        // Skip unresponsive SIMs
-        if (!simStates[slot].responsive) {
-            continue;
-        }
-        
-        // Select SIM and verify it's responsive
-        selectSIM(slot);
-        delay(100);  // Extra settling time after MUX switch
-        
-        // Verify SIM is responsive before polling
-        sendATCapture("AT", 500);
-        if (!strstr(getSimBuffer(), "OK")) {
-            logMsgInt("[SMS] SIM not responding during poll:", slot + 1);
-            simStates[slot].consecutiveErrors++;
-            continue;  // Skip this SIM
-        }
-        
-        if (!simStates[slot].basicInitDone) {
-            sendATCapture("AT", 500);
-            sendATCapture("AT+CMGF=1", 800);
-            // Set SMS storage to SIM memory
-            sendATCapture("AT+CPMS=\"SM\",\"SM\",\"SM\"", 800);
-            // Enable new SMS indications - store to SIM
-            sendATCapture("AT+CNMI=2,1,0,0,0", 800);
-            if (missedCallForwardEnabled) {
-                configureModemForMissedCallDetect();
-            } else {
-                sendATCapture("AT+CLIP=0", 800);
-                sendATCapture("AT+GSMBUSY=1", 800);
-            }
-            // Set character set to GSM for proper sender decoding
-            sendATCapture("AT+CSCS=\"GSM\"", 800);
-            
-            // Debug: Show SMS storage status
-            sendATCapture("AT+CPMS?", 800);
-            logMsgVal("[SMS] Storage", getSimBuffer());
-            // Debug: Show SMSC (SMS center number)
-            sendATCapture("AT+CSCA?", 800);
-            logMsgVal("[SMS] SMSC", getSimBuffer());
-            
-            simStates[slot].basicInitDone = true;
-            logMsgInt("[SMS] SIM initialized:", slot + 1);
-        }
-        
-        // AT+CMGL="ALL" returns all stored messages (more reliable than REC UNREAD)
-        // Format: +CMGL: <index>,"status","sender","","timestamp"<CR><LF>body<CR><LF>
-        logMsgInt("[SMS] Polling SIM", slot + 1);
-        sendATCapture("AT+CMGL=\"ALL\"", 8000);  // 8 second timeout for reliability
-        
-        char* buf = getSimBuffer();
-        if (missedCallForwardEnabled) {
-            processCallUrcFromBuffer(slot, buf);
-#if MISSED_CALL_URC_LISTEN_MS > 0
-            listenForCallUrc(slot, MISSED_CALL_URC_LISTEN_MS);
-#endif
-        }
-        
-        // Debug: show raw response (first 200 chars)
-        logMsg("[SMS] Raw response:");
-        int bufLen = strlen(buf);
-        int showLen = bufLen > 200 ? 200 : bufLen;
-        for (int k = 0; k < showLen; k++) {
-            if (buf[k] == '\r') Serial.print("\\r");
-            else if (buf[k] == '\n') Serial.print("\\n");
-            else Serial.print(buf[k]);
-        }
-        Serial.println();
-        
-        // Check if any messages
-        if (strstr(buf, "+CMGL:") != NULL) {
-            logMsgInt("[SMS] Found messages on SIM", slot + 1);
-            
-            // Successful poll - reset error tracking
-            simStates[slot].consecutiveErrors = 0;
-            simStates[slot].lastSuccessfulPoll = millis();
-            
-            // Parse and process (static + small to avoid stack overflow)
-            static SmsMessage messages[5];  // Increased from 3 to 5
-            int count = parseSMSList(buf, messages, 5);
-            
-            for (int j = 0; j < count; j++) {
-                messages[j].simSlot = slot;
-                processIncomingSMS(slot, &messages[j]);
-            }
-        } else if (strstr(buf, "OK") != NULL) {
-            // No messages, just OK - still a successful poll
-            simStates[slot].consecutiveErrors = 0;
-            simStates[slot].lastSuccessfulPoll = millis();
 
-            // Some SIMs store SMS in ME; try once per cycle as a fallback
-            sendATCapture("AT+CPMS=\"ME\",\"ME\",\"ME\"", 800);
-            sendATCapture("AT+CMGL=\"ALL\"", 8000);
-            char* buf2 = getSimBuffer();
-            if (strstr(buf2, "+CMGL:") != NULL) {
-                logMsgInt("[SMS] Found messages on SIM (ME)", slot + 1);
-                static SmsMessage messages[5];
-                int count = parseSMSList(buf2, messages, 5);
-                for (int j = 0; j < count; j++) {
-                    messages[j].simSlot = slot;
-                    processIncomingSMS(slot, &messages[j]);
-                }
-            } else {
-                unsigned long now = millis();
-                if (now - simStates[slot].lastNoSmsLog > NO_SMS_LOG_THROTTLE_MS) {
-                    simStates[slot].lastNoSmsLog = now;
-                    logMsgInt("[SMS] No stored SMS on SIM", slot + 1);
-                }
-            }
-        } else {
-            logMsgInt("[SMS] Poll error on SIM", slot + 1);
-            simStates[slot].consecutiveErrors++;
+    // Poll exactly one eligible+due SIM per call (round-robin via currentPollSim).
+    const int start = currentPollSim;
+    int slot = -1;
+    for (int i = 0; i < SIM_COUNT; i++) {
+        const int trySlot = (start + i) % SIM_COUNT;
+        if (!smsSlotEligibleForPoll(trySlot)) {
+            continue;
         }
-        
-        // Longer delay between SIMs for stability
-        delay(150);
+        if (!smsSlotPollDue(trySlot)) {
+            continue;
+        }
+        slot = trySlot;
+        break;
     }
-    
-    // Move to next SIM for next cycle
-    currentPollSim = (currentPollSim + 1) % SIM_COUNT;
-    
-    pollingInProgress = false;
+    if (slot < 0) {
+        currentPollSim = (start + 1) % SIM_COUNT;
+        return;
+    }
+    currentPollSim = (slot + 1) % SIM_COUNT;
+
+    lastPollMs = millis();
+    lastSlotPollMs[slot] = millis();
+    pollOneSimSlot(slot);
+    handleWebRequests();
 }
 
 void pauseSmsPolling(unsigned long durationMs) {
@@ -1146,7 +1128,7 @@ int getCurrentPollSim() {
 }
 
 bool isPollingInProgress() {
-    return pollingInProgress;
+    return isSimBusy();
 }
 
 // -----------------------------------------------------------------------------

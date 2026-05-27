@@ -1,0 +1,30 @@
+BUILD FIX — read this if compile fails or OTA install is disabled
+================================================================
+
+Your sketch needs a larger app partition than "Default" (1.25 MB).
+
+In Arduino IDE (with sim800_gateway.ino open):
+
+  1. Tools  (menu bar, between Sketch and Help)
+  2. Partition Scheme  (scroll down in Tools if needed)
+  3. Pick:  Minimal SPIFFS (1.9MB APP with OTA/128KB SPIFFS)
+
+Also check:
+  - Tools -> Board -> ESP32 Dev Module (or your board)
+  - Tools -> Flash Size -> 4MB
+
+Then: Sketch -> Clean, then Verify.
+
+SUCCESS: output shows  Maximum is 1966080 bytes  (not 1310720).
+
+Without changing partition, the firmware still compiles but OTA *install*
+is turned off for that build (you may see a compiler warning).
+
+AFTER CHANGING PARTITION SCHEME
+---------------------------------
+Upload the new firmware once. On first boot it raw-erases the LittleFS region
+(messages/errors logs cleared; WiFi and agent settings in NVS stay).
+
+If you still see "lfs_fs_grow" reboot loops:
+  1. Tools -> Erase Flash -> All
+  2. Upload firmware again

@@ -2,9 +2,11 @@
 
 #include "maintenance.h"
 #include "config.h"
+#include "sms.h"
 #include "ota.h"
 #include "logger.h"
 #include "utils.h"
+#include "webui.h"
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -28,6 +30,32 @@ static unsigned long lastMaintenancePollMs = 0;
 static unsigned long lastFirmwareCheckMs = 0;
 static bool sessionsUpdatedSincePoll = false;
 static bool restartInProgress = false;
+
+static char cachedFwRemote[32] = "";
+static bool cachedFwUpdateAvailable = false;
+
+void maintenanceRecordFirmwareCheck(const char* remoteVersion, bool updateAvailable) {
+    cachedFwUpdateAvailable = updateAvailable;
+    if (remoteVersion && remoteVersion[0]) {
+        charBufSet(cachedFwRemote, sizeof(cachedFwRemote), remoteVersion);
+    } else {
+        cachedFwRemote[0] = '\0';
+    }
+    lastFirmwareCheckMs = millis();
+}
+
+void maintenanceGetFirmwareCache(char* remoteOut, size_t remoteSize, bool* updateAvailableOut,
+    unsigned long* lastCheckMsOut) {
+    if (remoteOut && remoteSize > 0) {
+        charBufSet(remoteOut, remoteSize, cachedFwRemote);
+    }
+    if (updateAvailableOut) {
+        *updateAvailableOut = cachedFwUpdateAvailable;
+    }
+    if (lastCheckMsOut) {
+        *lastCheckMsOut = lastFirmwareCheckMs;
+    }
+}
 
 static unsigned long parseIso8601UtcToMs(const char* iso) {
     if (!iso || !iso[0]) return 0;
@@ -129,33 +157,56 @@ static bool maintenanceHttpPost(const char* body, char* respOut, size_t respSize
         clientSecure.setTimeout(20000);
         if (!http.begin(clientSecure, url)) {
             httpsBusy = false;
+            resumeSmsPolling();
             return false;
         }
     } else {
         if (!http.begin(client, url)) {
             httpsBusy = false;
+            resumeSmsPolling();
             return false;
         }
     }
 
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(20000);
+    static char authHdr[1100];
     if (!charBufIsEmpty(agentBearerToken)) {
-        http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
+        formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
+        http.addHeader("Authorization", authHdr);
     }
 
     int code = http.POST(body);
     if (code > 0 && respSize > 1) {
-        String resp = http.getString();
-        if (resp.length() > 0) {
-            strncpy(respOut, resp.c_str(), respSize - 1);
-            respOut[respSize - 1] = '\0';
+        WiFiClient* stream = http.getStreamPtr();
+        if (stream) {
+            size_t total = 0;
+            unsigned long t0 = millis();
+            while (millis() - t0 < 20000UL && total < respSize - 1) {
+                if (stream->available()) {
+                    const int n = stream->read(
+                        (uint8_t*)(respOut + total),
+                        (int)(respSize - 1 - total)
+                    );
+                    if (n > 0) {
+                        total += (size_t)n;
+                    }
+                } else if (!http.connected()) {
+                    break;
+                } else {
+                    handleWebRequests();
+                    yield();
+                    delay(5);
+                }
+            }
+            respOut[total] = '\0';
         }
     }
     http.end();
     clientSecure.stop();
     client.stop();
     httpsBusy = false;
+    resumeSmsPolling();
 
     if (code == 401) {
         if (refreshAgentToken()) {
@@ -172,10 +223,19 @@ static void applyMaintenancePollResponse(const char* resp) {
     char restartIso[40];
     extractJsonStringValue(resp, "scheduled_restart_at", restartIso, sizeof(restartIso));
     if (restartIso[0]) {
-        scheduledRestartAtMs = parseIso8601UtcToMs(restartIso);
+        const unsigned long ms = parseIso8601UtcToMs(restartIso);
+        if (ms != scheduledRestartAtMs) {
+            scheduledRestartAtMs = ms;
+            logMsg2Val("[MAINT] Scheduled restart at", restartIso, "", "");
+            appendMonitorLogVal("[MAINT] Scheduled restart", restartIso);
+        }
     } else if (strstr(resp, "\"scheduled_restart_at\":null") != nullptr ||
                strstr(resp, "\"scheduled_restart_at\": null") != nullptr) {
-        scheduledRestartAtMs = 0;
+        if (scheduledRestartAtMs != 0) {
+            scheduledRestartAtMs = 0;
+            appendMonitorLog("[MAINT] Scheduled restart cleared");
+            logMsg("[MAINT] Scheduled restart cleared");
+        }
     }
 
     const bool fwAvail = extractJsonBool(resp, "firmware_update_available", false);
@@ -197,6 +257,7 @@ static void maintenancePollBackend() {
     snprintf(body, sizeof(body),
         "{\"device_id\":\"%s\",\"firmware_version\":\"%s\",\"action\":\"poll\"}",
         agentDeviceId, FIRMWARE_VERSION);
+    appendMonitorLog("[MAINT] Poll start");
 
     if (maintenanceHttpPost(body, resp, sizeof(resp))) {
         applyMaintenancePollResponse(resp);
@@ -292,16 +353,21 @@ static void maintenanceLocalFirmwareCheck() {
 #if OTA_ENABLED
     bool updateAvailable = false;
     char remoteVer[32];
-    if (otaCheckForUpdate(&updateAvailable, remoteVer, sizeof(remoteVer)) && updateAvailable) {
-        char detail[72];
-        snprintf(detail, sizeof(detail), "%s (local %s)", remoteVer, FIRMWARE_VERSION);
-        logMsg2Val("[MAINT] Firmware update available", detail, "", "");
-        appendMonitorLogVal("[MAINT] Update available", detail);
+    remoteVer[0] = '\0';
+    if (otaCheckForUpdate(&updateAvailable, remoteVer, sizeof(remoteVer))) {
+        maintenanceRecordFirmwareCheck(remoteVer, updateAvailable);
+        if (updateAvailable) {
+            char detail[72];
+            snprintf(detail, sizeof(detail), "%s (local %s)", remoteVer, FIRMWARE_VERSION);
+            logMsg2Val("[MAINT] Firmware update available", detail, "", "");
+            appendMonitorLogVal("[MAINT] Update available", detail);
+        }
+    } else {
+        maintenanceRecordFirmwareCheck("", false);
     }
 #else
-    (void)0;
+    maintenanceRecordFirmwareCheck("", false);
 #endif
-    lastFirmwareCheckMs = millis();
 }
 
 void maintenanceOnBoot() {
@@ -325,8 +391,14 @@ void maintenanceOnBoot() {
 }
 
 void maintenanceOnHeartbeatSuccess() {
+    // Maintenance API poll runs on MAINTENANCE_POLL_MIN_INTERVAL_MS via maintenanceTick()
+    // (no extra HTTPS stacked right after heartbeat).
     sessionsUpdatedSincePoll = false;
-    maintenancePollBackend();
+}
+
+bool maintenanceRunDeferredPollIfNeeded() {
+    (void)0;
+    return false;
 }
 
 void maintenanceOnSessionsUpdated() {
@@ -334,14 +406,38 @@ void maintenanceOnSessionsUpdated() {
     maintenanceMaybeRunScheduledRestart();
 }
 
-void maintenanceTick(unsigned long nowMs) {
-    if (charBufIsEmpty(agentBaseUrl) || !WiFi.isConnected()) return;
+extern volatile bool otaInProgress;
 
-    if (lastFirmwareCheckMs == 0 ||
-        (nowMs - lastFirmwareCheckMs) >= (unsigned long)FIRMWARE_CHECK_INTERVAL_MS) {
-        maintenanceLocalFirmwareCheck();
-        if ((nowMs - lastMaintenancePollMs) >= (unsigned long)MAINTENANCE_POLL_MIN_INTERVAL_MS) {
-            maintenancePollBackend();
-        }
+void maintenanceTick(unsigned long nowMs) {
+    if (otaInProgress || httpsBusy) return;
+
+    maintenanceMaybeRunScheduledRestart();
+
+    if (!WiFi.isConnected()) return;
+
+    bool ranMaintPoll = false;
+    if (!charBufIsEmpty(agentBaseUrl) &&
+        (nowMs - lastMaintenancePollMs) >= (unsigned long)MAINTENANCE_POLL_MIN_INTERVAL_MS) {
+        maintenancePollBackend();
+        ranMaintPoll = true;
     }
+
+    if (!ranMaintPoll &&
+        (lastFirmwareCheckMs == 0 ||
+         (nowMs - lastFirmwareCheckMs) >= (unsigned long)FIRMWARE_CHECK_INTERVAL_MS)) {
+        maintenanceLocalFirmwareCheck();
+    }
+}
+
+bool maintenanceHasScheduledRestart() {
+    return scheduledRestartAtMs > 0;
+}
+
+long maintenanceGetScheduledRestartInSec() {
+    if (scheduledRestartAtMs == 0) return -1;
+    const time_t nowSecs = time(nullptr);
+    if (nowSecs <= 1600000000L) return -1;
+    const unsigned long nowMs = (unsigned long)nowSecs * 1000UL;
+    if (scheduledRestartAtMs <= nowMs) return 0;
+    return (long)((scheduledRestartAtMs - nowMs + 999UL) / 1000UL);
 }

@@ -110,15 +110,15 @@ void handleSendSms();
 // GET /messages - Get message history
 void handleMessages();
 
+// GET /clear-messages - Clear message history
+void handleClearMessages();
+
 // -----------------------------------------------------------------------------
 // Route Handlers - Agent Config
 // -----------------------------------------------------------------------------
 
 // POST /agent-config - Save agent configuration
 void handleAgentConfig();
-
-// GET /test-push - Test push to backend
-void handleTestPush();
 
 // POST /login - Agent login
 void handleLogin();
@@ -155,13 +155,6 @@ void handleFirmwareUpdate();
 
 // POST /firmware-config - Save OTA firmware URL to NVS
 void handleFirmwareConfig();
-
-// -----------------------------------------------------------------------------
-// Route Handlers - Battery
-// -----------------------------------------------------------------------------
-
-// GET /battery - Get battery info
-void handleBattery();
 
 // -----------------------------------------------------------------------------
 // JSON Response Helpers

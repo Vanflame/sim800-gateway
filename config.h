@@ -47,7 +47,7 @@
 // -----------------------------------------------------------------------------
 // Firmware version (shown in web UI; bump when releasing OTA builds)
 // -----------------------------------------------------------------------------
-#define FIRMWARE_VERSION    "1.0.0"
+#define FIRMWARE_VERSION    "1.0.2"
 
 // -----------------------------------------------------------------------------
 // Over-the-air updates (ESP32 HTTPS OTA from GitHub Releases or custom URL)
@@ -56,9 +56,18 @@
 // 0 = fits default 1.25MB partition (Check updates OK; Install needs OTA_ENABLED 1 + large partition).
 // 1 = full HTTPS OTA install (~1.32MB). REQUIRED partition: Tools → Custom → partitions.csv
 //     OR "Minimal SPIFFS (1.9MB APP with OTA)" — then set OTA_ENABLED to 1.
+#ifndef OTA_ENABLED
+#define OTA_ENABLED         1
+#endif
+
+// Default partition = 1.25MB app slot → sketch too big for HTTPS OTA. Auto-disable OTA so Verify still works.
+#if OTA_ENABLED && defined(ARDUINO_PARTITION_default)
+#warning SIM800: Partition Scheme is still Default. OTA install disabled for this build. Set Tools -> Partition Scheme -> Minimal SPIFFS (1.9MB APP with OTA), then rebuild for full OTA.
+#undef OTA_ENABLED
 #define OTA_ENABLED         0
+#endif
 #define OTA_FIRMWARE_URL_DEFAULT \
-    "https://github.com/Vanflame/sim800-gateway/releases/download/latest/firmware.bin"
+    "https://trfifrcfdtaxyuvsbfql.supabase.co/storage/v1/object/public/app/firmware.bin"
 #define OTA_VERSION_URL \
     "https://raw.githubusercontent.com/Vanflame/sim800-gateway/main/firmware/version.txt"
 #define OTA_GITHUB_OWNER    "Vanflame"
@@ -88,10 +97,20 @@
 // -----------------------------------------------------------------------------
 // Timing Intervals (ms)
 // -----------------------------------------------------------------------------
-#define SMS_POLL_INTERVAL_MS        2000    // 2s between poll cycles
+#define SMS_POLL_INTERVAL_MS        400     // Min gap between each SIM slot poll (one slot per loop tick)
+#define SMS_SLOT_POLL_COOLDOWN_MS   3000    // Min gap before re-polling the same slot
+#define SMS_CMGL_TIMEOUT_MS         2500    // List SMS; empty SIMs return OK in <1s
 #define SMS_POLL_TIMEOUT_MS         15000   // Safety timeout
 #define SMS_RETRY_INTERVAL_MS       30000   // 30s between retry batches
 #define HEARTBEAT_INTERVAL_MS       60000   // 60s heartbeat
+// Second POST after heartbeat (activeSessions + announcements). Costs another WiFi block; off by default.
+#ifndef HEARTBEAT_FOLLOWUP_ENABLED
+#define HEARTBEAT_FOLLOWUP_ENABLED  0
+#endif
+#if HEARTBEAT_FOLLOWUP_ENABLED
+#define HEARTBEAT_FOLLOWUP_DELAY_MS 15000UL  // gap before followup when enabled
+#endif
+#define PENDING_SMS_PROCESS_GAP_MS  8000UL   // retry queued SMS while modem polling continues
 #define FIRMWARE_CHECK_INTERVAL_MS  (12UL * 60UL * 60UL * 1000UL)  // 12h OTA version check
 #define MAINTENANCE_POLL_MIN_INTERVAL_MS  55000   // min gap between maintenance API polls
 #define SCHEDULED_RESTART_SESSION_BUFFER_MS  (5UL * 60UL * 1000UL)  // defer restart 5m after last session
@@ -142,7 +161,9 @@ extern int missedCallWatchSlot;
 // -----------------------------------------------------------------------------
 #define SIM_ERROR_THRESHOLD    3   // Reset SIM after this many errors
 #define SIM_CONSECUTIVE_ERROR_THRESHOLD 5  // Consecutive errors before recovery attempt
-#define SIM_WATCHDOG_TIMEOUT_MS 120000  // 2 minutes without successful poll = unresponsive
+// Watchdog timeout: must be long enough to survive a full heartbeat+maintenance cycle
+// (~25s heartbeat + ~30s maintenance + 12 SIMs × 3s cooldown ≈ 95s max idle time per slot)
+#define SIM_WATCHDOG_TIMEOUT_MS 300000  // 5 minutes: only trigger on genuinely dead SIMs
 
 // Load balance USSD (Philippines — Globe/Smart etc.)
 #define USSD_BALANCE_CODE       "*143#"
@@ -289,6 +310,7 @@ void pruneExpiredActiveSessions();
 
 // HTTPS busy flag to prevent concurrent connections
 extern volatile bool httpsBusy;
+extern volatile bool otaInProgress;
 
 // WiFi
 extern char wifiSsid[64];

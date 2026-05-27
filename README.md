@@ -14,11 +14,12 @@
 1. Install **ESP32 board support** (Board Manager → `esp32` by Espressif).
 2. Open **`sim800_gateway.ino`** (Arduino opens the whole folder).
 3. **Tools → Board**: your ESP32 board (e.g. ESP32 Dev Module).
-4. **Tools → Partition Scheme** (required — default 1.25MB OTA slots are too small):
+4. **Tools → Partition Scheme** — **required for OTA** (do not leave **Default**):
    - **`Minimal SPIFFS (1.9MB APP with OTA)`** — recommended, or
-   - **`Custom`** (uses `partitions.csv` in this folder — same 1.9MB layout), or
-   - `Huge APP (3MB No OTA)` only if you do **not** use OTA
-   - If you see **Sketch too big / text section exceeds available space**, you are on the wrong scheme.
+   - **`Custom`** (uses `partitions.csv` in this folder — same 1.9MB app slots)
+   - After compile, confirm max size is **~1966080** bytes, **not** 1310720.
+   - Wrong scheme: `Sketch uses … (100%) … Maximum is 1310720 bytes`.
+   - VS Code / Cursor: this repo includes `.vscode/arduino.json` with `PartitionScheme=min_spiffs`.
 5. **Tools → Upload Speed**: 921600 (or 115200 if upload fails).
 6. **Port**: select the ESP32 COM port.
 7. Click **Upload** (first flash must be USB).

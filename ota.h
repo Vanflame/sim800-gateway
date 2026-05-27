@@ -18,5 +18,10 @@ bool otaFetchRemoteVersion(char* version, size_t versionSize);
 // Compare remote vs FIRMWARE_VERSION; sets updateAvailable
 bool otaCheckForUpdate(bool* updateAvailable, char* remoteVersion, size_t remoteSize);
 
+// True if version string a is semantically newer than b (e.g. 1.0.2 > 1.0.1)
+bool otaVersionIsNewer(const char* a, const char* b);
+
 // Download and flash firmware from url; on success device reboots (does not return)
 bool otaPerformUpdate(const char* url, char* errorOut, size_t errorOutSize);
+
+extern volatile bool otaInProgress;

@@ -27,8 +27,27 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
-#include <LittleFS.h>
+#include <esp_partition.h>
+#include <esp_err.h>
+#include <stdio.h>
 #include <time.h>
+
+extern "C" {
+#include "esp_littlefs.h"
+}
+
+#ifndef ESP_PARTITION_SUBTYPE_DATA_LITTLEFS
+#define ESP_PARTITION_SUBTYPE_DATA_LITTLEFS ((esp_partition_subtype_t)0x83)
+#endif
+
+#define LFS_MOUNT_PATH     "/littlefs"
+#define LFS_MESSAGES_PATH  LFS_MOUNT_PATH "/messages.log"
+#define LFS_ERRORS_PATH    LFS_MOUNT_PATH "/errors.log"
+
+// Bump when LittleFS init logic changes (forces one raw erase on next boot).
+static const uint32_t LFS_STORE_MAGIC = 4;
+
+static bool g_littlefsReady = false;
 
 // -----------------------------------------------------------------------------
 // Global State Definitions (declared in config.h)
@@ -48,6 +67,8 @@ volatile bool httpsBusy = false;  // Prevent concurrent HTTPS
 bool smsPollingPaused = false;
 bool heartbeatPaused = false;
 bool pendingHeartbeatFollowup = false;
+static unsigned long heartbeatFinishedMs = 0;
+static wifi_ps_type_t wifiPsBeforeHttps = WIFI_PS_NONE;
 bool missedCallForwardEnabled = MISSED_CALL_FORWARD_DEFAULT;
 int missedCallWatchSlot = -1;
 bool deviceRegistered = false;
@@ -102,6 +123,136 @@ unsigned long persistentFailed = 0;
 // Persistent Storage Functions
 // -----------------------------------------------------------------------------
 
+static const esp_partition_t* getLittleFsPartition() {
+    const esp_partition_t* part = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_LITTLEFS, nullptr);
+    if (part) {
+        return part;
+    }
+    return esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr);
+}
+
+static uint32_t getLittleFsPartitionBytes() {
+    const esp_partition_t* part = getLittleFsPartition();
+    return part ? part->size : 0;
+}
+
+static bool eraseLittleFsPartitionRaw(const esp_partition_t* part) {
+    if (!part) {
+        return false;
+    }
+    if (esp_littlefs_partition_mounted(part)) {
+        esp_vfs_littlefs_unregister_partition(part);
+    }
+    const esp_err_t err = esp_partition_erase_range(part, 0, part->size);
+    Serial.printf("[STORE] Raw erase %u bytes: %s\n",
+                  (unsigned)part->size, esp_err_to_name(err));
+    return err == ESP_OK;
+}
+
+// Arduino LittleFS.begin() sets grow_on_mount=true and can report success when mount failed.
+static bool mountLittleFSStorage(bool formatFirst) {
+    const esp_partition_t* part = getLittleFsPartition();
+    if (!part) {
+        return false;
+    }
+
+    g_littlefsReady = false;
+    if (esp_littlefs_partition_mounted(part)) {
+        esp_vfs_littlefs_unregister_partition(part);
+    }
+
+    if (formatFirst) {
+        eraseLittleFsPartitionRaw(part);
+        const esp_err_t ferr = esp_littlefs_format_partition(part);
+        Serial.printf("[STORE] format_partition: %s\n", esp_err_to_name(ferr));
+        if (ferr != ESP_OK) {
+            return false;
+        }
+    }
+
+    esp_vfs_littlefs_conf_t conf = {};
+    conf.base_path = LFS_MOUNT_PATH;
+    conf.partition = part;
+    conf.partition_label = nullptr;
+    conf.format_if_mount_failed = false;
+    conf.read_only = false;
+    conf.dont_mount = false;
+    conf.grow_on_mount = false;
+
+    const esp_err_t err = esp_vfs_littlefs_register(&conf);
+    Serial.printf("[STORE] vfs register: %s\n", esp_err_to_name(err));
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    if (!esp_littlefs_partition_mounted(part)) {
+        return false;
+    }
+
+    FILE* probe = fopen(LFS_MOUNT_PATH "/.ok", "w");
+    if (!probe) {
+        return false;
+    }
+    fclose(probe);
+    remove(LFS_MOUNT_PATH "/.ok");
+    g_littlefsReady = true;
+    return true;
+}
+
+static void initLittleFS() {
+    const esp_partition_t* part = getLittleFsPartition();
+    const uint32_t partBytes = part ? part->size : 0;
+    if (!part || partBytes == 0) {
+        Serial.println("[STORE] No SPIFFS/LittleFS data partition");
+        appendMonitorLog("[STORE] No data partition");
+        return;
+    }
+
+    Preferences storeMeta;
+    storeMeta.begin("store", false);
+    const uint32_t lastBytes = storeMeta.getUInt("lfs_sz", 0);
+    const uint32_t lastMagic = storeMeta.getUInt("lfs_magic", 0);
+    const bool needPrep = (lastMagic != LFS_STORE_MAGIC) || (lastBytes != partBytes);
+    storeMeta.end();
+
+    if (needPrep) {
+        Serial.printf("[STORE] Preparing flash storage (%u bytes partition)\n",
+                      (unsigned)partBytes);
+    }
+
+    if (!mountLittleFSStorage(needPrep)) {
+        Serial.println("[STORE] Mount failed, raw erase and format");
+        if (!mountLittleFSStorage(true)) {
+            Serial.println("[STORE] LittleFS mount failed");
+            appendMonitorLog("[STORE] LittleFS mount failed");
+            g_littlefsReady = false;
+            return;
+        }
+    }
+
+    Serial.println("[STORE] LittleFS mounted");
+    appendMonitorLog("[STORE] LittleFS mounted");
+
+    storeMeta.begin("store", false);
+    storeMeta.putUInt("lfs_sz", partBytes);
+    storeMeta.putUInt("lfs_magic", LFS_STORE_MAGIC);
+    storeMeta.end();
+}
+
+static bool lfsFileExists(const char* path) {
+    if (!g_littlefsReady) {
+        return false;
+    }
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        return false;
+    }
+    fclose(f);
+    return true;
+}
+
 void loadPersistentStats() {
     preferences.begin("gateway", true);  // read-only
     persistentReceived = preferences.getULong("received", 0);
@@ -122,151 +273,186 @@ void savePersistentStats() {
 
 // Append SMS to persistent file
 void appendSmsToFile(const char* time, int simSlot, const char* number, const char* sender, const char* message) {
-    File file = LittleFS.open("/messages.log", "a");
+    if (!g_littlefsReady) {
+        return;
+    }
+    // Cap stored message length to keep history size predictable
+    char clipped[201];
+    if (message && message[0]) {
+        strncpy(clipped, message, 200);
+        clipped[200] = '\0';
+    } else {
+        clipped[0] = '\0';
+    }
+
+    FILE* file = fopen(LFS_MESSAGES_PATH, "a");
     if (!file) {
         logMsg("[STORE] Failed to open messages.log");
         return;
     }
-    
-    // Format: timestamp|sim|number|sender|message\n
-    file.print(time);
-    file.print("|");
-    file.print(simSlot);
-    file.print("|");
-    file.print(number);
-    file.print("|");
-    file.print(sender);
-    file.print("|");
-    file.println(message);
-    file.close();
+    fprintf(file, "%s|%d|%s|%s|%s\n", time, simSlot, number, sender, clipped);
+    fclose(file);
 }
 
 // Read SMS messages from file (returns count, fills buffer)
 int readSmsFromFile(char* buf, size_t bufSize, int maxMessages) {
-    if (!LittleFS.exists("/messages.log")) {
+    if (!g_littlefsReady || !lfsFileExists(LFS_MESSAGES_PATH)) {
         return 0;
     }
-    
-    File file = LittleFS.open("/messages.log", "r");
-    if (!file) return 0;
-    
-    // Read file in chunks, keeping only last maxMessages
+
+    FILE* file = fopen(LFS_MESSAGES_PATH, "r");
+    if (!file) {
+        return 0;
+    }
+
     int count = 0;
     size_t pos = 0;
     buf[0] = '\0';
-    
-    // Simple approach: read and count, then seek back
-    file.seek(0, SeekEnd);
-    size_t fileSize = file.position();
-    file.seek(0, SeekSet);
-    
-    // If file is small enough, just read it all
-    if (fileSize < bufSize) {
-        while (file.available() && pos < bufSize - 1) {
-            buf[pos++] = file.read();
+
+    fseek(file, 0, SEEK_END);
+    const long fileSize = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    if (fileSize <= 0) {
+        fclose(file);
+        return 0;
+    }
+
+    if ((size_t)fileSize < bufSize) {
+        while (pos < bufSize - 1) {
+            const int ch = fgetc(file);
+            if (ch == EOF) {
+                break;
+            }
+            buf[pos++] = (char)ch;
         }
         buf[pos] = '\0';
-        
-        // Count newlines
         for (size_t i = 0; buf[i]; i++) {
-            if (buf[i] == '\n') count++;
-        }
-    } else {
-        // For large files, read from end
-        // Find start of last maxMessages lines
-        int linesFound = 0;
-        size_t readPos = fileSize;
-        char chunk[128];
-        
-        while (readPos > 0 && linesFound < maxMessages) {
-            size_t chunkSize = (readPos > sizeof(chunk)) ? sizeof(chunk) : readPos;
-            readPos -= chunkSize;
-            file.seek(readPos, SeekSet);
-            file.readBytes(chunk, chunkSize);
-            
-            for (int i = chunkSize - 1; i >= 0 && linesFound < maxMessages; i--) {
-                if (chunk[i] == '\n') linesFound++;
+            if (buf[i] == '\n') {
+                count++;
             }
         }
-        
-        // Now read from that position
-        file.seek(readPos, SeekSet);
-        while (file.available() && pos < bufSize - 1) {
-            buf[pos++] = file.read();
+    } else {
+        int linesFound = 0;
+        long readPos = fileSize;
+        char chunk[128];
+
+        while (readPos > 0 && linesFound < maxMessages) {
+            const long chunkSize = (readPos > (long)sizeof(chunk)) ? (long)sizeof(chunk) : readPos;
+            readPos -= chunkSize;
+            fseek(file, readPos, SEEK_SET);
+            const size_t got = fread(chunk, 1, (size_t)chunkSize, file);
+
+            for (int i = (int)got - 1; i >= 0 && linesFound < maxMessages; i--) {
+                if (chunk[i] == '\n') {
+                    linesFound++;
+                }
+            }
+        }
+
+        fseek(file, readPos, SEEK_SET);
+        while (pos < bufSize - 1) {
+            const int ch = fgetc(file);
+            if (ch == EOF) {
+                break;
+            }
+            buf[pos++] = (char)ch;
         }
         buf[pos] = '\0';
         count = linesFound;
     }
-    
-    file.close();
+
+    fclose(file);
     return count;
 }
 
 // Append error to persistent file
 void appendErrorToFile(const char* time, const char* error) {
-    File file = LittleFS.open("/errors.log", "a");
-    if (!file) return;
-    
-    file.print(time);
-    file.print("|");
-    file.println(error);
-    file.close();
+    if (!g_littlefsReady) {
+        return;
+    }
+    FILE* file = fopen(LFS_ERRORS_PATH, "a");
+    if (!file) {
+        return;
+    }
+    fprintf(file, "%s|%s\n", time, error);
+    fclose(file);
 }
 
 // Read errors from persistent file
 int readErrorsFromFile(char* buf, size_t bufSize, int maxErrors) {
-    if (!LittleFS.exists("/errors.log")) {
+    if (!g_littlefsReady || !lfsFileExists(LFS_ERRORS_PATH)) {
         return 0;
     }
-    
-    File file = LittleFS.open("/errors.log", "r");
-    if (!file) return 0;
-    
+
+    FILE* file = fopen(LFS_ERRORS_PATH, "r");
+    if (!file) {
+        return 0;
+    }
+
     int count = 0;
     size_t pos = 0;
     buf[0] = '\0';
-    
-    file.seek(0, SeekEnd);
-    size_t fileSize = file.position();
-    file.seek(0, SeekSet);
-    
-    // If file is small enough, just read it all
-    if (fileSize < bufSize) {
-        while (file.available() && pos < bufSize - 1) {
-            buf[pos++] = file.read();
+
+    fseek(file, 0, SEEK_END);
+    const long fileSize = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    if (fileSize <= 0) {
+        fclose(file);
+        return 0;
+    }
+
+    if ((size_t)fileSize < bufSize) {
+        while (pos < bufSize - 1) {
+            const int ch = fgetc(file);
+            if (ch == EOF) {
+                break;
+            }
+            buf[pos++] = (char)ch;
         }
         buf[pos] = '\0';
-        
         for (size_t i = 0; buf[i]; i++) {
-            if (buf[i] == '\n') count++;
-        }
-    } else {
-        // For large files, read from end
-        int linesFound = 0;
-        size_t readPos = fileSize;
-        char chunk[128];
-        
-        while (readPos > 0 && linesFound < maxErrors) {
-            size_t chunkSize = (readPos > sizeof(chunk)) ? sizeof(chunk) : readPos;
-            readPos -= chunkSize;
-            file.seek(readPos, SeekSet);
-            file.readBytes(chunk, chunkSize);
-            
-            for (int i = chunkSize - 1; i >= 0 && linesFound < maxErrors; i--) {
-                if (chunk[i] == '\n') linesFound++;
+            if (buf[i] == '\n') {
+                count++;
             }
         }
-        
-        file.seek(readPos, SeekSet);
-        while (file.available() && pos < bufSize - 1) {
-            buf[pos++] = file.read();
+    } else {
+        int linesFound = 0;
+        long readPos = fileSize;
+        char chunk[128];
+
+        while (readPos > 0 && linesFound < maxErrors) {
+            const long chunkSize = (readPos > (long)sizeof(chunk)) ? (long)sizeof(chunk) : readPos;
+            readPos -= chunkSize;
+            fseek(file, readPos, SEEK_SET);
+            const size_t got = fread(chunk, 1, (size_t)chunkSize, file);
+
+            for (int i = (int)got - 1; i >= 0 && linesFound < maxErrors; i--) {
+                if (chunk[i] == '\n') {
+                    linesFound++;
+                }
+            }
+        }
+
+        fseek(file, readPos, SEEK_SET);
+        while (pos < bufSize - 1) {
+            const int ch = fgetc(file);
+            if (ch == EOF) {
+                break;
+            }
+            buf[pos++] = (char)ch;
         }
         buf[pos] = '\0';
         count = linesFound;
     }
-    
-    file.close();
+
+    fclose(file);
     return count;
+}
+
+bool webLittleFsReady() {
+    return g_littlefsReady;
 }
 
 // -----------------------------------------------------------------------------
@@ -314,20 +500,7 @@ void setup() {
 #endif
     appendMonitorLog("[BOOT] Settings loaded");
     
-    // Initialize LittleFS for persistent storage
-    if (!LittleFS.begin(true)) {
-        Serial.println("[STORE] LittleFS mount failed, formatting...");
-        appendMonitorLog("[STORE] LittleFS format");
-        LittleFS.format();
-        if (LittleFS.begin(true)) {
-            Serial.println("[STORE] LittleFS mounted after format");
-        } else {
-            Serial.println("[STORE] LittleFS still failed after format");
-            appendMonitorLog("[STORE] LittleFS mount failed");
-        }
-    } else {
-        Serial.println("[STORE] LittleFS mounted");
-    }
+    initLittleFS();
     
     // Load persistent statistics
     loadPersistentStats();
@@ -367,51 +540,159 @@ void setup() {
 
 static void fetchHeartbeatFollowup();
 
-// -----------------------------------------------------------------------------
-// Main Loop
-// -----------------------------------------------------------------------------
+static void wifiPrepareForHttps() {
+    wifiPsBeforeHttps = WiFi.getSleep();
+    WiFi.setSleep(WIFI_PS_NONE);
+}
 
-void loop() {
-    // Handle web requests (must be called frequently)
-    handleWebRequests();
-    
-    // Fast missed-call scan (one SIM per tick; no AT / minimal flush)
-    if (missedCallForwardEnabled && !smsPollingPaused) {
-        pollMissedCallsFast();
+static void wifiRestoreAfterHttps() {
+    WiFi.setSleep(wifiPsBeforeHttps);
+}
+
+static bool ensureWifiForHttps() {
+    if (WiFi.isConnected()) {
+        return true;
+    }
+    if (charBufIsEmpty(wifiSsid)) {
+        return false;
+    }
+    logMsg("[WIFI] Reconnecting for HTTPS");
+    appendMonitorLog("[WIFI] Reconnecting");
+    WiFi.disconnect();
+    delay(100);
+    WiFi.begin(wifiSsid, wifiPassword);
+    for (int i = 0; i < 60; i++) {
+        if (WiFi.status() == WL_CONNECTED) {
+            delay(200);
+            return true;
+        }
+        delay(250);
+        yield();
+        handleWebRequests();
+    }
+    return false;
+}
+
+// One blocking HTTPS job per loop() — all WiFi/TLS from loop() (not thread-safe on ESP32).
+static bool scheduleBackgroundNet(unsigned long now) {
+    if (otaInProgress || httpsBusy) {
+        return false;
     }
 
-    // Poll SIMs for new SMS
-    if (!isSimBusy() && !smsPollingPaused) {
-        pollSIMsForSMS();
-    }
-    
-    // Process pending SMS queue
-    processPendingSmsQueue();
-
-    // Background *143# bulk queue
-    ussdTick();
-
-    // Followup uses WiFi only — do not wait for modem (isSimBusy)
-    if (pendingHeartbeatFollowup && !httpsBusy) {
+#if HEARTBEAT_FOLLOWUP_ENABLED
+    if (pendingHeartbeatFollowup && heartbeatFinishedMs > 0 &&
+        (now - heartbeatFinishedMs) >= HEARTBEAT_FOLLOWUP_DELAY_MS) {
         pendingHeartbeatFollowup = false;
+        logMsg("[HEARTBEAT] Followup starting");
+        appendMonitorLog("[HEARTBEAT] Followup starting");
         fetchHeartbeatFollowup();
         pruneExpiredActiveSessions();
         maintenanceOnSessionsUpdated();
         if (!isSimBusy()) {
             flushPendingMissedCallsAfterHeartbeat();
         }
+        return true;
     }
+#endif
 
-    // Periodic tasks
-    unsigned long now = millis();
-
-    maintenanceTick(now);
-    
-    // Heartbeat / sync with backend
-    if (!heartbeatPaused && (now - lastHeartbeatMs > HEARTBEAT_INTERVAL_MS)) {
-        lastHeartbeatMs = now;
+    if (!heartbeatPaused && !pendingHeartbeatFollowup && !charBufIsEmpty(agentBaseUrl) &&
+        !isSimBusy() && ensureWifiForHttps() &&
+        (now - lastHeartbeatMs) >= (unsigned long)HEARTBEAT_INTERVAL_MS) {
         pruneExpiredActiveSessions();
         performHeartbeat();
+        heartbeatFinishedMs = millis();
+        return true;
+    }
+
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// Main Loop
+// -----------------------------------------------------------------------------
+
+static void runBusyWatchdog() {
+    static unsigned long simBusySince = 0;
+    static unsigned long httpsBusySince = 0;
+
+    if (isSimBusy()) {
+        if (simBusySince == 0) {
+            simBusySince = millis();
+        } else if (millis() - simBusySince > 45000UL) {
+            logMsg("[WATCHDOG] Force clear simBusy");
+            setSimBusy(false);
+            simBusySince = 0;
+        }
+    } else {
+        simBusySince = 0;
+    }
+
+    if (httpsBusy) {
+        if (httpsBusySince == 0) {
+            httpsBusySince = millis();
+        } else if (millis() - httpsBusySince > 90000UL) {
+            logMsg("[WATCHDOG] Force clear httpsBusy");
+            httpsBusy = false;
+            httpsBusySince = 0;
+            resumeSmsPolling();
+        }
+    } else {
+        httpsBusySince = 0;
+    }
+}
+
+static void logHeapIfLow() {
+    static unsigned long lastHeapLogMs = 0;
+    const unsigned long now = millis();
+    if (now - lastHeapLogMs < 300000UL) {
+        return;
+    }
+    lastHeapLogMs = now;
+    const uint32_t freeHeap = ESP.getFreeHeap();
+    const uint32_t largest = ESP.getMaxAllocHeap();
+    if (freeHeap < 25000 || largest < 12000) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "[SYS] Low heap free=%u largest=%u", (unsigned)freeHeap, (unsigned)largest);
+        logMsg(buf);
+        appendMonitorLog(buf);
+    }
+}
+
+void loop() {
+    // Handle web requests (must be called frequently)
+    handleWebRequests();
+    runBusyWatchdog();
+    logHeapIfLow();
+
+    // During OTA only service HTTP; skip SIM/heartbeat/maintenance so WiFi/CPU focus on download.
+    if (otaInProgress) {
+        yield();
+        return;
+    }
+
+    // Poll SIMs before missed-call scan (modem UART; heartbeat uses WiFi on same thread)
+    if (!isSimBusy() && !smsPollingPaused && !isSmsPollingPaused()) {
+        pollSIMsForSMS();
+    }
+
+    if (missedCallForwardEnabled && !smsPollingPaused && !isSimBusy()) {
+        pollMissedCallsFast();
+    }
+
+    if (!httpsBusy && !isSmsPollingPaused()) {
+        ussdTick();
+    }
+
+    unsigned long now = millis();
+
+    if (!httpsBusy && getPendingSmsCount() > 0) {
+        processPendingSmsQueue();
+    }
+
+    const bool netJobRan = scheduleBackgroundNet(now);
+
+    if (!netJobRan && !httpsBusy && !isSimBusy()) {
+        maintenanceTick(now);
     }
     
     // Battery info update
@@ -643,7 +924,9 @@ static void applyBackendSimStatusFromJson(const char* s) {
                 (strcmp(status, "ACTIVE") == 0 || strcmp(status, "IN_USE") == 0);
             simStates[slot].enabled = shouldEnable;
             if (!shouldEnable) {
-                appendMonitorLogVal("[HEARTBEAT] Backend disabled SIM", String(slot).c_str());
+                char slotBuf[8];
+                snprintf(slotBuf, sizeof(slotBuf), "%d", slot);
+                appendMonitorLogVal("[HEARTBEAT] Backend disabled SIM", slotBuf);
             }
         }
 
@@ -797,7 +1080,7 @@ static bool simInHeartbeatReport(int i) {
 
 static void fetchHeartbeatFollowup() {
     if (charBufIsEmpty(agentBaseUrl) || charBufIsEmpty(agentBearerToken)) return;
-    if (!WiFi.isConnected() || httpsBusy) return;
+    if (httpsBusy || !ensureWifiForHttps()) return;
 
     static char url[256];
     snprintf(url, sizeof(url), "%s/api/agent/heartbeat/followup", agentBaseUrl);
@@ -835,7 +1118,9 @@ static void fetchHeartbeatFollowup() {
         return;
     }
 
+    logMsg("[HEARTBEAT] Followup POST");
     httpsBusy = true;
+    wifiPrepareForHttps();
     HTTPClient http;
     WiFiClientSecure clientSecure;
     WiFiClient clientPlain;
@@ -844,21 +1129,24 @@ static void fetchHeartbeatFollowup() {
 
     if (isHttps) {
         clientSecure.setInsecure();
-        clientSecure.setTimeout(10000);
+        clientSecure.setTimeout(25000);
         begun = http.begin(clientSecure, url);
     } else {
-        clientPlain.setTimeout(10000);
+        clientPlain.setTimeout(25000);
         begun = http.begin(clientPlain, url);
     }
 
     if (!begun) {
         httpsBusy = false;
+        wifiRestoreAfterHttps();
         return;
     }
 
     http.addHeader("Content-Type", "application/json");
-    http.setTimeout(10000);
-    http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
+    http.setTimeout(25000);
+    static char authHdrFollow[1100];
+    formatBearerHeader(authHdrFollow, sizeof(authHdrFollow), agentBearerToken);
+    http.addHeader("Authorization", authHdrFollow);
 
     const int code = http.POST(body);
 
@@ -878,6 +1166,8 @@ static void fetchHeartbeatFollowup() {
                 } else if (!http.connected()) {
                     break;
                 } else {
+                    handleWebRequests();
+                    yield();
                     delay(2);
                 }
             }
@@ -892,13 +1182,14 @@ static void fetchHeartbeatFollowup() {
         clientPlain.stop();
     }
     httpsBusy = false;
+    wifiRestoreAfterHttps();
 
     if (code >= 200 && code < 300 && respBuf[0] != '\0') {
         parseActiveSessionsFromJson(respBuf);
         if (activeSessionCount > 0) {
             logMsgInt("[HEARTBEAT] Followup sessions", activeSessionCount);
         }
-        appendMonitorLog("[HEARTBEAT] Followup OK");
+        appendMonitorLog("[HEARTBEAT] Followup done");
         pruneExpiredActiveSessions();
         maintenanceOnSessionsUpdated();
     }
@@ -909,16 +1200,21 @@ void performHeartbeat() {
         return;  // No backend configured
     }
     
-    if (!WiFi.isConnected()) {
-        return;  // No internet
+    if (!ensureWifiForHttps()) {
+        logMsg("[HEARTBEAT] No WiFi");
+        appendMonitorLog("[HEARTBEAT] No WiFi");
+        return;
     }
-    
+
     // Skip if another HTTPS operation is in progress
     if (httpsBusy) {
         return;
     }
-    
+
     httpsBusy = true;
+    wifiPrepareForHttps();
+    logMsg("[HEARTBEAT] Starting");
+    appendMonitorLog("[HEARTBEAT] Starting");
     
     // Ensure NTP for TLS
     if (!ntpConfigured) {
@@ -944,6 +1240,7 @@ void performHeartbeat() {
             logMsg("[HEARTBEAT] HTTPS begin failed");
             appendMonitorLog("[HEARTBEAT] HTTPS begin failed");
             httpsBusy = false;
+            wifiRestoreAfterHttps();
             return;
         }
     } else {
@@ -951,6 +1248,7 @@ void performHeartbeat() {
             logMsg("[HEARTBEAT] HTTP begin failed");
             appendMonitorLog("[HEARTBEAT] HTTP begin failed");
             httpsBusy = false;
+            wifiRestoreAfterHttps();
             return;
         }
     }
@@ -958,8 +1256,10 @@ void performHeartbeat() {
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(25000);  // 25 second timeout
     
+    static char authHdr[1100];
     if (!charBufIsEmpty(agentBearerToken)) {
-        http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
+        formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
+        http.addHeader("Authorization", authHdr);
     }
 
     if (HEARTBEAT_DEBUG) {
@@ -1023,15 +1323,39 @@ void performHeartbeat() {
         appendMonitorLog(body);
     }
 
-    // Try up to 2 times for connection errors
+    static char respBuf[2048];
+    respBuf[0] = '\0';
+
     int attempt = 0;
     int code = -1;
-    String resp = "";
-    
+
     while (attempt < 2) {
+        handleWebRequests();
         code = http.POST(body);
         if (code > 0) {
-            resp = http.getString();
+            WiFiClient* stream = http.getStreamPtr();
+            if (stream) {
+                size_t total = 0;
+                unsigned long t0 = millis();
+                while (millis() - t0 < 20000UL && total < sizeof(respBuf) - 1) {
+                    if (stream->available()) {
+                        const int n = stream->read(
+                            (uint8_t*)(respBuf + total),
+                            (int)(sizeof(respBuf) - 1 - total)
+                        );
+                        if (n > 0) {
+                            total += (size_t)n;
+                        }
+                    } else if (!http.connected()) {
+                        break;
+                    } else {
+                        handleWebRequests();
+                        yield();
+                        delay(5);
+                    }
+                }
+                respBuf[total] = '\0';
+            }
         }
         http.end();
         
@@ -1043,8 +1367,9 @@ void performHeartbeat() {
             logMsgInt("[HEARTBEAT] Conn error, retrying", code);
             clientSecure.stop();
             client.stop();
-            delay(500);  // Wait before retry
-            
+            delay(500);
+            ensureWifiForHttps();
+
             // Reconnect
             if (isHttps) {
                 clientSecure.setInsecure();
@@ -1056,7 +1381,8 @@ void performHeartbeat() {
             http.addHeader("Content-Type", "application/json");
             http.setTimeout(25000);
             if (!charBufIsEmpty(agentBearerToken)) {
-                http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
+                formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
+                http.addHeader("Authorization", authHdr);
             }
         }
         attempt++;
@@ -1069,6 +1395,7 @@ void performHeartbeat() {
         clientSecure.stop();
         client.stop();
         httpsBusy = false;
+        wifiRestoreAfterHttps();
         return;
     }
     
@@ -1088,17 +1415,40 @@ void performHeartbeat() {
             }
             http.addHeader("Content-Type", "application/json");
             if (!charBufIsEmpty(agentBearerToken)) {
-                http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
+                formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
+                http.addHeader("Authorization", authHdr);
             }
             code = http.POST(body);
-            resp = "";
+            respBuf[0] = '\0';
             if (code > 0) {
-                resp = http.getString();
+                WiFiClient* stream = http.getStreamPtr();
+                if (stream) {
+                    size_t total = 0;
+                    unsigned long t0 = millis();
+                    while (millis() - t0 < 20000UL && total < sizeof(respBuf) - 1) {
+                        if (stream->available()) {
+                            const int n = stream->read(
+                                (uint8_t*)(respBuf + total),
+                                (int)(sizeof(respBuf) - 1 - total)
+                            );
+                            if (n > 0) {
+                                total += (size_t)n;
+                            }
+                        } else if (!http.connected()) {
+                            break;
+                        } else {
+                            handleWebRequests();
+                            yield();
+                            delay(5);
+                        }
+                    }
+                    respBuf[total] = '\0';
+                }
             }
             http.end();
         }
     }
-    
+
     if (code >= 200 && code < 300) {
         logMsg("[HEARTBEAT] OK");
         appendMonitorLog("[HEARTBEAT] OK");
@@ -1110,13 +1460,9 @@ void performHeartbeat() {
 
     if (HEARTBEAT_DEBUG) {
         appendMonitorLogInt("[HEARTBEAT][DBG] HTTP code", code);
-        if (resp.length() > 0) {
-            String r = resp;
-            if (r.length() > 900) r = r.substring(0, 900);
+        if (respBuf[0]) {
             appendMonitorLog("[HEARTBEAT][DBG] Response (trunc):");
-            appendMonitorLog(r.c_str());
-            logMsg("[HEARTBEAT][DBG] Response (trunc):");
-            logMsg(r.c_str());
+            appendMonitorLog(respBuf);
         } else {
             appendMonitorLog("[HEARTBEAT][DBG] Empty response body");
         }
@@ -1128,14 +1474,22 @@ void performHeartbeat() {
     delay(50);
     
     httpsBusy = false;
+    wifiRestoreAfterHttps();
 
-    if (code >= 200 && code < 300 && resp.length() > 0) {
-        applyBackendSimStatusFromJson(resp.c_str());
+    if (code >= 200 && code < 300 && respBuf[0] != '\0') {
+        applyBackendSimStatusFromJson(respBuf);
+#if HEARTBEAT_FOLLOWUP_ENABLED
         pendingHeartbeatFollowup = !charBufIsEmpty(agentBearerToken);
+#else
+        pendingHeartbeatFollowup = false;
+#endif
         pruneExpiredActiveSessions();
         maintenanceOnHeartbeatSuccess();
         if (!pendingHeartbeatFollowup) {
             maintenanceOnSessionsUpdated();
+            if (!isSimBusy()) {
+                flushPendingMissedCallsAfterHeartbeat();
+            }
         }
     } else if (code < 200 || code >= 300) {
         appendMonitorLog("[HEARTBEAT] Keeping local sessions (request failed)");
@@ -1146,6 +1500,8 @@ void performHeartbeat() {
     if (code > 0 && code < 400) {
         deviceRegistered = true;
     }
+
+    lastHeartbeatMs = millis();
 }
 
 // -----------------------------------------------------------------------------
@@ -1167,9 +1523,12 @@ void updateBatteryInfo() {
 
 void checkAndRecoverUnresponsiveSims() {
     if (isSimBusy()) return;
+    // Do not mark SIMs stale while HTTPS blocks polling.
+    if (httpsBusy || isSmsPollingPaused()) return;
     
     unsigned long now = millis();
-    
+    bool attemptedRecoveryThisPass = false;
+
     for (int i = 0; i < SIM_COUNT; i++) {
         // Skip disabled SIMs
         if (!simStates[i].enabled) continue;
@@ -1236,7 +1595,8 @@ void checkAndRecoverUnresponsiveSims() {
             
             setSimBusy(false);
             delay(100);
-            continue;
+            attemptedRecoveryThisPass = true;
+            break;
         }
         
         // Check if SIM has too many consecutive errors or hasn't responded in a while
@@ -1361,6 +1721,13 @@ void checkAndRecoverUnresponsiveSims() {
         
         setSimBusy(false);
         delay(100);  // Small delay between SIMs
+        attemptedRecoveryThisPass = true;
+        break;
+    }
+
+    if (attemptedRecoveryThisPass) {
+        // Keep normal polling alive: only one SIM recovery per watchdog run.
+        return;
     }
 }
 
@@ -1518,9 +1885,14 @@ void getErrorLogText(char* buf, size_t bufSize) {
 
 void clearErrorLog() {
     errorLogCount = 0;
-    // Also delete persistent file
-    if (LittleFS.exists("/errors.log")) {
-        LittleFS.remove("/errors.log");
+    if (g_littlefsReady && lfsFileExists(LFS_ERRORS_PATH)) {
+        remove(LFS_ERRORS_PATH);
+    }
+}
+
+void clearMessagesLog() {
+    if (g_littlefsReady && lfsFileExists(LFS_MESSAGES_PATH)) {
+        remove(LFS_MESSAGES_PATH);
     }
 }
 

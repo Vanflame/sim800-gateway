@@ -417,6 +417,9 @@ bool ussdRunOnSlot(int slot) {
     const unsigned long ussdStartMs = millis();
 
     setSimBusy(true);
+    // Avoid webserver re-entrancy / extra heap churn while modem session is open.
+    // This makes USSD more stable on marginal SIMs.
+    setSimYieldToWebServer(false);
     selectSIM(slot);
     setActiveSimSlot(slot);
 
@@ -444,11 +447,14 @@ bool ussdRunOnSlot(int slot) {
     }
     simStates[slot].ussdLastCheckMs = millis();
     setSimBusy(false);
+    setSimYieldToWebServer(true);
 
     char logDetail[64];
     snprintf(logDetail, sizeof(logDetail), "%s (%us)", summary,
         (unsigned)simStates[slot].ussdLastDurationSec);
-    logMsg2Val("[USSD] SIM", String(slot + 1).c_str(), hasBalance ? "OK" : "FAIL", logDetail);
+    char simNum[8];
+    snprintf(simNum, sizeof(simNum), "%d", slot + 1);
+    logMsg2Val("[USSD] SIM", simNum, hasBalance ? "OK" : "FAIL", logDetail);
 
     return hasBalance;
 
@@ -465,9 +471,10 @@ bool ussdStartManual(int slot) {
     if (!ussdSlotHasNumber(slot)) return false;
     if (bulkActive || manualActive) return false;
 
+    // Clear last result so a stale result from a previous run isn't returned
+    manualLastSlot = -1;
     manualActive = true;
     manualSlot = slot;
-    manualLastSlot = slot;
     simStates[slot].ussdStatus = 3;
     simStates[slot].ussdLastDurationSec = 0;
     charBufClear(simStates[slot].ussdLastResult, sizeof(simStates[slot].ussdLastResult));

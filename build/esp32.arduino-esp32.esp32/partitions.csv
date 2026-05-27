@@ -1,7 +1,16 @@
+# 4MB flash — ~1.9MB per OTA app slot (REQUIRED for this sketch with OTA enabled)
+#
+# Arduino IDE:
+#   Tools → Partition Scheme → "Custom Partition Table"
+#   Tools → Custom Partition CSV → select this file (partitions.csv in sketch folder)
+#
+# Or: Tools → Partition Scheme → "Minimal SPIFFS (1.9MB APP with OTA)"
+#
+# Default "Huge APP" / 1.25MB OTA slots = max 1310720 bytes → sketch too big.
 # Name,   Type, SubType, Offset,  Size, Flags
 nvs,      data, nvs,     0x9000,  0x5000,
 otadata,  data, ota,     0xe000,  0x2000,
-app0,     app,  ota_0,   0x10000, 0x140000,
-app1,     app,  ota_1,   0x150000,0x140000,
-spiffs,   data, spiffs,  0x290000,0x160000,
+app0,     app,  ota_0,   0x10000, 0x1E0000,
+app1,     app,  ota_1,   0x1F0000,0x1E0000,
+spiffs,   data, spiffs,  0x3D0000,0x20000,
 coredump, data, coredump,0x3F0000,0x10000,
