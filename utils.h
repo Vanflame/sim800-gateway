@@ -41,6 +41,15 @@ inline void charBufAppend(char* buf, size_t size, const char* src) {
 // Trim whitespace from both ends (in place)
 void charBufTrim(char* buf);
 
+// Default device_id for new devices: gw-<6 hex digits from chip MAC>, e.g. gw-a4f2b1
+inline void generateDefaultDeviceId(char* out, size_t outSize) {
+    if (!out || outSize < 10) {
+        return;
+    }
+    const uint32_t chipId = (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFUL);
+    snprintf(out, outSize, "gw-%06x", chipId);
+}
+
 // -----------------------------------------------------------------------------
 // Phone Number Normalization (Philippines format)
 // -----------------------------------------------------------------------------

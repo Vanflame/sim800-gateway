@@ -1683,7 +1683,7 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
         </div>
         <div class="form-group">
           <label for="deviceId">Device ID</label>
-          <input id="deviceId" placeholder="SIM800-XXXXXX (auto-generated if empty)" />
+          <input id="deviceId" placeholder="gw-xxxxxx (auto from chip ID if empty)" />
         </div>
         <button class="btn full" id="saveConfigBtn">Save backend settings</button>
       </div>
@@ -3173,7 +3173,7 @@ function updateFirmwareOtaUi(s) {
     installBtn.disabled = true;
     if (note) {
       note.classList.remove('hide');
-      note.textContent = 'Wireless updates need to be enabled first. Please contact support to activate this feature on your device.';
+      note.textContent = 'Wireless install is disabled in this firmware build. Flash via USB, or rebuild with OTA_WEB_INSTALL_ENABLED=1.';
     }
   } else if (note) {
     note.classList.add('hide');
@@ -5107,7 +5107,7 @@ void handleAgentConfig() {
         if (devId.length() > 0) {
             charBufSet(agentDeviceId, sizeof(agentDeviceId), devId.c_str());
         } else if (charBufIsEmpty(agentDeviceId)) {
-            snprintf(agentDeviceId, sizeof(agentDeviceId), "SIM800-%06X", (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF));
+            generateDefaultDeviceId(agentDeviceId, sizeof(agentDeviceId));
         }
     }
     if (server.hasArg("bearer_token")) {
@@ -5784,7 +5784,7 @@ bool registerDeviceWithBackend() {
     }
 
     if (charBufIsEmpty(agentDeviceId)) {
-        snprintf(agentDeviceId, sizeof(agentDeviceId), "SIM800-%06X", (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF));
+        generateDefaultDeviceId(agentDeviceId, sizeof(agentDeviceId));
         preferences.begin("agent", false);
         preferences.putString("dev", agentDeviceId);
         preferences.end();

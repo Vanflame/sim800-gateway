@@ -1256,7 +1256,7 @@ void loadSettings() {
     
     // Generate device ID if not set
     if (charBufIsEmpty(agentDeviceId)) {
-        snprintf(agentDeviceId, sizeof(agentDeviceId), "SIM800-%06X", (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF));
+        generateDefaultDeviceId(agentDeviceId, sizeof(agentDeviceId));
         preferences.begin("agent", false);
         preferences.putString("dev", agentDeviceId);
         preferences.end();
