@@ -69,7 +69,7 @@
 #endif
 // OTA download throughput (larger = faster HTTPS read; needs ~OTA_DL_BUFFER_SIZE free heap)
 #ifndef OTA_DL_BUFFER_SIZE
-#define OTA_DL_BUFFER_SIZE          8192
+#define OTA_DL_BUFFER_SIZE          4096
 #endif
 // 0 = mbedTLS default buffers (most reliable connect). 8192+ can speed download if heap allows.
 #ifndef OTA_TLS_RX_BUFFER_SIZE
