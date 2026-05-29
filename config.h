@@ -47,7 +47,7 @@
 // -----------------------------------------------------------------------------
 // Firmware version (shown in web UI; bump when releasing OTA builds)
 // -----------------------------------------------------------------------------
-#define FIRMWARE_VERSION    "1.0.8"
+#define FIRMWARE_VERSION    "1.0.9"
 
 // -----------------------------------------------------------------------------
 // Over-the-air updates (ESP32 HTTPS OTA from GitHub Releases or custom URL)
@@ -71,11 +71,12 @@
 #ifndef OTA_DL_BUFFER_SIZE
 #define OTA_DL_BUFFER_SIZE          8192
 #endif
+// 0 = mbedTLS default buffers (most reliable connect). 8192+ can speed download if heap allows.
 #ifndef OTA_TLS_RX_BUFFER_SIZE
-#define OTA_TLS_RX_BUFFER_SIZE      16384
+#define OTA_TLS_RX_BUFFER_SIZE      0
 #endif
 #ifndef OTA_TLS_TX_BUFFER_SIZE
-#define OTA_TLS_TX_BUFFER_SIZE      1024
+#define OTA_TLS_TX_BUFFER_SIZE      512
 #endif
 
 // Default partition = 1.25MB app slot → sketch too big for HTTPS OTA. Auto-disable OTA so Verify still works.

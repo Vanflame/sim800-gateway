@@ -289,19 +289,55 @@ static uint8_t otaDlBuffer[OTA_DL_BUFFER_SIZE];
 static const size_t OTA_DL_CHUNK = sizeof(otaDlBuffer);
 static const unsigned long OTA_DL_STALL_MS = 120000;
 
-static void otaBetweenTlsSessions() {
+static void otaCooldownMs(unsigned long ms) {
     WiFi.setSleep(WIFI_PS_NONE);
-    delay(2500);
-    for (int i = 0; i < 25; i++) {
+    const unsigned long until = millis() + ms;
+    while ((long)(until - millis()) > 0) {
         yield();
-        delay(40);
+        delay(10);
     }
     if (WiFi.isConnected()) {
         char buf[40];
         snprintf(buf, sizeof(buf), "[OTA] WiFi RSSI=%d", WiFi.RSSI());
         logMsg(buf);
     } else {
-        logMsg("[OTA] WiFi disconnected before download");
+        logMsg("[OTA] WiFi disconnected");
+    }
+}
+
+static void otaLogDnsForUrl(const char* url) {
+    if (!url || strncmp(url, "https://", 8) != 0) {
+        return;
+    }
+    const char* hostStart = url + 8;
+    const char* pathStart = strchr(hostStart, '/');
+    char host[96];
+    if (pathStart) {
+        const size_t hostLen = (size_t)(pathStart - hostStart);
+        if (hostLen == 0 || hostLen >= sizeof(host)) {
+            return;
+        }
+        memcpy(host, hostStart, hostLen);
+        host[hostLen] = '\0';
+    } else {
+        charBufSet(host, sizeof(host), hostStart);
+    }
+    IPAddress ip;
+    if (WiFi.hostByName(host, ip)) {
+        char buf[80];
+        snprintf(
+            buf,
+            sizeof(buf),
+            "[OTA] DNS %s -> %u.%u.%u.%u",
+            host,
+            (unsigned)ip[0],
+            (unsigned)ip[1],
+            (unsigned)ip[2],
+            (unsigned)ip[3]
+        );
+        logMsg(buf);
+    } else {
+        logMsgVal("[OTA] DNS failed for", host);
     }
 }
 
@@ -339,10 +375,28 @@ static void otaPrepareTlsClient(WiFiClientSecure& client) {
     client.setInsecure();
     client.setTimeout(300000);
 #if defined(ESP32) && defined(ARDUINO_ARCH_ESP32)
-    if (!client.setBufferSizes(OTA_TLS_RX_BUFFER_SIZE, OTA_TLS_TX_BUFFER_SIZE)) {
-        logMsg("[OTA] TLS buffer size unchanged (use default)");
+    if (OTA_TLS_RX_BUFFER_SIZE > 0) {
+        const size_t largest = ESP.getMaxAllocHeap();
+        const size_t need = (size_t)OTA_TLS_RX_BUFFER_SIZE + 24576UL;
+        if (largest >= need &&
+            client.setBufferSizes(OTA_TLS_RX_BUFFER_SIZE, OTA_TLS_TX_BUFFER_SIZE)) {
+            char buf[56];
+            snprintf(buf, sizeof(buf), "[OTA] TLS RX=%d TX=%d", OTA_TLS_RX_BUFFER_SIZE, OTA_TLS_TX_BUFFER_SIZE);
+            logMsg(buf);
+        } else {
+            logMsg("[OTA] TLS default buffers (heap or setBufferSizes declined)");
+        }
     }
 #endif
+}
+
+static void otaConfigureHttpClient(HTTPClient& http) {
+    http.setTimeout(600000);
+    http.setConnectTimeout(45000);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    http.setReuse(false);
+    http.addHeader("Connection", "close");
+    http.setUserAgent("sim800-gateway-ota/1.0");
 }
 
 // Stream download + esp_ota (HTTPUpdate is unreliable on arduino-esp32).
@@ -356,10 +410,6 @@ static bool otaStreamDownloadAndFlash(const char* url, char* errorOut, size_t er
 
     uint8_t* const buff = otaDlBuffer;
 
-    HTTPClient http;
-    WiFiClientSecure client;
-    otaPrepareTlsClient(client);
-
     if (!WiFi.isConnected()) {
         WiFi.setSleep(prevWifiPs);
         if (errorOut && errorOutSize > 0) {
@@ -368,210 +418,131 @@ static bool otaStreamDownloadAndFlash(const char* url, char* errorOut, size_t er
         return false;
     }
 
-    otaBetweenTlsSessions();
-
-    if (!http.begin(client, url)) {
-        WiFi.setSleep(prevWifiPs);
-        if (errorOut && errorOutSize > 0) {
-            snprintf(errorOut, errorOutSize, "HTTP begin failed");
-        }
-        return false;
-    }
-
-    http.setTimeout(600000);
-    http.setConnectTimeout(60000);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    http.setReuse(false);
-    http.addHeader("Connection", "close");
-    http.setUserAgent("sim800-gateway-ota/1.0");
-
+    otaCooldownMs(800);
+    otaLogDnsForUrl(url);
     logMsg("[OTA] HTTP GET (streaming)...");
+
     int code = -1;
-    for (int attempt = 0; attempt < 4 && code != HTTP_CODE_OK; attempt++) {
+
+    for (int attempt = 0; attempt < 4; attempt++) {
         if (attempt > 0) {
             logMsgInt("[OTA] GET retry", attempt + 1);
-            http.end();
-            client.stop();
-            otaBetweenTlsSessions();
-            if (!http.begin(client, url)) {
-                break;
-            }
-            http.setTimeout(600000);
-            http.setConnectTimeout(60000);
-            http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-            http.setReuse(false);
-            http.addHeader("Connection", "close");
-            http.setUserAgent("sim800-gateway-ota/1.0");
+            otaCooldownMs(4000);
         }
+
+        WiFiClientSecure client;
+        HTTPClient http;
+        otaPrepareTlsClient(client);
+        if (!http.begin(client, url)) {
+            logMsg("[OTA] http.begin failed");
+            continue;
+        }
+        otaConfigureHttpClient(http);
+
         logMsg("[OTA] Connecting to firmware URL...");
         code = http.GET();
         if (code != HTTP_CODE_OK) {
             otaLogGetFailure(http, code);
-        }
-    }
-    if (code != HTTP_CODE_OK) {
-        if (errorOut && errorOutSize > 0) {
-            snprintf(errorOut, errorOutSize, "HTTP GET failed (%d)", code);
-        }
-        http.end();
-        client.stop();
-        WiFi.setSleep(prevWifiPs);
-        return false;
-    }
-
-    const int contentLen = http.getSize();
-    if (contentLen <= 0) {
-        if (errorOut && errorOutSize > 0) {
-            snprintf(errorOut, errorOutSize, "Missing Content-Length");
-        }
-        http.end();
-        client.stop();
-        WiFi.setSleep(prevWifiPs);
-        return false;
-    }
-
-    {
-        char buf[96];
-        snprintf(buf, sizeof(buf), "[OTA] Download size=%d bytes", contentLen);
-        logMsg(buf);
-        appendMonitorLog(buf);
-    }
-
-    if ((size_t)contentLen < OTA_MIN_APP_BYTES) {
-        if (errorOut && errorOutSize > 0) {
-            snprintf(
-                errorOut,
-                errorOutSize,
-                "File too small (%d bytes). Wrong .bin?",
-                contentLen
-            );
-        }
-        http.end();
-        client.stop();
-        WiFi.setSleep(prevWifiPs);
-        return false;
-    }
-
-    if (!otaFirmwareFitsUpdateSlot(contentLen, errorOut, errorOutSize)) {
-        http.end();
-        client.stop();
-        WiFi.setSleep(prevWifiPs);
-        return false;
-    }
-
-    const esp_partition_t* part = esp_ota_get_next_update_partition(nullptr);
-    if (!part) {
-        if (errorOut && errorOutSize > 0) {
-            snprintf(errorOut, errorOutSize, "No OTA update partition");
-        }
-        http.end();
-        WiFi.setSleep(prevWifiPs);
-        return false;
-    }
-
-    esp_ota_handle_t ota_handle = 0;
-    esp_err_t ota_err = esp_ota_begin(part, (size_t)contentLen, &ota_handle);
-    if (ota_err != ESP_OK) {
-        if (errorOut && errorOutSize > 0) {
-            snprintf(
-                errorOut,
-                errorOutSize,
-                "esp_ota_begin failed: %s (%d bytes)",
-                esp_err_to_name(ota_err),
-                contentLen
-            );
-        }
-        http.end();
-        WiFi.setSleep(prevWifiPs);
-        return false;
-    }
-
-    WiFiClient* stream = http.getStreamPtr();
-    if (!stream) {
-        esp_ota_abort(ota_handle);
-        http.end();
-        WiFi.setSleep(prevWifiPs);
-        if (errorOut && errorOutSize > 0) {
-            snprintf(errorOut, errorOutSize, "No HTTP stream");
-        }
-        return false;
-    }
-
-    // Magic byte check on first byte of body (preflight uses HEAD only to save one SSL session).
-    uint8_t magic = 0;
-    unsigned long magicWait = millis();
-    while (stream->available() < 1 && http.connected() && (millis() - magicWait) < 30000) {
-        yield();
-    }
-    if (stream->read(&magic, 1) != 1 || magic != ESP_APP_IMAGE_MAGIC) {
-        if (errorOut && errorOutSize > 0) {
-            snprintf(errorOut, errorOutSize, "Bad firmware header (not ESP32 .bin)");
-        }
-        esp_ota_abort(ota_handle);
-        http.end();
-        WiFi.setSleep(prevWifiPs);
-        return false;
-    }
-
-    size_t written = 1;
-    ota_err = esp_ota_write(ota_handle, &magic, 1);
-    if (ota_err != ESP_OK) {
-        if (errorOut && errorOutSize > 0) {
-            snprintf(errorOut, errorOutSize, "esp_ota_write header: %s", esp_err_to_name(ota_err));
-        }
-        esp_ota_abort(ota_handle);
-        http.end();
-        WiFi.setSleep(prevWifiPs);
-        return false;
-    }
-    const unsigned long dlStartMs = millis();
-    unsigned long lastLogMs = dlStartMs;
-    unsigned long lastDataMs = dlStartMs;
-
-    logMsg("[OTA] Downloading (blocking read, 8 KB chunks)...");
-
-    while (written < (size_t)contentLen) {
-        const size_t remaining = (size_t)contentLen - written;
-        size_t want = remaining;
-        if (want > OTA_DL_CHUNK) {
-            want = OTA_DL_CHUNK;
-        }
-
-        const int got = stream->readBytes(buff, want);
-        if (got > 0) {
-            ota_err = esp_ota_write(ota_handle, buff, (size_t)got);
-            if (ota_err != ESP_OK) {
-                if (errorOut && errorOutSize > 0) {
-                    snprintf(
-                        errorOut,
-                        errorOutSize,
-                        "esp_ota_write at %u: %s",
-                        (unsigned)written,
-                        esp_err_to_name(ota_err)
-                    );
-                }
-                esp_ota_abort(ota_handle);
-                http.end();
-                client.stop();
-                WiFi.setSleep(prevWifiPs);
-                return false;
-            }
-            written += (size_t)got;
-            lastDataMs = millis();
-
-            if (millis() - lastLogMs >= 3000) {
-                otaLogDlProgress(written, contentLen, dlStartMs);
-                lastLogMs = millis();
-            }
+            http.end();
+            client.stop();
             continue;
         }
 
-        if (!http.connected()) {
-            break;
+        const int contentLen = http.getSize();
+        if (contentLen <= 0) {
+            logMsg("[OTA] Missing Content-Length, retrying");
+            http.end();
+            client.stop();
+            continue;
         }
-        if (millis() - lastDataMs > OTA_DL_STALL_MS) {
+
+        {
+            char buf[96];
+            snprintf(buf, sizeof(buf), "[OTA] Download size=%d bytes", contentLen);
+            logMsg(buf);
+            appendMonitorLog(buf);
+        }
+
+        if ((size_t)contentLen < OTA_MIN_APP_BYTES) {
             if (errorOut && errorOutSize > 0) {
-                snprintf(errorOut, errorOutSize, "Download stalled");
+                snprintf(
+                    errorOut,
+                    errorOutSize,
+                    "File too small (%d bytes). Wrong .bin?",
+                    contentLen
+                );
+            }
+            http.end();
+            client.stop();
+            WiFi.setSleep(prevWifiPs);
+            return false;
+        }
+
+        if (!otaFirmwareFitsUpdateSlot(contentLen, errorOut, errorOutSize)) {
+            http.end();
+            client.stop();
+            WiFi.setSleep(prevWifiPs);
+            return false;
+        }
+
+        const esp_partition_t* part = esp_ota_get_next_update_partition(nullptr);
+        if (!part) {
+            if (errorOut && errorOutSize > 0) {
+                snprintf(errorOut, errorOutSize, "No OTA update partition");
+            }
+            http.end();
+            WiFi.setSleep(prevWifiPs);
+            return false;
+        }
+
+        esp_ota_handle_t ota_handle = 0;
+        esp_err_t ota_err = esp_ota_begin(part, (size_t)contentLen, &ota_handle);
+        if (ota_err != ESP_OK) {
+            if (errorOut && errorOutSize > 0) {
+                snprintf(
+                    errorOut,
+                    errorOutSize,
+                    "esp_ota_begin failed: %s (%d bytes)",
+                    esp_err_to_name(ota_err),
+                    contentLen
+                );
+            }
+            http.end();
+            client.stop();
+            WiFi.setSleep(prevWifiPs);
+            return false;
+        }
+
+        WiFiClient* stream = http.getStreamPtr();
+        if (!stream) {
+            esp_ota_abort(ota_handle);
+            http.end();
+            client.stop();
+            WiFi.setSleep(prevWifiPs);
+            if (errorOut && errorOutSize > 0) {
+                snprintf(errorOut, errorOutSize, "No HTTP stream");
+            }
+            return false;
+        }
+
+        uint8_t magic = 0;
+        unsigned long magicWait = millis();
+        while (stream->available() < 1 && http.connected() && (millis() - magicWait) < 30000) {
+            yield();
+        }
+        if (stream->read(&magic, 1) != 1 || magic != ESP_APP_IMAGE_MAGIC) {
+            logMsg("[OTA] Bad firmware header, retrying");
+            esp_ota_abort(ota_handle);
+            http.end();
+            client.stop();
+            continue;
+        }
+
+        size_t written = 1;
+        ota_err = esp_ota_write(ota_handle, &magic, 1);
+        if (ota_err != ESP_OK) {
+            if (errorOut && errorOutSize > 0) {
+                snprintf(errorOut, errorOutSize, "esp_ota_write header: %s", esp_err_to_name(ota_err));
             }
             esp_ota_abort(ota_handle);
             http.end();
@@ -579,52 +550,109 @@ static bool otaStreamDownloadAndFlash(const char* url, char* errorOut, size_t er
             WiFi.setSleep(prevWifiPs);
             return false;
         }
-        delay(1);
-        yield();
+        const unsigned long dlStartMs = millis();
+        unsigned long lastLogMs = dlStartMs;
+        unsigned long lastDataMs = dlStartMs;
+
+        logMsg("[OTA] Downloading (blocking read, 8 KB chunks)...");
+
+        while (written < (size_t)contentLen) {
+            const size_t remaining = (size_t)contentLen - written;
+            size_t want = remaining;
+            if (want > OTA_DL_CHUNK) {
+                want = OTA_DL_CHUNK;
+            }
+
+            const int got = stream->readBytes(buff, want);
+            if (got > 0) {
+                ota_err = esp_ota_write(ota_handle, buff, (size_t)got);
+                if (ota_err != ESP_OK) {
+                    if (errorOut && errorOutSize > 0) {
+                        snprintf(
+                            errorOut,
+                            errorOutSize,
+                            "esp_ota_write at %u: %s",
+                            (unsigned)written,
+                            esp_err_to_name(ota_err)
+                        );
+                    }
+                    esp_ota_abort(ota_handle);
+                    http.end();
+                    client.stop();
+                    WiFi.setSleep(prevWifiPs);
+                    return false;
+                }
+                written += (size_t)got;
+                lastDataMs = millis();
+
+                if (millis() - lastLogMs >= 3000) {
+                    otaLogDlProgress(written, contentLen, dlStartMs);
+                    lastLogMs = millis();
+                }
+                continue;
+            }
+
+            if (!http.connected()) {
+                break;
+            }
+            if (millis() - lastDataMs > OTA_DL_STALL_MS) {
+                if (errorOut && errorOutSize > 0) {
+                    snprintf(errorOut, errorOutSize, "Download stalled");
+                }
+                esp_ota_abort(ota_handle);
+                http.end();
+                client.stop();
+                WiFi.setSleep(prevWifiPs);
+                return false;
+            }
+            delay(1);
+            yield();
+        }
+
+        http.end();
+        client.stop();
+
+        if (written != (size_t)contentLen) {
+            logMsg("[OTA] Incomplete download, retrying");
+            esp_ota_abort(ota_handle);
+            continue;
+        }
+
+        otaLogDlProgress(written, contentLen, dlStartMs);
+        logMsg("[OTA] Verifying flash...");
+        appendMonitorLog("[OTA] Download complete, verifying...");
+
+        ota_err = esp_ota_end(ota_handle);
+        if (ota_err != ESP_OK) {
+            if (errorOut && errorOutSize > 0) {
+                snprintf(errorOut, errorOutSize, "esp_ota_end: %s", esp_err_to_name(ota_err));
+            }
+            WiFi.setSleep(prevWifiPs);
+            return false;
+        }
+
+        ota_err = esp_ota_set_boot_partition(part);
+        if (ota_err != ESP_OK) {
+            if (errorOut && errorOutSize > 0) {
+                snprintf(errorOut, errorOutSize, "esp_ota_set_boot: %s", esp_err_to_name(ota_err));
+            }
+            WiFi.setSleep(prevWifiPs);
+            return false;
+        }
+
+        WiFi.setSleep(prevWifiPs);
+        logMsg("[OTA] Flash OK, rebooting");
+        appendMonitorLog("[OTA] Flash OK, rebooting");
+        delay(500);
+        ESP.restart();
+        return true;
     }
 
-    http.end();
+    if (errorOut && errorOutSize > 0) {
+        snprintf(errorOut, errorOutSize, "HTTP GET failed (%d)", code);
+    }
     WiFi.setSleep(prevWifiPs);
-
-    if (written != (size_t)contentLen) {
-        if (errorOut && errorOutSize > 0) {
-            snprintf(
-                errorOut,
-                errorOutSize,
-                "Incomplete download %u / %d",
-                (unsigned)written,
-                contentLen
-            );
-        }
-        esp_ota_abort(ota_handle);
-        return false;
-    }
-
-    otaLogDlProgress(written, contentLen, dlStartMs);
-    logMsg("[OTA] Verifying flash...");
-    appendMonitorLog("[OTA] Download complete, verifying...");
-
-    ota_err = esp_ota_end(ota_handle);
-    if (ota_err != ESP_OK) {
-        if (errorOut && errorOutSize > 0) {
-            snprintf(errorOut, errorOutSize, "esp_ota_end: %s", esp_err_to_name(ota_err));
-        }
-        return false;
-    }
-
-    ota_err = esp_ota_set_boot_partition(part);
-    if (ota_err != ESP_OK) {
-        if (errorOut && errorOutSize > 0) {
-            snprintf(errorOut, errorOutSize, "esp_ota_set_boot: %s", esp_err_to_name(ota_err));
-        }
-        return false;
-    }
-
-    logMsg("[OTA] Flash OK, rebooting");
-    appendMonitorLog("[OTA] Flash OK, rebooting");
-    delay(500);
-    ESP.restart();
-    return true;
+    return false;
 }
 #endif
 
@@ -861,7 +889,7 @@ bool otaPerformUpdate(const char* url, char* errorOut, size_t errorOutSize) {
         }
         return false;
     }
-    otaBetweenTlsSessions();
+    otaCooldownMs(800);
 #else
     logMsg("[OTA] Single HTTPS GET (no HEAD preflight)");
 #endif
