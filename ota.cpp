@@ -284,10 +284,10 @@ static bool otaFirmwareFitsUpdateSlot(int firmwareBytes, char* errorOut, size_t 
 #endif
 
 #if OTA_ENABLED
-// Fixed BSS buffer: malloc after TLS+esp_ota_begin often fails; 16 KB static overflowed DRAM.
-static uint8_t otaDlBuffer[4096];
+// Fixed BSS buffer — use readBytes() to fill each chunk (faster than polling available()).
+static uint8_t otaDlBuffer[OTA_DL_BUFFER_SIZE];
 static const size_t OTA_DL_CHUNK = sizeof(otaDlBuffer);
-static const unsigned long OTA_DL_STALL_MS = 90000;
+static const unsigned long OTA_DL_STALL_MS = 120000;
 
 static void otaBetweenTlsSessions() {
     WiFi.setSleep(WIFI_PS_NONE);
@@ -315,9 +315,11 @@ static void otaLogGetFailure(HTTPClient& http, int code) {
 }
 
 static void otaLogDlProgress(size_t written, int contentLen, unsigned long dlStartMs) {
-    const unsigned long elapsedSec = (millis() - dlStartMs) / 1000UL;
-    const unsigned kbps =
-        (elapsedSec > 0) ? (unsigned)((written / 1024UL) / elapsedSec) : 0UL;
+    const unsigned long elapsedMs = millis() - dlStartMs;
+    unsigned kbPerSec = 0;
+    if (elapsedMs >= 200UL) {
+        kbPerSec = (unsigned)((written * 1000UL) / elapsedMs / 1024UL);
+    }
     const unsigned pct =
         (contentLen > 0) ? (unsigned)((written * 100UL) / (size_t)contentLen) : 0UL;
     char pbuf[96];
@@ -328,9 +330,19 @@ static void otaLogDlProgress(size_t written, int contentLen, unsigned long dlSta
         (unsigned)written,
         contentLen,
         pct,
-        kbps
+        kbPerSec
     );
     logMsg(pbuf);
+}
+
+static void otaPrepareTlsClient(WiFiClientSecure& client) {
+    client.setInsecure();
+    client.setTimeout(300000);
+#if defined(ESP32) && defined(ARDUINO_ARCH_ESP32)
+    if (!client.setBufferSizes(OTA_TLS_RX_BUFFER_SIZE, OTA_TLS_TX_BUFFER_SIZE)) {
+        logMsg("[OTA] TLS buffer size unchanged (use default)");
+    }
+#endif
 }
 
 // Stream download + esp_ota (HTTPUpdate is unreliable on arduino-esp32).
@@ -346,8 +358,7 @@ static bool otaStreamDownloadAndFlash(const char* url, char* errorOut, size_t er
 
     HTTPClient http;
     WiFiClientSecure client;
-    client.setInsecure();
-    client.setTimeout(90000);
+    otaPrepareTlsClient(client);
 
     if (!WiFi.isConnected()) {
         WiFi.setSleep(prevWifiPs);
@@ -517,39 +528,17 @@ static bool otaStreamDownloadAndFlash(const char* url, char* errorOut, size_t er
     unsigned long lastLogMs = dlStartMs;
     unsigned long lastDataMs = dlStartMs;
 
+    logMsg("[OTA] Downloading (blocking read, 8 KB chunks)...");
+
     while (written < (size_t)contentLen) {
-        size_t avail = stream->available();
-        if (avail == 0) {
-            if (!http.connected()) {
-                break;
-            }
-            if (millis() - lastDataMs > OTA_DL_STALL_MS) {
-                if (errorOut && errorOutSize > 0) {
-                    snprintf(errorOut, errorOutSize, "Download stalled");
-                }
-                esp_ota_abort(ota_handle);
-                http.end();
-                WiFi.setSleep(prevWifiPs);
-                return false;
-            }
-            yield();
-            continue;
+        const size_t remaining = (size_t)contentLen - written;
+        size_t want = remaining;
+        if (want > OTA_DL_CHUNK) {
+            want = OTA_DL_CHUNK;
         }
 
-        // Drain everything already received from TLS (do not readBytes() wait for full 8 KB).
-        while (avail > 0 && written < (size_t)contentLen) {
-            const size_t remaining = (size_t)contentLen - written;
-            size_t chunk = avail;
-            if (chunk > OTA_DL_CHUNK) {
-                chunk = OTA_DL_CHUNK;
-            }
-            if (chunk > remaining) {
-                chunk = remaining;
-            }
-            const int got = stream->read(buff, chunk);
-            if (got <= 0) {
-                break;
-            }
+        const int got = stream->readBytes(buff, want);
+        if (got > 0) {
             ota_err = esp_ota_write(ota_handle, buff, (size_t)got);
             if (ota_err != ESP_OK) {
                 if (errorOut && errorOutSize > 0) {
@@ -563,18 +552,35 @@ static bool otaStreamDownloadAndFlash(const char* url, char* errorOut, size_t er
                 }
                 esp_ota_abort(ota_handle);
                 http.end();
+                client.stop();
                 WiFi.setSleep(prevWifiPs);
                 return false;
             }
             written += (size_t)got;
             lastDataMs = millis();
-            avail = stream->available();
 
-            if (millis() - lastLogMs >= 5000) {
+            if (millis() - lastLogMs >= 3000) {
                 otaLogDlProgress(written, contentLen, dlStartMs);
                 lastLogMs = millis();
             }
+            continue;
         }
+
+        if (!http.connected()) {
+            break;
+        }
+        if (millis() - lastDataMs > OTA_DL_STALL_MS) {
+            if (errorOut && errorOutSize > 0) {
+                snprintf(errorOut, errorOutSize, "Download stalled");
+            }
+            esp_ota_abort(ota_handle);
+            http.end();
+            client.stop();
+            WiFi.setSleep(prevWifiPs);
+            return false;
+        }
+        delay(1);
+        yield();
     }
 
     http.end();

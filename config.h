@@ -47,7 +47,7 @@
 // -----------------------------------------------------------------------------
 // Firmware version (shown in web UI; bump when releasing OTA builds)
 // -----------------------------------------------------------------------------
-#define FIRMWARE_VERSION    "1.0.7"
+#define FIRMWARE_VERSION    "1.0.8"
 
 // -----------------------------------------------------------------------------
 // Over-the-air updates (ESP32 HTTPS OTA from GitHub Releases or custom URL)
@@ -66,6 +66,16 @@
 // Allow POST /firmware-update from the device web UI. Off = no wireless install (USB flash only).
 #ifndef OTA_WEB_INSTALL_ENABLED
 #define OTA_WEB_INSTALL_ENABLED  1
+#endif
+// OTA download throughput (larger = faster HTTPS read; needs ~OTA_DL_BUFFER_SIZE free heap)
+#ifndef OTA_DL_BUFFER_SIZE
+#define OTA_DL_BUFFER_SIZE          8192
+#endif
+#ifndef OTA_TLS_RX_BUFFER_SIZE
+#define OTA_TLS_RX_BUFFER_SIZE      16384
+#endif
+#ifndef OTA_TLS_TX_BUFFER_SIZE
+#define OTA_TLS_TX_BUFFER_SIZE      1024
 #endif
 
 // Default partition = 1.25MB app slot → sketch too big for HTTPS OTA. Auto-disable OTA so Verify still works.
