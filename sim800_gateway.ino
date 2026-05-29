@@ -22,6 +22,7 @@
 #include "calls.h"
 #include "ussd.h"
 #include "maintenance.h"
+#include "status_led.h"
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -741,7 +742,8 @@ void setup() {
     Serial.println("========================================");
 
     appendMonitorLog("[BOOT] Starting...");
-    
+    statusLedInit();
+
     // Logger is header-only (no init function)
     for (int i = 0; i < SIM_COUNT; i++) {
         simStates[i].enabled = true;
@@ -802,6 +804,7 @@ void setup() {
     logMsg("========================================");
 
     appendMonitorLog("[BOOT] Ready — press Run in web UI to init SIM800");
+    statusLedSetBootComplete();
 }
 
 static void fetchHeartbeatFollowup();
@@ -1025,6 +1028,7 @@ static void logHeapIfLow() {
 void loop() {
     // Handle web requests (must be called frequently)
     handleWebRequests();
+    statusLedTick();
     runBusyWatchdog();
     logHeapIfLow();
 
@@ -1036,6 +1040,7 @@ void loop() {
             lastOtaPauseLogMs = nowMs;
             logMsg("[OTA] SMS/heartbeat paused for firmware download");
         }
+        statusLedTick();
         yield();
         return;
     }
@@ -1570,51 +1575,6 @@ static void hbHttpEnd() {
     gHbHttp.end();
     gHbTls.stop();
     gHbPlain.stop();
-}
-
-void agentHttpsReleaseClient() {
-    hbHttpEnd();
-    delay(200);
-    yield();
-}
-
-bool agentHttpsBeginGet(const char* url, int connectTimeoutMs, int readTimeoutMs) {
-    if (!url || !url[0]) {
-        return false;
-    }
-    hbHttpEnd();
-    delay(50);
-    if (!hbHttpBegin(url, readTimeoutMs)) {
-        return false;
-    }
-    gHbHttp.setTimeout(readTimeoutMs);
-    gHbHttp.setConnectTimeout(connectTimeoutMs);
-    gHbHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    gHbHttp.setReuse(false);
-    gHbHttp.addHeader("Connection", "close");
-    gHbHttp.setUserAgent("sim800-gateway-ota/1.0");
-    return true;
-}
-
-int agentHttpsHead() {
-    return gHbHttp.sendRequest("HEAD");
-}
-
-int agentHttpsGet() {
-    return gHbHttp.GET();
-}
-
-int agentHttpsGetContentLength() {
-    return gHbHttp.getSize();
-}
-
-Stream* agentHttpsGetStream() {
-    return gHbHttp.getStreamPtr();
-}
-
-void agentHttpsEndSession() {
-    hbHttpEnd();
-    markHttpsSessionEnded();
 }
 
 int agentHttpsPostJson(const char* url, const char* jsonBody, int timeoutMs, bool addAuth,

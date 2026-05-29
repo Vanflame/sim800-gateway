@@ -67,16 +67,28 @@
 #ifndef OTA_WEB_INSTALL_ENABLED
 #define OTA_WEB_INSTALL_ENABLED  1
 #endif
-// OTA download throughput (larger = faster HTTPS read; needs ~OTA_DL_BUFFER_SIZE free heap)
+// Static BSS read chunk (4096 = reliable link). Optional larger heap buf after GET connects.
 #ifndef OTA_DL_BUFFER_SIZE
 #define OTA_DL_BUFFER_SIZE          4096
 #endif
-// 0 = mbedTLS default buffers (most reliable connect). 8192+ can speed download if heap allows.
-#ifndef OTA_TLS_RX_BUFFER_SIZE
-#define OTA_TLS_RX_BUFFER_SIZE      0
+#ifndef OTA_DL_BUFFER_HEAP_MAX
+#define OTA_DL_BUFFER_HEAP_MAX      8192
 #endif
-#ifndef OTA_TLS_TX_BUFFER_SIZE
-#define OTA_TLS_TX_BUFFER_SIZE      512
+#ifndef OTA_DL_STALL_MS
+#define OTA_DL_STALL_MS             180000UL
+#endif
+#ifndef OTA_STOP_MODEM_FOR_DOWNLOAD
+#define OTA_STOP_MODEM_FOR_DOWNLOAD 0
+#endif
+#ifndef STATUS_LED_ENABLED
+#define STATUS_LED_ENABLED          1
+#endif
+#ifndef STATUS_LED_PIN
+#define STATUS_LED_PIN              2
+#endif
+// 1 = most ESP32 boards: LOW=ON, HIGH=OFF. Flip to 0 if inverted on your module.
+#ifndef STATUS_LED_ACTIVE_LOW
+#define STATUS_LED_ACTIVE_LOW       0
 #endif
 
 // Default partition = 1.25MB app slot → sketch too big for HTTPS OTA. Auto-disable OTA so Verify still works.
@@ -345,16 +357,9 @@ inline bool cloudBackendDeferred() { return millis() < heartbeatNotBeforeMs; }
 void wifiPrepareForHttps();
 bool ensureWifiForHttps();
 void wifiRecoverAfterHttps();
-// Single shared TLS client (gHbHttp) — use for SMS, ping, maintenance, and OTA to avoid -1 / low heap.
+// Single shared TLS client (gHbHttp) — use for SMS, ping, maintenance to avoid -1 after ping.
 int agentHttpsPostJson(const char* url, const char* jsonBody, int timeoutMs, bool addAuth,
     char* respOut, size_t respOutSize, const char* opLabel = nullptr);
-void agentHttpsReleaseClient();
-bool agentHttpsBeginGet(const char* url, int connectTimeoutMs, int readTimeoutMs);
-int agentHttpsHead();
-int agentHttpsGet();
-int agentHttpsGetContentLength();
-Stream* agentHttpsGetStream();
-void agentHttpsEndSession();
 unsigned long getLastSmsPollActivityMs();
 extern unsigned long lastHttpsEndMs;
 void markHttpsSessionEnded();

@@ -155,8 +155,8 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
       border-bottom: 1px solid var(--border);
       display: flex;
       align-items: center;
-      position: relative;
-    }
+        position: relative;
+      }
     
     .sidebar-nav {
       flex: 1;
@@ -1167,7 +1167,7 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
     .msg-count { font-size: 12px; color: var(--muted); white-space: nowrap; }
 
     .sms-list { display: flex; flex-direction: column; gap: 1px; }
-
+    
     .sms-item {
       display: flex;
       align-items: flex-start;
@@ -1354,19 +1354,19 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
     <!-- Main Content -->
     <main class="main-content" id="mainContent">
       <!-- Mobile Header -->
-      <header class="mobile-header">
-        <button class="menu-btn" onclick="toggleSidebar()">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
-        </button>
-        <div class="logo">
-          <div class="logo-icon" style="width:28px;height:28px;font-size:14px;">OT</div>
-          <span style="font-weight:600;">OTPocket Agent</span>
-        </div>
+    <header class="mobile-header">
+      <button class="menu-btn" onclick="toggleSidebar()">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="24" height="24"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <div class="logo">
+        <div class="logo-icon" style="width:28px;height:28px;font-size:14px;">OT</div>
+        <span style="font-weight:600;">OTPocket Agent</span>
+      </div>
         <div class="header-status" style="display:flex;align-items:center;gap:8px;">
           <span class="badge warning hide" id="offlineModeBadge" style="font-size:11px;">Offline</span>
-          <div class="status-dot" id="statusDot"></div>
-        </div>
-      </header>
+        <div class="status-dot" id="statusDot"></div>
+      </div>
+    </header>
       <!-- Mobile restart strip (shown below header when restart is pending) -->
       <div class="mobile-restart-strip" id="mobileRestartStrip">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
@@ -1409,12 +1409,12 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
           </div>
           <button class="btn full" id="loginBtn" style="margin-top:8px;">Sign In</button>
         </form>
-
+        
         <div id="loginGraceBanner" class="hide" style="margin-top:12px;padding:12px;border-radius:8px;background:rgba(34,197,94,0.12);border:1px solid rgba(34,197,94,0.25);">
           <p style="font-size:13px;color:var(--success);margin:0 0 6px 0;" id="loginGraceText">Signed in — WiFi details stay visible below.</p>
           <button type="button" class="btn sm secondary" id="loginGraceContinueBtn">Open dashboard now</button>
-        </div>
-        
+      </div>
+      
         <div class="card" id="loginModemRunCard" style="margin-top:12px;">
           <div class="card-header" style="border-bottom:1px solid var(--border);padding-bottom:10px;margin-bottom:12px;">
             <div class="card-title" style="font-size:14px;">SIM800 gateway</div>
@@ -1427,8 +1427,8 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
         <div class="card" style="margin-top:12px;">
           <div class="card-header" style="border-bottom:1px solid var(--border);padding-bottom:10px;margin-bottom:12px;">
             <div class="card-title" style="font-size:14px;">WiFi Setup (AP mode)</div>
-            <span class="badge danger" id="loginWifiBadge">Disconnected</span>
-          </div>
+          <span class="badge danger" id="loginWifiBadge">Disconnected</span>
+        </div>
           <p class="muted text-sm" style="margin-bottom:10px;">
             Not connected yet? Configure WiFi here so the gateway can go online.
           </p>
@@ -1461,18 +1461,18 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
         <h1 class="page-title">SIM Slots</h1>
         <p class="page-subtitle">Manage your SIM cards</p>
       </div>
-
+      
       <div class="card ussd-bulk-panel" id="ussdBulkPanel">
         <div class="ussd-bulk-head" id="ussdBulkHead" onclick="toggleUssdBulkPanel()">
           <h4>*143# bulk results</h4>
           <span id="ussdBulkSummary" class="muted text-sm"></span>
           <span id="ussdBulkChevron">▼</span>
-        </div>
+          </div>
         <div id="ussdBulkCollapse" class="ussd-bulk-collapse">
           <div id="ussdBulkBody" class="muted text-sm" style="padding:0 16px 14px;">*143# All: slots with a number only (Off OK).</div>
         </div>
       </div>
-
+      
       <div class="card" id="modemRunCard" style="margin-bottom:12px;">
         <div class="card-header" style="border-bottom:1px solid var(--border);padding-bottom:10px;margin-bottom:12px;">
           <div>
@@ -1483,8 +1483,8 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
         </div>
         <button type="button" class="btn full" id="modemRunBtn">Run — init SIM slots &amp; start polling</button>
         <button type="button" class="btn secondary full hide" id="modemStopBtn" style="margin-top:8px;">Stop modem tasks</button>
-      </div>
-
+        </div>
+        
       <div class="card sim-slots-card">
         <div class="sim-toolbar">
           <span class="sim-stat-pill" id="simCountPill">
@@ -1496,11 +1496,11 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
               <span class="action-group-label">Slots</span>
               <button class="btn sm secondary" id="checkAllBtn" title="Re-scan signal, registration, and numbers for every slot">Refresh slots</button>
               <button class="btn sm danger" id="disableAllSimsBtn" title="Turn off every SIM slot">Disable all</button>
-            </div>
+        </div>
             <div class="action-group">
               <span class="action-group-label">Balance</span>
               <button class="btn sm secondary" id="ussdBulkBtn" title="Dial *143# on each slot that has a number">*143# all</button>
-            </div>
+      </div>
           </div>
         </div>
         <div class="sim-grid" id="simGrid"></div>
@@ -1524,22 +1524,22 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
       <div class="page-header">
         <h1 class="page-title">Messages</h1>
       </div>
-
+      
       <div class="msg-toolbar">
         <div class="msg-search-wrap">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
           <input id="smsSearch" type="search" placeholder="Search messages or senders…" oninput="filterMessages()" autocomplete="off" />
         </div>
         <span class="msg-count" id="smsCount">—</span>
-        <button class="btn xs secondary" id="refreshSmsBtn">Refresh</button>
+          <button class="btn xs secondary" id="refreshSmsBtn">Refresh</button>
         <button class="btn xs danger" id="clearSmsBtn">Clear all</button>
-      </div>
-
-      <div class="sms-list" id="smsList">
-        <div class="empty-state">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
-          <p>No messages yet</p>
         </div>
+
+        <div class="sms-list" id="smsList">
+          <div class="empty-state">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+            <p>No messages yet</p>
+          </div>
       </div>
     </div>
     
@@ -1595,13 +1595,13 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
         </div>
       </div>
     </div>
-
+    
     <!-- Settings Tab -->
     <div class="tab-content" id="tab-settings">
       <div class="page-header">
         <h1 class="page-title">Settings</h1>
       </div>
-
+      
       <div class="card" id="wifiCard">
         <div class="card-header">
           <div class="card-title">WiFi</div>
@@ -1666,8 +1666,8 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
       <div class="card settings-card">
         <div class="card-header">
           <div>
-            <div class="card-title">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+          <div class="card-title">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
               Backend
             </div>
           </div>
@@ -1687,7 +1687,7 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
         </div>
         <button class="btn full" id="saveConfigBtn">Save backend settings</button>
       </div>
-
+      
       <div class="card settings-card">
         <div class="card-header">
           <div>
@@ -1695,7 +1695,7 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
               Gateway services
             </div>
-          </div>
+        </div>
         </div>
 
         <div class="settings-row">
@@ -1805,10 +1805,10 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
       
       <div class="card">
         <div class="log-panel-header">
-          <div class="log-tabs">
+        <div class="log-tabs">
             <button type="button" class="log-tab active" id="logTabLive" onclick="switchLogTab('live')">Activity<span class="log-tab-badge" id="monitorCount">0</span></button>
             <button type="button" class="log-tab" id="logTabErrors" onclick="switchLogTab('errors')">Errors<span class="log-tab-badge" id="errorLogCount">0</span></button>
-          </div>
+        </div>
         </div>
         <div class="log-viewport" id="monitor"><div class="log-empty">Loading…</div></div>
         <div class="log-viewport hide" id="errorLog"><div class="log-empty">No errors recorded</div></div>
@@ -2050,10 +2050,10 @@ function switchLogTab(tab) {
   const errTab = $('logTabErrors');
   if (liveTab) liveTab.classList.toggle('active', tab === 'live');
   if (errTab) errTab.classList.toggle('active', tab === 'errors');
-
+  
   const monitor = $('monitor');
   const errorLog = $('errorLog');
-
+  
   if (tab === 'live') {
     if (monitor) monitor.classList.remove('hide');
     if (errorLog) errorLog.classList.add('hide');
@@ -2072,7 +2072,7 @@ async function get(path, timeoutMs) {
   try {
     const r = await fetch(path, {cache:'no-store', signal: ctrl.signal});
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.json();
+  return r.json();
   } finally {
     clearTimeout(timer);
   }
@@ -2251,7 +2251,7 @@ async function refreshStatus() {
     if (window.ussdManualBusy || window.ussdPendingSlot != null || window.ussdBulkPolling) {
       updateSimCardTimers();
     } else {
-      refreshSims();
+    refreshSims();
     }
 
   } catch(e) {
@@ -2366,8 +2366,8 @@ function startSessionsCountdown() {
         if (sess.expiresIn > 0) sess.expiresIn--;
       });
       window.activeSessionsData = sessions.filter(sess => sess.expiresIn > 0);
-      updateSessionsDisplay();
-      updateSimCardTimers();
+    updateSessionsDisplay();
+    updateSimCardTimers();
     }
   }, 1000);
 }
@@ -2630,8 +2630,8 @@ function setUssdBulkRunningUi(st) {
 }
 
 async function refreshSims() {
-  const grid = $('simGrid');
-  if (!grid) return;
+    const grid = $('simGrid');
+    if (!grid) return;
   try {
     const s = await get('/sim-config');
     if (!s || s.success === false) {
@@ -2668,11 +2668,11 @@ async function refreshSims() {
         if (csqMatch) rssi = parseInt(csqMatch[1]);
       }
       if (rssi != null) {
-        if (rssi === 99) bars = 0;
-        else if (rssi >= 20) bars = 4;
-        else if (rssi >= 15) bars = 3;
-        else if (rssi >= 10) bars = 2;
-        else if (rssi >= 5) bars = 1;
+          if (rssi === 99) bars = 0;
+          else if (rssi >= 20) bars = 4;
+          else if (rssi >= 15) bars = 3;
+          else if (rssi >= 10) bars = 2;
+          else if (rssi >= 5) bars = 1;
       }
 
       let network = '-';
@@ -3111,7 +3111,7 @@ async function toggleMissedCallForward() {
       st.missed_call_forward = r.enabled;
       updateGatewayServicesUi(st);
       toast(r.message || (r.enabled ? 'Missed-call forwarding enabled' : 'Missed-call forwarding disabled'));
-    } else {
+      } else {
       toast(r.error || 'Failed');
     }
   } catch (e) {
@@ -3158,7 +3158,7 @@ function applyFirmwareUiState(opts) {
     setStatusPill(pill, 'on', 'Up to date');
     if (statusLine) statusLine.textContent = 'Your device is running the latest software.';
     if (installBtn) installBtn.disabled = true;
-  } else {
+    } else {
     setStatusPill(pill, 'on', 'Up to date');
     if (statusLine) statusLine.textContent = 'Your device is running the latest software.';
     if (installBtn) installBtn.disabled = true;
@@ -3194,7 +3194,7 @@ function updateFirmwareCard(s) {
         restartText.textContent = sec === 0
           ? 'Restart due now — will happen automatically when safe.'
           : 'Device restarts in ' + formatRestartCountdown(sec) + '.';
-      } else {
+  } else {
         restartText.textContent = 'A restart has been scheduled.';
       }
     } else {
@@ -3337,7 +3337,7 @@ let ussdManualPollTimer = null;
 async function checkUssdSlot(idx) {
   if (window.ussdManualBusy) {
     toast('*143# check already running');
-    return;
+      return;
   }
   window.ussdManualBusy = true;
   window.ussdPendingSlot = idx;
@@ -3424,9 +3424,9 @@ function renderUssdBulkResults(data) {
 
   if (!data.results || data.results.length === 0) {
     body.innerHTML = '<span class="muted">No results.</span>';
-    return;
-  }
-
+      return;
+    }
+    
   const okList = data.results.filter(x => x.ok);
   const failList = data.results.filter(x => !x.ok);
 
@@ -3507,10 +3507,10 @@ async function toggleSim(idx) {
   const s = await get('/sim-config');
   const newEnabled = !s.enabled[idx];
   const r = await post('/sim-enable', { slot: idx, enabled: newEnabled ? 1 : 0 });
-  if (r.success) {
+    if (r.success) {
     toast('SIM ' + (idx + 1) + ' ' + (newEnabled ? 'enabled' : 'disabled'));
-    await refreshSims();
-  } else {
+      await refreshSims();
+    } else {
     toast('Failed: ' + (r.error || 'Unknown error'));
   }
 }
@@ -3615,7 +3615,7 @@ async function doLogin() {
     toast('Enter email and password');
     return;
   }
-
+  
   const now = Date.now();
   if (now < loginClientCooldownUntil) {
     const msg = 'Too many attempts — wait 1 minute before login again';
@@ -3644,8 +3644,8 @@ async function doLogin() {
       showLoginError('');
       toast('Signed in successfully');
       setTimeout(() => {
-        refreshStatus();
-        checkAuthStatus();
+      refreshStatus();
+      checkAuthStatus();
       }, 600);
     } else {
       const msg = r.error || 'Login failed';
@@ -3759,7 +3759,7 @@ async function checkAuthStatus() {
     $('authSignedOutView')?.classList.toggle('hide', hasToken);
     $('authSignedInView')?.classList.toggle('hide', !hasToken);
 
-    const authBadge = $('authBadge');
+      const authBadge = $('authBadge');
     const accountModeBadge = $('accountModeBadge');
     if (hasToken) {
       if (authBadge) { authBadge.className = 'badge success'; authBadge.textContent = 'Online'; }
@@ -3781,9 +3781,9 @@ async function checkAuthStatus() {
     updateGatewayServicesUi(s);
     updateScheduledRestartNav(s);
 
-    try {
-      const simConfig = await get('/sim-config');
-      const regCount = simConfig.backend_registered ? simConfig.backend_registered.filter(Boolean).length : 0;
+      try {
+        const simConfig = await get('/sim-config');
+        const regCount = simConfig.backend_registered ? simConfig.backend_registered.filter(Boolean).length : 0;
       const regText = regCount + ' / ' + simConfig.enabled.length;
       if ($('simsRegCount')) $('simsRegCount').textContent = regText;
       if ($('accountSimsRegCount')) $('accountSimsRegCount').textContent = regText;
@@ -4298,7 +4298,7 @@ void handleSaveWifi() {
     armWifiUserSetupMs(45000);
     WiFi.setAutoReconnect(false);
     ensureGatewaySoftAp();
-
+    
     logMsg2Val("[WIFI] Saved", wifiSsid, "connecting", "...");
     appendMonitorLogVal("[WIFI] Connect ", wifiSsid);
     sendJsonSuccess("WiFi saved, connecting...");
@@ -4498,7 +4498,7 @@ void buildSimConfigJson(char* buf, size_t bufSize) {
         snprintf(buf, bufSize, "{\"success\":false,\"error\":\"JSON buffer full\"}");
         return;
     }
-
+    
     for (int i = 0; i < SIM_COUNT; i++) {
         if (!jsonAppendFmt(buf, bufSize, &pos, "%s%s",
                 i > 0 ? "," : "", simStates[i].enabled ? "true" : "false")) {
@@ -4546,7 +4546,7 @@ void buildSimConfigJson(char* buf, size_t bufSize) {
             goto json_fail;
         }
     }
-
+    
     if (!jsonAppendFmt(buf, bufSize, &pos, "],\"operators\":[")) goto json_fail;
     for (int i = 0; i < SIM_COUNT; i++) {
         char op[24];
@@ -5096,10 +5096,10 @@ void handleSendSms() {
 
 void handleAgentConfig() {
     if (server.hasArg("base_url")) {
-        charBufSet(agentBaseUrl, sizeof(agentBaseUrl), server.arg("base_url").c_str());
+    charBufSet(agentBaseUrl, sizeof(agentBaseUrl), server.arg("base_url").c_str());
     }
     if (server.hasArg("api_path")) {
-        charBufSet(agentApiPath, sizeof(agentApiPath), server.arg("api_path").c_str());
+    charBufSet(agentApiPath, sizeof(agentApiPath), server.arg("api_path").c_str());
     }
     if (server.hasArg("device_id")) {
         String devId = server.arg("device_id");
@@ -5111,7 +5111,7 @@ void handleAgentConfig() {
         }
     }
     if (server.hasArg("bearer_token")) {
-        charBufSet(agentBearerToken, sizeof(agentBearerToken), server.arg("bearer_token").c_str());
+    charBufSet(agentBearerToken, sizeof(agentBearerToken), server.arg("bearer_token").c_str());
     }
     
     // Save to preferences
@@ -5120,7 +5120,7 @@ void handleAgentConfig() {
     preferences.putString("path", agentApiPath);
     preferences.putString("dev", agentDeviceId);
     if (server.hasArg("bearer_token")) {
-        preferences.putString("tok", agentBearerToken);
+    preferences.putString("tok", agentBearerToken);
     }
     preferences.end();
     
@@ -5379,13 +5379,13 @@ void handleLogin() {
     }
     httpsBusy = true;
     wifiGuard.enable();
-
+    
     logMsg2Val("[AUTH] URL", url, "", "");
     const unsigned long authT0 = millis();
     
     auto beginAuthHttp = [&]() -> bool {
-        if (isHttps) {
-            clientSecure.setInsecure();
+    if (isHttps) {
+        clientSecure.setInsecure();
             clientSecure.setTimeout(12000);
             return http.begin(clientSecure, url);
         }
@@ -5393,10 +5393,10 @@ void handleLogin() {
     };
 
     if (!beginAuthHttp()) {
-        logMsg("[AUTH] HTTP begin failed");
-        appendMonitorLog("[AUTH] HTTP begin failed");
+            logMsg("[AUTH] HTTP begin failed");
+            appendMonitorLog("[AUTH] HTTP begin failed");
         sendAuthLoginJsonError(isHttps ? "Cannot connect to server (TLS)" : "Cannot connect to server");
-        return;
+            return;
     }
     
     http.addHeader("Content-Type", "application/json");
@@ -5406,7 +5406,7 @@ void handleLogin() {
 
     const unsigned long postMs = millis() - authT0;
     int respLen = 0;
-
+    
     if (code > 0) {
         respLen = readHttpBodyToBuffer(http, gAuthRespBuf, sizeof(gAuthRespBuf));
         {
@@ -5529,7 +5529,7 @@ void handleLogin() {
         wifiGuard.active = false;
         WiFi.setSleep(WIFI_PS_NONE);
         ensureGatewaySoftAp();
-
+        
         char buf[512];
         snprintf(buf, sizeof(buf),
             "{\"success\":true,\"message\":\"Logged in\",\"has_refresh\":%s}",
@@ -5627,7 +5627,7 @@ bool refreshAgentToken() {
     
     logMsg("[AUTH] Token refresh starting");
     appendMonitorLog("[AUTH] Token refresh starting");
-
+    
     // Pause SMS polling to free heap for SSL
     pauseSmsPolling(15000);
     delay(100); // Let any in-progress polling finish
@@ -5734,7 +5734,7 @@ bool refreshAgentToken() {
         if (atLen > 0) {
             appendMonitorLogInt("[AUTH] Refresh token too long", atLen);
         } else {
-            appendMonitorLog("[AUTH] Refresh failed: no access_token");
+        appendMonitorLog("[AUTH] Refresh failed: no access_token");
         }
         resumeSmsPolling();
         return false;
@@ -5782,29 +5782,29 @@ bool registerDeviceWithBackend() {
     if (httpsBusy) {
         return false;
     }
-
+    
     if (charBufIsEmpty(agentDeviceId)) {
         generateDefaultDeviceId(agentDeviceId, sizeof(agentDeviceId));
         preferences.begin("agent", false);
         preferences.putString("dev", agentDeviceId);
         preferences.end();
     }
-
+    
     char url[256];
     snprintf(url, sizeof(url), "%s/api/agent/devices", agentBaseUrl);
-
+    
     char payload[256];
     snprintf(payload, sizeof(payload),
         "{\"device_id\":\"%s\",\"name\":\"%s\"}",
         agentDeviceId, agentDeviceId);
-
+    
     HTTPClient http;
     WiFiClientSecure clientSecure;
     WiFiClient client;
     const bool isHttps = (strncmp(url, "https://", 8) == 0);
-
+    
     httpsBusy = true;
-
+    
     bool begun = false;
     if (isHttps) {
         clientSecure.setInsecure();
@@ -5817,11 +5817,11 @@ bool registerDeviceWithBackend() {
         httpsBusy = false;
         return false;
     }
-
+    
     http.addHeader("Content-Type", "application/json");
     http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
     http.setTimeout(12000);
-
+    
     int code = http.POST(payload);
     http.end();
 
@@ -5829,18 +5829,18 @@ bool registerDeviceWithBackend() {
         clientSecure.stop();
         client.stop();
         delay(100);
-        if (isHttps) {
-            clientSecure.setInsecure();
-            http.begin(clientSecure, url);
-        } else {
-            http.begin(client, url);
-        }
-        http.addHeader("Content-Type", "application/json");
-        http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
+            if (isHttps) {
+                clientSecure.setInsecure();
+                http.begin(clientSecure, url);
+            } else {
+                http.begin(client, url);
+            }
+            http.addHeader("Content-Type", "application/json");
+            http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
         http.setTimeout(12000);
-        code = http.POST(payload);
-        http.end();
-    }
+            code = http.POST(payload);
+            http.end();
+        }
 
     if (isHttps) {
         clientSecure.stop();
@@ -5849,7 +5849,7 @@ bool registerDeviceWithBackend() {
     }
     delay(50);
     httpsBusy = false;
-
+    
     if (code >= 200 && code < 300) {
         deviceRegistered = true;
         logMsg2Val("[REGISTER] Device OK", agentDeviceId, "", "");
