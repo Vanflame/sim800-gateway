@@ -47,7 +47,7 @@
 // -----------------------------------------------------------------------------
 // Firmware version (shown in web UI; bump when releasing OTA builds)
 // -----------------------------------------------------------------------------
-#define FIRMWARE_VERSION    "1.0.13"
+#define FIRMWARE_VERSION    "1.0.14"
 
 // -----------------------------------------------------------------------------
 // Over-the-air updates (ESP32 HTTPS OTA from GitHub Releases or custom URL)
@@ -89,6 +89,12 @@
 // 1 = most ESP32 boards: LOW=ON, HIGH=OFF. Flip to 0 if inverted on your module.
 #ifndef STATUS_LED_ACTIVE_LOW
 #define STATUS_LED_ACTIVE_LOW       0
+#endif
+#ifndef STATUS_LED_OTA_BLINK_MS
+#define STATUS_LED_OTA_BLINK_MS     250
+#endif
+#ifndef STATUS_LED_SIM_INIT_BLINK_MS
+#define STATUS_LED_SIM_INIT_BLINK_MS 400
 #endif
 
 // Default partition = 1.25MB app slot → sketch too big for HTTPS OTA. Auto-disable OTA so Verify still works.

@@ -7,6 +7,7 @@
 #include "calls.h"
 #include "logger.h"
 #include "utils.h"
+#include "status_led.h"
 #include <Arduino.h>
 #include <WebServer.h>
 
@@ -148,6 +149,9 @@ void sendATCapture(const char* cmd, unsigned long timeoutMs) {
                 if (gYieldToWebServer) {
                     server.handleClient();
                 }
+                if (statusLedIsSimInitActive()) {
+                    statusLedTick();
+                }
                 delay(2);
                 continue;
             }
@@ -175,6 +179,9 @@ void sendATCapture(const char* cmd, unsigned long timeoutMs) {
         // Yield to web server to keep UI responsive (can be disabled to prevent re-entrancy)
         if (gYieldToWebServer) {
             server.handleClient();
+        }
+        if (statusLedIsSimInitActive()) {
+            statusLedTick();
         }
         delay(2);
     }
@@ -774,8 +781,19 @@ void simMarkSlotOffline(int slot, const char* reason) {
 }
 
 // Check all SIMs on startup - marks responsive SIMs and initializes them
+static void simInitDelayMs(unsigned long ms) {
+    const unsigned long until = millis() + ms;
+    while ((long)(until - millis()) > 0) {
+        statusLedTick();
+        delay(10);
+    }
+}
+
 void checkAllSIMsOnStartup() {
     extern SimState simStates[];
+
+    statusLedSetSimInitActive(true);
+    setSimBusy(true);
 
     // Prevent re-entrant web requests while probing SIMs
     bool prevYield = gYieldToWebServer;
@@ -784,7 +802,7 @@ void checkAllSIMsOnStartup() {
     // Pass 1: probe all SIMs with extra settling time
     for (int i = 0; i < SIM_COUNT; i++) {
         selectSIM(i);
-        delay(200);  // Extra settling time on first probe
+        simInitDelayMs(200);  // Extra settling time on first probe
         
         // Quick probe (empty mux channels fail fast)
         bool isResponsive = false;
@@ -792,7 +810,7 @@ void checkAllSIMsOnStartup() {
             sendATCapture("AT", 400);
             isResponsive = (strstr(getSimBuffer(), "OK") != NULL);
             if (!isResponsive) {
-                delay(100);
+                simInitDelayMs(100);
             }
         }
         
@@ -821,14 +839,15 @@ void checkAllSIMsOnStartup() {
             logMsgInt("[SETUP] SIM not responding:", i + 1);
         }
 
-        delay(150);  // Longer delay between SIMs
+        simInitDelayMs(150);  // Longer delay between SIMs
+        statusLedTick();
     }
 
     // Pass 2: init responsive SIMs with proper delays
     for (int i = 0; i < SIM_COUNT; i++) {
         if (!simStates[i].responsive) continue;
         selectSIM(i);
-        delay(200);  // Extra settling time
+        simInitDelayMs(200);  // Extra settling time
 
         logMsgInt("[SETUP] SIM init begin:", i + 1);
         
@@ -892,8 +911,12 @@ void checkAllSIMsOnStartup() {
         getBatteryInfo(&simStates[i].batteryPercent, &simStates[i].batteryMv);
         logMsgInt("[SETUP] SIM init complete:", i + 1);
 
-        delay(150);  // Longer delay between SIMs
+        simInitDelayMs(150);  // Longer delay between SIMs
+        statusLedTick();
     }
 
     gYieldToWebServer = prevYield;
+    setSimBusy(false);
+    statusLedSetSimInitActive(false);
+    statusLedTick();
 }
