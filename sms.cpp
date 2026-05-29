@@ -1070,13 +1070,6 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
             url, payload, 20000, agentUseAuth && !charBufIsEmpty(agentBearerToken), nullptr, 0, "sms-forward");
     }
 
-    if (code == 401 && refreshAgentToken()) {
-        cooperativeDelayMs(100);
-        waitForHttpsSettle(true);
-        code = agentHttpsPostJson(
-            url, payload, 20000, agentUseAuth && !charBufIsEmpty(agentBearerToken), nullptr, 0, "sms-forward");
-    }
-
     const bool forwardOk = (code >= 200 && code < 300);
     endSmsHttpsSession(forwardOk);
 

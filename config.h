@@ -47,7 +47,7 @@
 // -----------------------------------------------------------------------------
 // Firmware version (shown in web UI; bump when releasing OTA builds)
 // -----------------------------------------------------------------------------
-#define FIRMWARE_VERSION    "1.0.12"
+#define FIRMWARE_VERSION    "1.0.13"
 
 // -----------------------------------------------------------------------------
 // Over-the-air updates (ESP32 HTTPS OTA from GitHub Releases or custom URL)
@@ -206,6 +206,8 @@ extern int missedCallWatchSlot;
 #define AGENT_REFRESH_TOKEN_SIZE  768
 #define AGENT_AUTH_HDR_SIZE       (AGENT_BEARER_TOKEN_SIZE + 32)
 #define AGENT_AUTH_RESP_SIZE      2560
+// Refresh access token this many seconds before Supabase expiry (default JWT ~3600s).
+#define AGENT_TOKEN_REFRESH_MARGIN_SEC  300
 #define SIM_BUFFER_SIZE     2048    // Main UART response buffer (increased for SMS list responses)
 #define PHONE_BUFFER_SIZE   24      // Phone number buffer
 #define CREG_BUFFER_SIZE    32      // CREG response buffer
@@ -379,12 +381,17 @@ extern char agentBaseUrl[128];
 extern char agentDeviceId[64];
 extern char agentBearerToken[AGENT_BEARER_TOKEN_SIZE];
 extern char agentRefreshToken[AGENT_REFRESH_TOKEN_SIZE];
+/** Unix ms — refresh before this (0 = unknown, use legacy interval). */
+extern unsigned long agentAccessTokenExpiresAtMs;
+
+// Refresh access token using refresh token (updates agentBearerToken + preferences)
+bool refreshAgentToken();
+/** Refresh if access token is near expiry (requires NTP). */
+bool maybeRefreshAgentTokenProactive();
 extern char agentSimNumber[PHONE_BUFFER_SIZE];
 extern int agentSimSlot;
 extern char agentApiPath[64];
 
-// Refresh access token using refresh token (updates agentBearerToken + preferences)
-bool refreshAgentToken();
 extern bool agentUseAuth;
 
 inline bool agentIsSignedIn() {

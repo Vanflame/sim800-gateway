@@ -365,6 +365,7 @@ char agentBaseUrl[128] = "";
 char agentDeviceId[64] = "";
 char agentBearerToken[AGENT_BEARER_TOKEN_SIZE] = "";
 char agentRefreshToken[AGENT_REFRESH_TOKEN_SIZE] = "";
+unsigned long agentAccessTokenExpiresAtMs = 0;
 char agentSimNumber[PHONE_BUFFER_SIZE] = "";
 int agentSimSlot = 0;
 char agentApiPath[64] = DEFAULT_API_PATH;
@@ -949,6 +950,7 @@ static bool scheduleBackgroundNet(unsigned long now) {
         !charBufIsEmpty(agentBaseUrl) &&
         !isSimBusy() && ensureWifiForHttps() &&
         (now - lastHeartbeatMs) >= (unsigned long)HEARTBEAT_INTERVAL_MS) {
+        maybeRefreshAgentTokenProactive();
         pruneExpiredActiveSessions();
         performHeartbeat();
         heartbeatFinishedMs = millis();
@@ -1240,6 +1242,7 @@ void loadSettings() {
     preferences.getString("dev", agentDeviceId, sizeof(agentDeviceId));
     preferences.getString("tok", agentBearerToken, sizeof(agentBearerToken));
     preferences.getString("rtok", agentRefreshToken, sizeof(agentRefreshToken));
+    agentAccessTokenExpiresAtMs = preferences.getULong("tok_exp", 0);
     preferences.getString("sim", agentSimNumber, sizeof(agentSimNumber));
     agentSimSlot = preferences.getInt("slot", 0);
     preferences.getString("path", agentApiPath, sizeof(agentApiPath));
@@ -1611,13 +1614,32 @@ int agentHttpsPostJson(const char* url, const char* jsonBody, int timeoutMs, boo
     gHbHttp.addHeader("Content-Type", "application/json");
     gHbHttp.setTimeout(timeoutMs);
     if (addAuth && !charBufIsEmpty(agentBearerToken)) {
+        maybeRefreshAgentTokenProactive();
         formatBearerHeader(gHbAuthHdr, sizeof(gHbAuthHdr), agentBearerToken);
         gHbHttp.addHeader("Authorization", gHbAuthHdr);
     }
 
     handleWebRequests();
     yield();
-    const int code = gHbHttp.POST(jsonBody);
+    int code = gHbHttp.POST(jsonBody);
+
+    if (code == 401 && addAuth && refreshAgentToken()) {
+        hbHttpEnd();
+        if (!hbHttpBegin(url, timeoutMs)) {
+            httpsBusy = false;
+            wifiRecoverAfterHttps();
+            return -1;
+        }
+        gHbHttp.addHeader("Content-Type", "application/json");
+        gHbHttp.setTimeout(timeoutMs);
+        if (!charBufIsEmpty(agentBearerToken)) {
+            formatBearerHeader(gHbAuthHdr, sizeof(gHbAuthHdr), agentBearerToken);
+            gHbHttp.addHeader("Authorization", gHbAuthHdr);
+        }
+        handleWebRequests();
+        yield();
+        code = gHbHttp.POST(jsonBody);
+    }
 
     if (code > 0 && respOut && respOutSize > 1) {
         WiFiClient* stream = gHbHttp.getStreamPtr();
@@ -1699,6 +1721,7 @@ static void fetchHeartbeatFollowup() {
     }
 
     logMsg("[HEARTBEAT] Followup POST");
+    maybeRefreshAgentTokenProactive();
     httpsBusy = true;
     wifiPrepareForHttps();
 
@@ -1713,7 +1736,7 @@ static void fetchHeartbeatFollowup() {
     formatBearerHeader(gHbAuthHdr, sizeof(gHbAuthHdr), agentBearerToken);
     gHbHttp.addHeader("Authorization", gHbAuthHdr);
 
-    const int code = gHbHttp.POST(gHbBody);
+    int code = gHbHttp.POST(gHbBody);
 
     gHbResp[0] = '\0';
     if (code > 0) {
@@ -1739,9 +1762,54 @@ static void fetchHeartbeatFollowup() {
         }
     }
 
-    hbHttpEnd();
-    httpsBusy = false;
-    wifiRecoverAfterHttps();
+    if (code == 401) {
+        hbHttpEnd();
+        httpsBusy = false;
+        wifiRecoverAfterHttps();
+        delay(100);
+        if (refreshAgentToken()) {
+            httpsBusy = true;
+            wifiPrepareForHttps();
+            if (hbHttpBegin(gHbUrl, 25000)) {
+                gHbHttp.addHeader("Content-Type", "application/json");
+                gHbHttp.setTimeout(25000);
+                formatBearerHeader(gHbAuthHdr, sizeof(gHbAuthHdr), agentBearerToken);
+                gHbHttp.addHeader("Authorization", gHbAuthHdr);
+                code = gHbHttp.POST(gHbBody);
+                gHbResp[0] = '\0';
+                if (code > 0) {
+                    WiFiClient* stream = gHbHttp.getStreamPtr();
+                    if (stream) {
+                        const unsigned long t0 = millis();
+                        int total = 0;
+                        while (millis() - t0 < 6000 && total < (int)sizeof(gHbResp) - 1) {
+                            if (stream->available()) {
+                                const int n = stream->read(
+                                    (uint8_t*)(gHbResp + total), sizeof(gHbResp) - 1 - total);
+                                if (n > 0) {
+                                    total += n;
+                                }
+                            } else if (!gHbHttp.connected()) {
+                                break;
+                            } else {
+                                handleWebRequests();
+                                yield();
+                                delay(2);
+                            }
+                        }
+                        gHbResp[total] = '\0';
+                    }
+                }
+                hbHttpEnd();
+            }
+        }
+        httpsBusy = false;
+        wifiRecoverAfterHttps();
+    } else {
+        hbHttpEnd();
+        httpsBusy = false;
+        wifiRecoverAfterHttps();
+    }
 
     if (code >= 200 && code < 300 && gHbResp[0] != '\0') {
         parseActiveSessionsFromJson(gHbResp);
@@ -1751,6 +1819,9 @@ static void fetchHeartbeatFollowup() {
         appendMonitorLog("[HEARTBEAT] Followup done");
         pruneExpiredActiveSessions();
         maintenanceOnSessionsUpdated();
+    } else if (code == 401) {
+        logMsg("[HEARTBEAT] Followup unauthorized (401)");
+        appendMonitorLog("[HEARTBEAT] Followup 401");
     }
 }
 
@@ -1833,6 +1904,8 @@ void performHeartbeat() {
         logHeartbeatWaitThrottled("not signed in");
         return;
     }
+
+    maybeRefreshAgentTokenProactive();
     
     if (!ensureWifiForHttps()) {
         logMsg("[HEARTBEAT] No WiFi");

@@ -145,13 +145,9 @@ static bool maintenanceHttpPost(const char* body, char* respOut, size_t respSize
     static char url[280];
     snprintf(url, sizeof(url), "%s/api/agent/device-maintenance", agentBaseUrl);
 
-    int code = agentHttpsPostJson(
+    const int code = agentHttpsPostJson(
         url, body, MAINTENANCE_HTTP_TIMEOUT_MS, true, respOut, respSize, "maint-poll");
     resumeSmsPolling();
-
-    if (code == 401 && refreshAgentToken()) {
-        return maintenanceHttpPost(body, respOut, respSize);
-    }
 
     return code >= 200 && code < 300;
 }

@@ -53,6 +53,7 @@ extern char agentBaseUrl[128];
 extern char agentDeviceId[64];
 extern char agentBearerToken[AGENT_BEARER_TOKEN_SIZE];
 extern char agentRefreshToken[AGENT_REFRESH_TOKEN_SIZE];
+extern unsigned long agentAccessTokenExpiresAtMs;
 extern char agentSimNumber[PHONE_BUFFER_SIZE];
 extern int agentSimSlot;
 extern char agentApiPath[64];
@@ -5173,6 +5174,85 @@ static const char* authHttpPostErrorMessage(int code) {
     return nullptr;
 }
 
+/** Extract a JSON integer field (unquoted number after colon). */
+static long extractAuthJsonLong(const char* json, const char* fieldName, long defaultVal) {
+    if (!json || !fieldName) return defaultVal;
+    char keyPat[40];
+    snprintf(keyPat, sizeof(keyPat), "\"%s\"", fieldName);
+    const char* keyPos = strstr(json, keyPat);
+    if (!keyPos) return defaultVal;
+    const char* colon = strchr(keyPos, ':');
+    if (!colon) return defaultVal;
+    const char* p = colon + 1;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p == '"') return defaultVal;
+    return strtol(p, nullptr, 10);
+}
+
+static void updateAccessTokenExpiryFromAuthJson(const char* json) {
+    if (!json || !json[0]) return;
+    long expiresIn = extractAuthJsonLong(json, "expires_in", 0);
+    if (expiresIn <= 0) {
+        expiresIn = 3600;
+    }
+    const time_t nowSecs = time(nullptr);
+    if (nowSecs <= 1600000000L) {
+        return;
+    }
+    unsigned long expSec = (unsigned long)nowSecs + (unsigned long)expiresIn;
+    if (expSec > (unsigned long)AGENT_TOKEN_REFRESH_MARGIN_SEC) {
+        expSec -= (unsigned long)AGENT_TOKEN_REFRESH_MARGIN_SEC;
+    }
+    agentAccessTokenExpiresAtMs = expSec * 1000UL;
+    preferences.begin("agent", false);
+    preferences.putULong("tok_exp", agentAccessTokenExpiresAtMs);
+    preferences.end();
+}
+
+bool maybeRefreshAgentTokenProactive() {
+    if (!agentIsSignedIn() || charBufIsEmpty(agentRefreshToken)) {
+        return false;
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+        return false;
+    }
+
+    static unsigned long lastCheckMs = 0;
+    const unsigned long now = millis();
+    if (lastCheckMs != 0 && (now - lastCheckMs) < 30000UL) {
+        return false;
+    }
+    lastCheckMs = now;
+
+    const time_t nowSecs = time(nullptr);
+    if (nowSecs <= 1600000000L) {
+        return false;
+    }
+    const unsigned long nowMs = (unsigned long)nowSecs * 1000UL;
+
+    bool needRefresh = false;
+    if (agentAccessTokenExpiresAtMs == 0) {
+        static unsigned long legacyNextRefreshMs = 0;
+        if (legacyNextRefreshMs == 0) {
+            legacyNextRefreshMs = now + (45UL * 60UL * 1000UL);
+        }
+        if (now >= legacyNextRefreshMs) {
+            needRefresh = true;
+            legacyNextRefreshMs = now + (45UL * 60UL * 1000UL);
+        }
+    } else if (nowMs >= agentAccessTokenExpiresAtMs) {
+        needRefresh = true;
+    }
+
+    if (!needRefresh) {
+        return false;
+    }
+
+    logMsg("[AUTH] Proactive token refresh");
+    appendMonitorLog("[AUTH] Proactive refresh");
+    return refreshAgentToken();
+}
+
 /** Extract a JSON string field value (supports optional space after colon). */
 static bool extractAuthJsonString(const char* json, const char* fieldName, char* out, size_t outSize, int* outLen) {
     if (!json || !fieldName || !out || outSize < 2) return false;
@@ -5518,6 +5598,7 @@ void handleLogin() {
         preferences.putString("tok", agentBearerToken);
         preferences.putString("rtok", agentRefreshToken);
         preferences.end();
+        updateAccessTokenExpiryFromAuthJson(gAuthRespBuf);
         
         logMsg("[AUTH] Login successful, tokens saved");
         appendMonitorLog("[AUTH] Login OK");
@@ -5561,10 +5642,12 @@ void handleLogout() {
     // Clear tokens
     agentBearerToken[0] = '\0';
     agentRefreshToken[0] = '\0';
+    agentAccessTokenExpiresAtMs = 0;
     
     preferences.begin("agent", false);
     preferences.remove("tok");
     preferences.remove("rtok");
+    preferences.remove("tok_exp");
     preferences.end();
     
     deviceRegistered = false;
@@ -5748,6 +5831,7 @@ bool refreshAgentToken() {
     preferences.putString("tok", agentBearerToken);
     preferences.putString("rtok", agentRefreshToken);
     preferences.end();
+    updateAccessTokenExpiryFromAuthJson(gAuthRespBuf);
     
     resumeSmsPolling();
     
