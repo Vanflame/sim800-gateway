@@ -61,6 +61,12 @@ void clearPendingSms();
 // Process pending SMS queue (retry sending to backend)
 void processPendingSmsQueue();
 
+// OTP priority: defer heartbeat and flush pending queue immediately
+void requestSmsForwardPriority();
+bool isSmsForwardPriorityActive();
+void processPendingSmsQueueNow();
+void clearSmsForwardPriorityIfIdle();
+
 // -----------------------------------------------------------------------------
 // SMS Reading
 // -----------------------------------------------------------------------------

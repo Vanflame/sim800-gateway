@@ -5625,6 +5625,9 @@ bool refreshAgentToken() {
         appendMonitorLog("[AUTH] NTP configured");
     }
     
+    logMsg("[AUTH] Token refresh starting");
+    appendMonitorLog("[AUTH] Token refresh starting");
+
     // Pause SMS polling to free heap for SSL
     pauseSmsPolling(15000);
     delay(100); // Let any in-progress polling finish

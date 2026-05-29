@@ -47,7 +47,7 @@
 // -----------------------------------------------------------------------------
 // Firmware version (shown in web UI; bump when releasing OTA builds)
 // -----------------------------------------------------------------------------
-#define FIRMWARE_VERSION    "1.0.2"
+#define FIRMWARE_VERSION    "1.0.5"
 
 // -----------------------------------------------------------------------------
 // Over-the-air updates (ESP32 HTTPS OTA from GitHub Releases or custom URL)
@@ -104,13 +104,17 @@
 #define SMS_RETRY_INTERVAL_MS       30000   // 30s between retry batches
 #define HEARTBEAT_INTERVAL_MS       60000   // 60s heartbeat (ping after first full sync)
 #define HEARTBEAT_PING_PAUSE_MS     8000UL   // SMS poll pause during lightweight ping
-#define HEARTBEAT_FULL_PAUSE_MS     25000UL  // SMS poll pause during full inventory sync
+#define HEARTBEAT_FULL_PAUSE_MS     5000UL   // brief SMS poll pause during full inventory sync
 #define HEARTBEAT_PING_TIMEOUT_MS   12000   // HTTP timeout for /api/agent/ping
 #define HEARTBEAT_FULL_TIMEOUT_MS   25000   // HTTP timeout for full /api/agent/heartbeat
 #define HEARTBEAT_POST_LOGIN_DEFER_MS   90000UL   // keep UI responsive after sign-in
 #define HEARTBEAT_POST_FAIL_COOLDOWN_MS 120000UL  // after conn error, backoff before next HB
 #define SMS_FORWARD_GAP_MS                  3000UL   // pause between back-to-back SMS HTTPS posts
-#define SMS_POST_FORWARD_HEARTBEAT_DEFER_MS 20000UL  // defer heartbeat after any SMS forward attempt
+#define HTTPS_POST_SETTLE_MS                6000UL   // wait after any HTTPS (ping/HB/SMS) before next POST
+#define SMS_PRIORITY_SETTLE_MS              1500UL   // short TLS settle when OTP seen (priority forward)
+#define SMS_PRIORITY_HTTPS_WAIT_MS          8000UL   // max wait for ping/HB to finish before OTP POST
+#define SMS_PRIORITY_RETRY_GAP_MS           6000UL   // min gap between urgent OTP retries
+#define SMS_POST_FORWARD_HEARTBEAT_DEFER_MS 20000UL  // defer heartbeat after successful SMS forward
 // Second POST after heartbeat (activeSessions + announcements). Costs another WiFi block; off by default.
 #ifndef HEARTBEAT_FOLLOWUP_ENABLED
 #define HEARTBEAT_FOLLOWUP_ENABLED  0
@@ -118,9 +122,14 @@
 #if HEARTBEAT_FOLLOWUP_ENABLED
 #define HEARTBEAT_FOLLOWUP_DELAY_MS 15000UL  // gap before followup when enabled
 #endif
-#define PENDING_SMS_PROCESS_GAP_MS  8000UL   // retry queued SMS while modem polling continues
+#define PENDING_SMS_PROCESS_GAP_MS  3000UL   // retry queued SMS while modem polling continues
 #define FIRMWARE_CHECK_INTERVAL_MS  (12UL * 60UL * 60UL * 1000UL)  // 12h OTA version check
-#define MAINTENANCE_POLL_MIN_INTERVAL_MS  55000   // min gap between maintenance API polls
+// Periodic POST to /api/agent/device-maintenance (~every 55s). Blocks loop() during HTTPS — off by default.
+#ifndef MAINTENANCE_BACKEND_POLL_ENABLED
+#define MAINTENANCE_BACKEND_POLL_ENABLED  0
+#endif
+#define MAINTENANCE_POLL_MIN_INTERVAL_MS  55000   // min gap between maintenance API polls (when enabled)
+#define MAINTENANCE_HTTP_TIMEOUT_MS       8000    // keep maint poll short so SMS poll gaps stay small
 #define SCHEDULED_RESTART_SESSION_BUFFER_MS  (5UL * 60UL * 1000UL)  // defer restart 5m after last session
 #define BATTERY_INFO_INTERVAL_MS    60000   // 60s battery check
 #define SIM_BACKEND_REG_RETRY_MS    30000   // 30s backend reg retry
@@ -135,6 +144,8 @@
 #define WIFI_RECONNECT_COOLDOWN_MS      (10UL * 60UL * 1000UL)
 #define WIFI_STA_DISCONNECT_LOG_MS      60000UL
 #define WIFI_USER_SETUP_ARM_MS          (2UL * 60UL * 1000UL)
+#define WIFI_BOOT_CONNECT_MAX_ATTEMPTS  5
+#define WIFI_BOOT_CONNECT_ATTEMPT_MS    8000UL   // max wait per boot connect try
 
 // Backend login rate limit (per device, in handleLogin)
 #define AUTH_LOGIN_MIN_INTERVAL_MS      10000UL
@@ -312,7 +323,21 @@ extern unsigned long heartbeatNotBeforeMs;
 void deferHeartbeat(unsigned long delayMs);
 inline void deferCloudBackend(unsigned long delayMs) { deferHeartbeat(delayMs); }
 inline bool cloudBackendDeferred() { return millis() < heartbeatNotBeforeMs; }
+void wifiPrepareForHttps();
+bool ensureWifiForHttps();
 void wifiRecoverAfterHttps();
+// Single shared TLS client (gHbHttp) — use for SMS, ping, maintenance to avoid -1 after ping.
+int agentHttpsPostJson(const char* url, const char* jsonBody, int timeoutMs, bool addAuth,
+    char* respOut, size_t respOutSize, const char* opLabel = nullptr);
+unsigned long getLastSmsPollActivityMs();
+extern unsigned long lastHttpsEndMs;
+void markHttpsSessionEnded();
+inline bool httpsStackNeedsSettle() {
+    return lastHttpsEndMs > 0 && (millis() - lastHttpsEndMs) < HTTPS_POST_SETTLE_MS;
+}
+bool isSmsForwardPriorityActive();
+void requestSmsForwardPriority();
+void processPendingSmsQueueNow();
 extern unsigned long modemGatewayStableUntilMs;
 extern unsigned long lastSmsPollMs;
 extern unsigned long smsPollingPauseUntilMs;

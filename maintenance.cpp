@@ -9,8 +9,6 @@
 #include "webui.h"
 
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
 #include <Preferences.h>
 #include <esp_system.h>
 #include <time.h>
@@ -26,6 +24,7 @@ extern bool smsPollingPaused;
 
 static unsigned long scheduledRestartAtMs = 0;
 static unsigned long lastMaintenancePollMs = 0;
+static unsigned long maintenanceDeferUntilMs = 0;
 static unsigned long lastFirmwareCheckMs = 0;
 static bool sessionsUpdatedSincePoll = false;
 static bool restartInProgress = false;
@@ -141,77 +140,17 @@ static bool maintenanceHttpPost(const char* body, char* respOut, size_t respSize
     if (charBufIsEmpty(agentBaseUrl) || charBufIsEmpty(agentDeviceId)) return false;
     if (!agentIsSignedIn()) return false;
     if (!WiFi.isConnected() || httpsBusy) return false;
+    if (isSmsForwardPriorityActive()) return false;
 
     static char url[280];
     snprintf(url, sizeof(url), "%s/api/agent/device-maintenance", agentBaseUrl);
 
-    const bool isHttps = (strncmp(url, "https://", 8) == 0);
-    HTTPClient http;
-    WiFiClientSecure clientSecure;
-    WiFiClient client;
-
-    httpsBusy = true;
-
-    if (isHttps) {
-        clientSecure.setInsecure();
-        clientSecure.setTimeout(20000);
-        if (!http.begin(clientSecure, url)) {
-            httpsBusy = false;
-            resumeSmsPolling();
-            return false;
-        }
-    } else {
-        if (!http.begin(client, url)) {
-            httpsBusy = false;
-            resumeSmsPolling();
-            return false;
-        }
-    }
-
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(20000);
-    static char authHdr[AGENT_AUTH_HDR_SIZE];
-    if (!charBufIsEmpty(agentBearerToken)) {
-        formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
-        http.addHeader("Authorization", authHdr);
-    }
-
-    int code = http.POST(body);
-    if (code > 0 && respSize > 1) {
-        WiFiClient* stream = http.getStreamPtr();
-        if (stream) {
-            size_t total = 0;
-            unsigned long t0 = millis();
-            while (millis() - t0 < 20000UL && total < respSize - 1) {
-                if (stream->available()) {
-                    const int n = stream->read(
-                        (uint8_t*)(respOut + total),
-                        (int)(respSize - 1 - total)
-                    );
-                    if (n > 0) {
-                        total += (size_t)n;
-                    }
-                } else if (!http.connected()) {
-                    break;
-                } else {
-                    handleWebRequests();
-                    yield();
-                    delay(5);
-                }
-            }
-            respOut[total] = '\0';
-        }
-    }
-    http.end();
-    clientSecure.stop();
-    client.stop();
-    httpsBusy = false;
+    int code = agentHttpsPostJson(
+        url, body, MAINTENANCE_HTTP_TIMEOUT_MS, true, respOut, respSize, "maint-poll");
     resumeSmsPolling();
 
-    if (code == 401) {
-        if (refreshAgentToken()) {
-            return maintenanceHttpPost(body, respOut, respSize);
-        }
+    if (code == 401 && refreshAgentToken()) {
+        return maintenanceHttpPost(body, respOut, respSize);
     }
 
     return code >= 200 && code < 300;
@@ -240,13 +179,24 @@ static void applyMaintenancePollResponse(const char* resp) {
 
     const bool fwAvail = extractJsonBool(resp, "firmware_update_available", false);
     if (fwAvail) {
+        static bool lastFwAvail = false;
+        static char lastFwRemote[32] = "";
+        static unsigned long lastFwLogMs = 0;
+
         char remoteVer[32];
         extractJsonStringValue(resp, "firmware_remote_version", remoteVer, sizeof(remoteVer));
-        char detail[80];
-        snprintf(detail, sizeof(detail), "%s (local %s)", remoteVer[0] ? remoteVer : "?",
-            FIRMWARE_VERSION);
-        logMsg2Val("[MAINT] Firmware update available", detail, "", "");
-        appendMonitorLogVal("[MAINT] Update available", detail);
+        const bool changed = !lastFwAvail || strcmp(remoteVer, lastFwRemote) != 0;
+        const unsigned long nowMs = millis();
+        if (changed || (nowMs - lastFwLogMs) >= FIRMWARE_CHECK_INTERVAL_MS) {
+            char detail[80];
+            snprintf(detail, sizeof(detail), "%s (local %s)", remoteVer[0] ? remoteVer : "?",
+                FIRMWARE_VERSION);
+            logMsg2Val("[MAINT] Firmware update available", detail, "", "");
+            appendMonitorLogVal("[MAINT] Update available", detail);
+            lastFwAvail = true;
+            charBufSet(lastFwRemote, sizeof(lastFwRemote), remoteVer);
+            lastFwLogMs = nowMs;
+        }
     }
 }
 
@@ -257,11 +207,23 @@ static void maintenancePollBackend() {
     snprintf(body, sizeof(body),
         "{\"device_id\":\"%s\",\"firmware_version\":\"%s\",\"action\":\"poll\"}",
         agentDeviceId, FIRMWARE_VERSION);
+    logMsg("[MAINT] Backend poll starting");
     appendMonitorLog("[MAINT] Poll start");
 
-    if (maintenanceHttpPost(body, resp, sizeof(resp))) {
+    const unsigned long t0 = millis();
+    const bool ok = maintenanceHttpPost(body, resp, sizeof(resp));
+    const unsigned long elapsedMs = millis() - t0;
+
+    if (ok) {
         applyMaintenancePollResponse(resp);
         lastMaintenancePollMs = millis();
+        char doneBuf[56];
+        snprintf(doneBuf, sizeof(doneBuf), "[MAINT] Backend poll OK (%lums)", elapsedMs);
+        logMsg(doneBuf);
+    } else {
+        char failBuf[56];
+        snprintf(failBuf, sizeof(failBuf), "[MAINT] Backend poll failed (%lums)", elapsedMs);
+        logMsg(failBuf);
     }
 }
 
@@ -357,10 +319,17 @@ static void maintenanceLocalFirmwareCheck() {
     if (otaCheckForUpdate(&updateAvailable, remoteVer, sizeof(remoteVer))) {
         maintenanceRecordFirmwareCheck(remoteVer, updateAvailable);
         if (updateAvailable) {
-            char detail[72];
-            snprintf(detail, sizeof(detail), "%s (local %s)", remoteVer, FIRMWARE_VERSION);
-            logMsg2Val("[MAINT] Firmware update available", detail, "", "");
-            appendMonitorLogVal("[MAINT] Update available", detail);
+            static bool lastLocalFwAvail = false;
+            static unsigned long lastLocalFwLogMs = 0;
+            const bool changed = !lastLocalFwAvail;
+            if (changed || (millis() - lastLocalFwLogMs) >= FIRMWARE_CHECK_INTERVAL_MS) {
+                char detail[72];
+                snprintf(detail, sizeof(detail), "%s (local %s)", remoteVer, FIRMWARE_VERSION);
+                logMsg2Val("[MAINT] Firmware update available", detail, "", "");
+                appendMonitorLogVal("[MAINT] Update available", detail);
+                lastLocalFwAvail = true;
+                lastLocalFwLogMs = millis();
+            }
         }
     } else {
         maintenanceRecordFirmwareCheck("", false);
@@ -411,17 +380,43 @@ extern volatile bool otaInProgress;
 void maintenanceTick(unsigned long nowMs) {
     if (otaInProgress || httpsBusy) return;
     if (cloudBackendDeferred()) return;
+    if (isSmsForwardPriorityActive()) return;
+    if (nowMs < maintenanceDeferUntilMs) return;
 
     maintenanceMaybeRunScheduledRestart();
 
     if (!WiFi.isConnected()) return;
 
+    if (httpsStackNeedsSettle()) {
+        maintenanceDeferUntilMs = nowMs + 12000UL;
+        return;
+    }
+
+    const unsigned long lastPoll = getLastSmsPollActivityMs();
+    if (lastPoll > 0 && (nowMs - lastPoll) < 3000UL) {
+        maintenanceDeferUntilMs = nowMs + 15000UL;
+        static unsigned long lastDeferLogMs = 0;
+        if (nowMs - lastDeferLogMs >= 30000UL) {
+            lastDeferLogMs = nowMs;
+            logMsg("[MAINT] Poll deferred (SMS polling active)");
+        }
+        return;
+    }
+
     bool ranMaintPoll = false;
+#if MAINTENANCE_BACKEND_POLL_ENABLED
     if (agentIsSignedIn() && !charBufIsEmpty(agentBaseUrl) &&
         (nowMs - lastMaintenancePollMs) >= (unsigned long)MAINTENANCE_POLL_MIN_INTERVAL_MS) {
         maintenancePollBackend();
         ranMaintPoll = true;
     }
+#else
+    static bool maintPollOffLogged = false;
+    if (!maintPollOffLogged && agentIsSignedIn()) {
+        maintPollOffLogged = true;
+        logMsg("[MAINT] Backend poll off (MAINTENANCE_BACKEND_POLL_ENABLED=0)");
+    }
+#endif
 
     if (!ranMaintPoll &&
         (lastFirmwareCheckMs == 0 ||

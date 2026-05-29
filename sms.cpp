@@ -13,8 +13,9 @@
 #include "webui.h"
 #include <Arduino.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
+#include <time.h>
+
+extern bool ntpConfigured;
 
 // External persistent storage functions (defined in main .ino)
 extern unsigned long persistentReceived;
@@ -30,12 +31,54 @@ extern void appendSmsToFile(const char* time, int simSlot, const char* number, c
 static PendingSms pendingQueue[MAX_PENDING_SMS];
 static int pendingCount = 0;
 static unsigned long lastRetryMs = 0;
-static unsigned long lastSmsHttpsEndMs = 0;
 extern volatile bool httpsBusy;
 
-static void waitBetweenSmsForwards() {
-    if (lastSmsHttpsEndMs == 0) return;
-    const unsigned long gapEnd = lastSmsHttpsEndMs + SMS_FORWARD_GAP_MS;
+static bool smsForwardPriority = false;
+
+void requestSmsForwardPriority() {
+    smsForwardPriority = true;
+    // Do not call deferHeartbeat() here — that sets cloudBackendDeferred() and blocks SMS POST.
+}
+
+bool isSmsForwardPriorityActive() {
+    return smsForwardPriority || pendingCount > 0;
+}
+
+void clearSmsForwardPriorityIfIdle() {
+    if (pendingCount == 0) {
+        smsForwardPriority = false;
+    }
+}
+
+static bool waitForHttpsIdle(unsigned long maxMs) {
+    const unsigned long t0 = millis();
+    while (httpsBusy && millis() - t0 < maxMs) {
+        handleWebRequests();
+        yield();
+        delay(5);
+    }
+    return !httpsBusy;
+}
+
+static bool waitForSimIdle(unsigned long maxMs) {
+    const unsigned long t0 = millis();
+    while (isSimBusy() && millis() - t0 < maxMs) {
+        handleWebRequests();
+        yield();
+        delay(5);
+    }
+    return !isSimBusy();
+}
+
+static void waitForHttpsSettle(bool urgent) {
+    if (lastHttpsEndMs == 0) {
+        return;
+    }
+    unsigned long gapMs = urgent ? SMS_PRIORITY_SETTLE_MS : HTTPS_POST_SETTLE_MS;
+    if (!urgent && gapMs < SMS_FORWARD_GAP_MS) {
+        gapMs = SMS_FORWARD_GAP_MS;
+    }
+    const unsigned long gapEnd = lastHttpsEndMs + gapMs;
     while (millis() < gapEnd) {
         handleWebRequests();
         yield();
@@ -43,10 +86,10 @@ static void waitBetweenSmsForwards() {
     }
 }
 
-static void endSmsHttpsSession() {
-    lastSmsHttpsEndMs = millis();
-    deferHeartbeat(SMS_POST_FORWARD_HEARTBEAT_DEFER_MS);
-    httpsBusy = false;
+static void endSmsHttpsSession(bool forwardOk) {
+    if (forwardOk) {
+        deferHeartbeat(SMS_POST_FORWARD_HEARTBEAT_DEFER_MS);
+    }
 }
 
 // Statistics
@@ -58,7 +101,12 @@ static unsigned long totalFailed = 0;
 static int currentPollSim = 0;
 static unsigned long pollingPauseUntil = 0;
 static unsigned long lastPollMs = 0;
+static unsigned long lastSmsPollActivityMs = 0;
 static unsigned long lastSlotPollMs[SIM_COUNT];
+
+unsigned long getLastSmsPollActivityMs() {
+    return lastSmsPollActivityMs;
+}
 
 static bool smsSlotPollDue(int slot) {
     if (slot < 0 || slot >= SIM_COUNT) return false;
@@ -407,7 +455,17 @@ bool enqueuePendingSms(int simSlot, const char* simNumber, const char* sender, c
         logMsg("[SMS] Queue full, dropping message");
         return false;
     }
-    
+
+    for (int i = 0; i < pendingCount; i++) {
+        PendingSms* existing = &pendingQueue[i];
+        if (existing->simSlot == simSlot &&
+            strcmp(existing->sender, sender) == 0 &&
+            strcmp(existing->message, message) == 0) {
+            logMsgInt("[SMS] Duplicate skipped on SIM", simSlot + 1);
+            return true;
+        }
+    }
+
     PendingSms* p = &pendingQueue[pendingCount++];
     p->simSlot = simSlot;
     charBufSet(p->simNumber, sizeof(p->simNumber), simNumber);
@@ -446,27 +504,14 @@ void clearPendingSms() {
 // Pending SMS Queue Processing
 // -----------------------------------------------------------------------------
 
-void processPendingSmsQueue() {
-    if (cloudBackendDeferred()) {
-        return;
+static bool processOnePendingSms(bool urgent) {
+    if (pendingCount == 0) {
+        return false;
     }
 
-    // Check retry interval
-    if (millis() - lastRetryMs < PENDING_SMS_PROCESS_GAP_MS) {
-        return;
-    }
-    
-    if (pendingCount == 0) {
-        return;
-    }
-    
-    lastRetryMs = millis();
-    
-    // Process one pending SMS at a time
     PendingSms* p = &pendingQueue[0];
     p->retryCount++;
-    
-    // Try to forward with the actual implementation
+
     static SmsMessage msg;
     msg.simSlot = p->simSlot;
     msg.messageIndex = 0;
@@ -474,38 +519,79 @@ void processPendingSmsQueue() {
     msg.unread = true;
     charBufSet(msg.sender, sizeof(msg.sender), p->sender);
     charBufSet(msg.message, sizeof(msg.message), p->message);
-    
+
     char fwdError[64] = "";
     if (forwardSmsToBackendWithSender(&msg, p->sender, fwdError, sizeof(fwdError))) {
-        // Success - remove from queue
         for (int i = 1; i < pendingCount; i++) {
             pendingQueue[i - 1] = pendingQueue[i];
         }
         pendingCount--;
-        logMsg("[SMS] Pending SMS forwarded successfully");
+        logMsg(urgent ? "[SMS] Priority forward OK" : "[SMS] Pending SMS forwarded successfully");
         appendMonitorLog("[SMS] Retry success, SMS forwarded");
-    } else if (p->retryCount >= 5) {
-        // Max retries - drop and log to error log
+        clearSmsForwardPriorityIfIdle();
+        return true;
+    }
+
+    if (p->retryCount >= 5) {
         logMsg("[SMS] Pending SMS dropped after max retries");
         appendMonitorLog("[SMS] Retry failed, SMS dropped after 5 attempts");
-        
-        // Log to error log with reason
         char errBuf[128];
-        snprintf(errBuf, sizeof(errBuf), "[SMS] Dropped SIM%d after 5 retries: %s", p->simSlot + 1, fwdError[0] ? fwdError : "unknown");
+        snprintf(errBuf, sizeof(errBuf), "[SMS] Dropped SIM%d after 5 retries: %s",
+            p->simSlot + 1, fwdError[0] ? fwdError : "unknown");
         appendErrorLog(errBuf);
         appendErrorLogVal("[SMS] Sender", p->sender);
-        
         for (int i = 1; i < pendingCount; i++) {
             pendingQueue[i - 1] = pendingQueue[i];
         }
         pendingCount--;
-    } else {
-        // Still retrying - log error with reason
-        logMsgInt("[SMS] Retry failed, attempt", p->retryCount);
-        char errBuf[128];
-        snprintf(errBuf, sizeof(errBuf), "[SMS] Retry %d failed SIM%d: %s", p->retryCount, p->simSlot + 1, fwdError[0] ? fwdError : "unknown");
-        appendErrorLog(errBuf);
+        clearSmsForwardPriorityIfIdle();
+        return true;
     }
+
+    char errBuf[128];
+    snprintf(errBuf, sizeof(errBuf), "[SMS] Retry %d/%d SIM%d: %s",
+        p->retryCount, 5, p->simSlot + 1, fwdError[0] ? fwdError : "unknown");
+    logMsg(errBuf);
+    appendErrorLog(errBuf);
+    return false;
+}
+
+static bool processPendingSmsQueueInternal(bool urgent) {
+    if (cloudBackendDeferred()) {
+        return false;
+    }
+
+    const unsigned long gapMs = urgent ? SMS_PRIORITY_RETRY_GAP_MS : PENDING_SMS_PROCESS_GAP_MS;
+    if (millis() - lastRetryMs < gapMs) {
+        return false;
+    }
+    if (pendingCount == 0) {
+        return false;
+    }
+
+    if (urgent) {
+        requestSmsForwardPriority();
+        if (!waitForHttpsIdle(SMS_PRIORITY_HTTPS_WAIT_MS)) {
+            logMsg("[SMS] Forward waiting for HTTPS (heartbeat/ping)");
+            return false;
+        }
+        waitForHttpsSettle(true);
+        if (!waitForSimIdle(3000)) {
+            logMsg("[SMS] Forward waiting for modem");
+            return false;
+        }
+    }
+
+    lastRetryMs = millis();
+    return processOnePendingSms(urgent);
+}
+
+void processPendingSmsQueue() {
+    processPendingSmsQueueInternal(false);
+}
+
+void processPendingSmsQueueNow() {
+    processPendingSmsQueueInternal(true);
 }
 
 // -----------------------------------------------------------------------------
@@ -785,9 +871,8 @@ void processIncomingSMS(int simSlot, const SmsMessage* msg) {
 }
 
 // Forward SMS to backend (extracted for reuse by multipart)
+// Never run HTTPS here — poll path must stay fast; forward runs from main loop queue.
 static void forwardSms(int simSlot, const char* senderDisplay, const SmsMessage* msg) {
-    char fwdError[64] = "";
-    extern volatile bool httpsBusy;
     auto isHexUcs2LikeMessage = [](const char* s) -> bool {
         if (!s) return false;
         int hexCount = 0;
@@ -805,40 +890,14 @@ static void forwardSms(int simSlot, const char* senderDisplay, const SmsMessage*
     if (isHexUcs2LikeMessage(msg ? msg->message : nullptr)) {
         appendErrorLogInt("[SMS] Blocked UCS2-hex-like message SIM", simSlot + 1);
         appendMonitorLog("[SMS] Blocked suspicious hex/UCS2 message");
-        // Do not forward/queue this payload.
         return;
     }
 
-    if (httpsBusy) {
-        enqueuePendingSms(simSlot, simStates[simSlot].number, senderDisplay, msg->message);
-        logMsg("[SMS] Queued (HTTPS busy)");
-        appendMonitorLog("[SMS] Queued during HTTPS");
-    } else if (forwardSmsToBackendWithSender(msg, senderDisplay, fwdError, sizeof(fwdError))) {
-        totalForwarded++;
-        persistentForwarded++;
-        logMsg("[SMS] Forward success, deleting from SIM");
-        appendMonitorLog("[SMS] Forward success");
-    } else {
-        totalFailed++;
-        persistentFailed++;
+    requestSmsForwardPriority();
+    enqueuePendingSms(simSlot, simStates[simSlot].number, senderDisplay, msg->message);
+    logMsgInt("[SMS] New message queued for forward, SIM", simSlot + 1);
+    appendMonitorLogInt("[SMS] Queued for forward SIM", simSlot + 1);
 
-        // Log to error log with detailed reason
-        char errBuf[128];
-        snprintf(errBuf, sizeof(errBuf), "[SMS] Forward failed SIM%d: %s", simSlot + 1, fwdError[0] ? fwdError : "unknown");
-        appendErrorLog(errBuf);
-        appendErrorLogVal("[SMS] Sender", senderDisplay);
-
-        // Add to retry queue with normalized sender
-        enqueuePendingSms(simSlot, simStates[simSlot].number, senderDisplay, msg->message);
-        logMsg("[SMS] Forward failed, queued for retry");
-        
-        // Log to monitor with reason
-        char monBuf[96];
-        snprintf(monBuf, sizeof(monBuf), "[SMS] Forward failed: %s", fwdError[0] ? fwdError : "unknown");
-        appendMonitorLog(monBuf);
-    }
-    
-    // Save stats to persistent storage
     savePersistentStats();
     
     // Save SMS to file for Messages tab
@@ -895,14 +954,20 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
         return false;
     }
 
-    // Check WiFi
-    if (!WiFi.isConnected()) {
-        logMsg("[SMS] No WiFi, queuing");
+    if (!ensureWifiForHttps()) {
+        logMsg("[SMS] No WiFi for forward");
         if (errorOut) snprintf(errorOut, errorOutSize, "No WiFi");
         return false;
     }
 
+    if (!ntpConfigured) {
+        configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+        ntpConfigured = true;
+        delay(300);
+    }
+
     if (cloudBackendDeferred()) {
+        logMsg("[SMS] Cloud sync paused");
         if (errorOut) snprintf(errorOut, errorOutSize, "Cloud sync paused");
         return false;
     }
@@ -974,15 +1039,8 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
         agentDeviceId
     );
     
-    // Make HTTP request (local to avoid collision with heartbeat)
-    HTTPClient http;
-    WiFiClientSecure clientSecure;
-    WiFiClient client;
-    bool isHttps = (strncmp(url, "https://", 8) == 0);
-    
-    // Wait if heartbeat/maintenance holds the TLS stack (common cause of -2)
     const unsigned long busyWait0 = millis();
-    while (httpsBusy && (millis() - busyWait0) < 15000UL) {
+    while (httpsBusy && (millis() - busyWait0) < SMS_PRIORITY_HTTPS_WAIT_MS) {
         handleWebRequests();
         yield();
         delay(10);
@@ -993,122 +1051,43 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
         return false;
     }
 
-    waitBetweenSmsForwards();
-    httpsBusy = true;
-    
-    if (isHttps) {
-        clientSecure.setInsecure();
-        if (!http.begin(clientSecure, url)) {
-            logMsg("[SMS] HTTP begin failed");
-            endSmsHttpsSession();
-            if (errorOut) snprintf(errorOut, errorOutSize, "HTTP begin failed");
-            return false;
-        }
-    } else {
-        if (!http.begin(client, url)) {
-            logMsg("[SMS] HTTP begin failed");
-            endSmsHttpsSession();
-            if (errorOut) snprintf(errorOut, errorOutSize, "HTTP begin failed");
-            return false;
-        }
-    }
-    
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(15000);
+    waitForHttpsSettle(true);
 
-    static char authHdr[AGENT_AUTH_HDR_SIZE];
-    if (agentUseAuth && !charBufIsEmpty(agentBearerToken)) {
-        formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
-        http.addHeader("Authorization", authHdr);
+    int code = agentHttpsPostJson(
+        url, payload, 20000, agentUseAuth && !charBufIsEmpty(agentBearerToken), nullptr, 0, "sms-forward");
+
+    if (code == -11) {
+        logMsg("[SMS] HTTPS busy — queued for retry");
+        if (errorOut) snprintf(errorOut, errorOutSize, "HTTPS busy");
+        return false;
     }
 
-    // Try up to 2 times for connection errors
-    int attempt = 0;
-    int code = -1;
-
-    while (attempt < 2) {
-        code = http.POST(payload);
-
-        // Success or non-connection error - don't retry
-        if (code >= 0 || (code != -1 && code != -11 && code != -2)) break;
-
-        // Connection error - retry once
-        if (code < 0 && attempt == 0) {
-            logMsgInt("[SMS] Forward conn error, retrying", code);
-            http.end();
-            clientSecure.stop();
-            client.stop();
-            delay(100);
-            attempt++;
-
-            // Re-initialize connection
-            if (isHttps) {
-                clientSecure.setInsecure();
-                if (!http.begin(clientSecure, url)) {
-                    logMsg("[SMS] HTTP begin failed on retry");
-                    break;
-                }
-            } else {
-                if (!http.begin(client, url)) {
-                    logMsg("[SMS] HTTP begin failed on retry");
-                    break;
-                }
-            }
-            http.addHeader("Content-Type", "application/json");
-            http.setTimeout(15000);
-            if (agentUseAuth && !charBufIsEmpty(agentBearerToken)) {
-                formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
-                http.addHeader("Authorization", authHdr);
-            }
-            continue;
-        }
-        break;
+    if (code < 0 && code != -11) {
+        logMsgInt("[SMS] Forward conn error, retrying", code);
+        cooperativeDelayMs(400);
+        waitForHttpsSettle(true);
+        code = agentHttpsPostJson(
+            url, payload, 20000, agentUseAuth && !charBufIsEmpty(agentBearerToken), nullptr, 0, "sms-forward");
     }
 
-    http.end();
-
-    if (code == 401) {
-        // Stop previous connection before refresh
-        clientSecure.stop();
-        client.stop();
-        delay(100);  // Let TCP fully close
-
-        if (refreshAgentToken()) {
-            if (isHttps) {
-                clientSecure.setInsecure();
-                if (!http.begin(clientSecure, url)) {
-                    logMsg("[SMS] HTTP begin failed");
-                    endSmsHttpsSession();
-                    return false;
-                }
-            } else {
-                if (!http.begin(client, url)) {
-                    logMsg("[SMS] HTTP begin failed");
-                    endSmsHttpsSession();
-                    return false;
-                }
-            }
-            http.addHeader("Content-Type", "application/json");
-            http.setTimeout(15000);
-            if (agentUseAuth && !charBufIsEmpty(agentBearerToken)) {
-                formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
-                http.addHeader("Authorization", authHdr);
-            }
-            code = http.POST(payload);
-            http.end();
-        }
+    if (code == 401 && refreshAgentToken()) {
+        cooperativeDelayMs(100);
+        waitForHttpsSettle(true);
+        code = agentHttpsPostJson(
+            url, payload, 20000, agentUseAuth && !charBufIsEmpty(agentBearerToken), nullptr, 0, "sms-forward");
     }
 
-    clientSecure.stop();
-    client.stop();
-    endSmsHttpsSession();
+    const bool forwardOk = (code >= 200 && code < 300);
+    endSmsHttpsSession(forwardOk);
 
-    if (code >= 200 && code < 300) {
+    if (forwardOk) {
         logMsgInt("[SMS] Forwarded OK, code", code);
         appendMonitorLogInt("[SMS] Forwarded OK, code", code);
         delay(50);
         return true;
-    } else {
+    }
+
+    {
         // Log detailed error
         if (code < 0) {
             logMsgInt("[SMS] Forward failed, connection error", code);
@@ -1157,6 +1136,11 @@ void pollSIMsForSMS() {
     checkMultipartTimeout();
 
     if (millis() < pollingPauseUntil) {
+        static unsigned long lastPauseLogMs = 0;
+        if (millis() - lastPauseLogMs > 15000UL) {
+            lastPauseLogMs = millis();
+            logMsg("[SMS] Poll paused (heartbeat/modem)");
+        }
         return;
     }
     if (isSimBusy()) {
@@ -1189,6 +1173,7 @@ void pollSIMsForSMS() {
     lastPollMs = millis();
     lastSlotPollMs[slot] = millis();
     pollOneSimSlot(slot);
+    lastSmsPollActivityMs = millis();
     handleWebRequests();
 }
 

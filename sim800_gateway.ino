@@ -156,6 +156,70 @@ static void wifiWaitStaSettle(uint32_t maxMs) {
     }
 }
 
+/** Block until STA linked or timeout; keeps AP web UI responsive. */
+static bool wifiWaitStaConnected(uint32_t maxMs) {
+    const unsigned long t0 = millis();
+    while (millis() - t0 < maxMs) {
+        handleWebRequests();
+        yield();
+        if (WiFi.status() == WL_CONNECTED && WiFi.localIP()[0] != 0) {
+            delay(150);
+            wifiFixStaNetworkIfNeeded();
+            return WiFi.isConnected() && wifiStaNetworkLooksValid();
+        }
+        delay(50);
+    }
+    return WiFi.isConnected() && WiFi.localIP()[0] != 0;
+}
+
+static bool wifiConnectStaWithRetries(int maxAttempts, uint32_t attemptTimeoutMs, bool bootLog) {
+    if (charBufIsEmpty(wifiSsid)) {
+        return false;
+    }
+
+    WiFi.setAutoReconnect(false);
+    WiFi.setSleep(WIFI_PS_NONE);
+    ensureGatewaySoftAp();
+
+    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+        if (attempt > 1) {
+            WiFi.disconnect(true, false);
+            wifiWaitStaSettle(1200);
+            ensureGatewaySoftAp();
+            if (bootLog) {
+                logMsgInt("[WIFI] Boot connect retry", attempt);
+                appendMonitorLogInt("[WIFI] Boot connect retry", attempt);
+            }
+        } else if (bootLog) {
+            logMsg2Val("[WIFI] Connecting to", wifiSsid, "", "");
+            appendMonitorLogVal("[WIFI] Connecting to", wifiSsid);
+        }
+
+        WiFi.begin(wifiSsid, wifiPassword);
+
+        if (wifiWaitStaConnected(attemptTimeoutMs)) {
+            wifiLogStaNetworkDetails();
+            if (bootLog) {
+                logMsgInt("[WIFI] Connected on try", attempt);
+                appendMonitorLogInt("[WIFI] Connected on try", attempt);
+            }
+            return true;
+        }
+
+        if (bootLog) {
+            char detail[48];
+            snprintf(detail, sizeof(detail), "status=%d", (int)WiFi.status());
+            logMsg2Val("[WIFI] Connect attempt failed", detail, "", "");
+        }
+    }
+
+    if (bootLog) {
+        logMsg("[WIFI] Boot connect failed — use AP web UI");
+        appendMonitorLog("[WIFI] Boot connect failed");
+    }
+    return false;
+}
+
 void wifiPrepareForUserConfig() {
     armWifiUserSetupMs(WIFI_USER_SETUP_ARM_MS);
     WiFi.setAutoReconnect(false);
@@ -285,6 +349,12 @@ int errorLogCount = 0;
 // Timing
 unsigned long lastHeartbeatMs = 0;
 unsigned long heartbeatNotBeforeMs = 0;
+unsigned long lastHttpsEndMs = 0;
+static bool agentInventoryHeartbeatDone = false;
+
+void markHttpsSessionEnded() {
+    lastHttpsEndMs = millis();
+}
 unsigned long modemGatewayStableUntilMs = 0;
 unsigned long lastSmsPollMs = 0;
 unsigned long smsPollingPauseUntil = 0;
@@ -736,7 +806,7 @@ void setup() {
 
 static void fetchHeartbeatFollowup();
 
-static void wifiPrepareForHttps() {
+void wifiPrepareForHttps() {
     wifiPsBeforeHttps = WiFi.getSleep();
     WiFi.setSleep(WIFI_PS_NONE);
 }
@@ -747,8 +817,22 @@ static void wifiRestoreAfterHttps() {
 
 void deferHeartbeat(unsigned long delayMs) {
     const unsigned long now = millis();
-    heartbeatNotBeforeMs = now + delayMs;
-    lastHeartbeatMs = now;
+    if (delayMs > heartbeatNotBeforeMs - now) {
+        heartbeatNotBeforeMs = now + delayMs;
+    }
+}
+
+static void logHeartbeatWaitThrottled(const char* reason) {
+    static unsigned long lastLogMs = 0;
+    const unsigned long now = millis();
+    if (now - lastLogMs < 30000UL) {
+        return;
+    }
+    lastLogMs = now;
+    char buf[72];
+    snprintf(buf, sizeof(buf), "[HEARTBEAT] Waiting: %s", reason);
+    logMsg(buf);
+    appendMonitorLog(buf);
 }
 
 void wifiRecoverAfterHttps() {
@@ -779,9 +863,11 @@ void wifiRecoverAfterHttps() {
         logMsg("[WIFI] STA down — web UI on AP http://192.168.4.1");
         appendMonitorLog("[WIFI] STA down — use AP");
     }
+
+    markHttpsSessionEnded();
 }
 
-static bool ensureWifiForHttps() {
+bool ensureWifiForHttps() {
     if (WiFi.isConnected()) {
         return true;
     }
@@ -814,6 +900,9 @@ static bool scheduleBackgroundNet(unsigned long now) {
     if (otaInProgress || httpsBusy) {
         return false;
     }
+    if (isSmsForwardPriorityActive()) {
+        return false;
+    }
 
 #if HEARTBEAT_FOLLOWUP_ENABLED
     if (pendingHeartbeatFollowup && heartbeatFinishedMs > 0 &&
@@ -832,27 +921,49 @@ static bool scheduleBackgroundNet(unsigned long now) {
 #endif
 
     if (millis() < heartbeatNotBeforeMs) {
+        logHeartbeatWaitThrottled("cloud pause after SMS/modem");
         return false;
     }
     if (millis() < wifiUserSetupUntilMs) {
         return false;
     }
     if (millis() < modemGatewayStableUntilMs) {
+        logHeartbeatWaitThrottled("modem stabilizing");
         return false;
     }
     if (isSimBusy()) {
         return false;
     }
 
+    const int pendingSms = getPendingSmsCount();
+    const bool needFullSync = !agentInventoryHeartbeatDone;
+    if (needFullSync && pendingSms > 0) {
+        logHeartbeatWaitThrottled("pending SMS (full sync)");
+        return false;
+    }
+
     if (!heartbeatPaused && !pendingHeartbeatFollowup && agentIsSignedIn() &&
         !charBufIsEmpty(agentBaseUrl) &&
-        getPendingSmsCount() == 0 &&
         !isSimBusy() && ensureWifiForHttps() &&
         (now - lastHeartbeatMs) >= (unsigned long)HEARTBEAT_INTERVAL_MS) {
         pruneExpiredActiveSessions();
         performHeartbeat();
         heartbeatFinishedMs = millis();
         return true;
+    }
+
+    if (agentInventoryHeartbeatDone && agentIsSignedIn() &&
+        !charBufIsEmpty(agentBaseUrl) &&
+        (now - lastHeartbeatMs) < (unsigned long)HEARTBEAT_INTERVAL_MS) {
+        const unsigned long nextPingMs = lastHeartbeatMs + (unsigned long)HEARTBEAT_INTERVAL_MS;
+        const unsigned long remainSec = (nextPingMs - now) / 1000UL;
+        static unsigned long lastNextPingLogMs = 0;
+        if (remainSec > 5 && (now - lastNextPingLogMs) >= 30000UL) {
+            lastNextPingLogMs = now;
+            char buf[56];
+            snprintf(buf, sizeof(buf), "[HEARTBEAT] Next ping in %lus", remainSec);
+            logMsg(buf);
+        }
     }
 
     return false;
@@ -972,16 +1083,6 @@ void loop() {
         return;
     }
 
-    // If an HTTPS job is running (heartbeat/forward/maintenance), keep loop lightweight
-    // so the web UI stays responsive even during repeated failures.
-    if (httpsBusy) {
-        for (int i = 0; i < 4; i++) {
-            handleWebRequests();
-            delay(1);
-        }
-        return;
-    }
-
     modemGatewayTick();
 
     if (modemGatewayRunning) {
@@ -991,11 +1092,27 @@ void loop() {
         }
 
         const bool blockSmsPoll = ussdBlocksSmsPoll() || isWebRefreshAllInProgress();
+        static unsigned long simBusySkipSinceMs = 0;
+        static unsigned long lastSimBusyLogMs = 0;
+        // Keep polling during HTTPS — modem UART is separate; stopping poll caused 30–40s gaps.
         if (!isSimBusy() && !smsPollingPaused && !isSmsPollingPaused() && !blockSmsPoll) {
+            simBusySkipSinceMs = 0;
             pollSIMsForSMS();
+        } else if (isSimBusy() && modemGatewayRunning) {
+            const unsigned long nowMs = millis();
+            if (simBusySkipSinceMs == 0) {
+                simBusySkipSinceMs = nowMs;
+            } else if ((nowMs - simBusySkipSinceMs) > 8000UL &&
+                       (nowMs - lastSimBusyLogMs) > 15000UL) {
+                lastSimBusyLogMs = nowMs;
+                logMsg("[SMS] Poll waiting (modem busy)");
+            }
+        } else {
+            simBusySkipSinceMs = 0;
         }
 
-        if (missedCallForwardEnabled && !smsPollingPaused && !isSimBusy() && !blockSmsPoll) {
+        if (missedCallForwardEnabled && !smsPollingPaused && !isSimBusy() && !blockSmsPoll &&
+            !isSmsForwardPriorityActive()) {
             pollMissedCallsFast();
         }
     }
@@ -1003,13 +1120,13 @@ void loop() {
     unsigned long now = millis();
     const bool authReady = !charBufIsEmpty(agentBearerToken) && !charBufIsEmpty(agentRefreshToken);
 
-    if (!cloudBackendDeferred()) {
-        if (authReady && !httpsBusy && getPendingSmsCount() > 0) {
-            processPendingSmsQueue();
-        }
+    if (!cloudBackendDeferred() && authReady && !httpsBusy && getPendingSmsCount() > 0) {
+        processPendingSmsQueueNow();
     }
 
-    const bool netJobRan = authReady ? scheduleBackgroundNet(now) : false;
+    const bool netJobRan = (authReady && !isSmsForwardPriorityActive())
+        ? scheduleBackgroundNet(now)
+        : false;
 
     if (!cloudBackendDeferred() && authReady && !netJobRan && !httpsBusy && !isSimBusy()) {
         maintenanceTick(now);
@@ -1086,10 +1203,12 @@ void initWiFi() {
     WiFi.softAP(apSsid, AP_PASSWORD, AP_CHANNEL);
     logMsg2Val("[WIFI] AP started", apSsid, "IP", WiFi.softAPIP().toString().c_str());
     
-    // Try saved STA network in background (do not block boot — web UI stays on AP).
+  // Try saved STA with retries (router/DHCP often needs a few seconds at boot).
     if (!charBufIsEmpty(wifiSsid)) {
-        logMsg2Val("[WIFI] Connecting to", wifiSsid, "", "");
-        WiFi.begin(wifiSsid, wifiPassword);
+        wifiConnectStaWithRetries(
+            WIFI_BOOT_CONNECT_MAX_ATTEMPTS,
+            WIFI_BOOT_CONNECT_ATTEMPT_MS,
+            true);
     } else {
         logMsg("[WIFI] No saved network — connect via web UI (AP mode)");
     }
@@ -1416,41 +1535,153 @@ static bool simInHeartbeatReport(int i) {
     return true;
 }
 
+// Heartbeat HTTPS uses large TLS/HTTP objects — must not live on loopTask stack (8KB).
+static HTTPClient gHbHttp;
+static WiFiClientSecure gHbTls;
+static WiFiClient gHbPlain;
+static char gHbUrl[280];
+static char gHbAuthHdr[AGENT_AUTH_HDR_SIZE];
+static char gHbBody[3072];
+static char gHbResp[1536];
+static char gHbNumEsc[72];
+static char gHbNormNum[PHONE_BUFFER_SIZE];
+
+static bool hbHttpBegin(const char* url, int timeoutMs) {
+    gHbTls.stop();
+    gHbPlain.stop();
+    gHbHttp.end();
+    const bool isHttps = (strncmp(url, "https://", 8) == 0);
+    if (isHttps) {
+        gHbTls.setInsecure();
+        gHbTls.setTimeout(timeoutMs);
+        return gHbHttp.begin(gHbTls, url);
+    }
+    gHbPlain.setTimeout(timeoutMs);
+    return gHbHttp.begin(gHbPlain, url);
+}
+
+static void hbHttpEnd() {
+    gHbHttp.end();
+    gHbTls.stop();
+    gHbPlain.stop();
+}
+
+int agentHttpsPostJson(const char* url, const char* jsonBody, int timeoutMs, bool addAuth,
+    char* respOut, size_t respOutSize, const char* opLabel) {
+    if (!url || !jsonBody || timeoutMs < 1000) {
+        return -1;
+    }
+    if (respOut && respOutSize > 0) {
+        respOut[0] = '\0';
+    }
+    if (!ensureWifiForHttps()) {
+        return -1;
+    }
+    if (httpsBusy) {
+        return -11;
+    }
+
+    const unsigned long t0 = millis();
+    if (opLabel && opLabel[0]) {
+        char startBuf[56];
+        snprintf(startBuf, sizeof(startBuf), "[HTTPS] %s starting", opLabel);
+        logMsg(startBuf);
+    }
+
+    httpsBusy = true;
+    wifiPrepareForHttps();
+
+    if (!hbHttpBegin(url, timeoutMs)) {
+        httpsBusy = false;
+        wifiRecoverAfterHttps();
+        return -1;
+    }
+
+    gHbHttp.addHeader("Content-Type", "application/json");
+    gHbHttp.setTimeout(timeoutMs);
+    if (addAuth && !charBufIsEmpty(agentBearerToken)) {
+        formatBearerHeader(gHbAuthHdr, sizeof(gHbAuthHdr), agentBearerToken);
+        gHbHttp.addHeader("Authorization", gHbAuthHdr);
+    }
+
+    handleWebRequests();
+    yield();
+    const int code = gHbHttp.POST(jsonBody);
+
+    if (code > 0 && respOut && respOutSize > 1) {
+        WiFiClient* stream = gHbHttp.getStreamPtr();
+        if (stream) {
+            size_t total = 0;
+            const unsigned long t0 = millis();
+            const unsigned long readLimitMs = (unsigned long)timeoutMs + 2000UL;
+            while (millis() - t0 < readLimitMs && total < respOutSize - 1) {
+                if (stream->available()) {
+                    const int n = stream->read(
+                        (uint8_t*)(respOut + total),
+                        (int)(respOutSize - 1 - total)
+                    );
+                    if (n > 0) {
+                        total += (size_t)n;
+                    }
+                } else if (!gHbHttp.connected()) {
+                    break;
+                } else {
+                    handleWebRequests();
+                    yield();
+                    delay(2);
+                }
+            }
+            respOut[total] = '\0';
+        }
+    }
+
+    hbHttpEnd();
+    httpsBusy = false;
+    wifiRecoverAfterHttps();
+
+    if (opLabel && opLabel[0]) {
+        const unsigned long elapsedMs = millis() - t0;
+        char doneBuf[72];
+        snprintf(doneBuf, sizeof(doneBuf), "[HTTPS] %s done %lums code=%d",
+            opLabel, elapsedMs, code);
+        logMsg(doneBuf);
+    }
+    return code;
+}
+
+void resetAgentInventoryHeartbeat() {
+    agentInventoryHeartbeatDone = false;
+}
+
 static void fetchHeartbeatFollowup() {
     if (charBufIsEmpty(agentBaseUrl) || charBufIsEmpty(agentBearerToken) || charBufIsEmpty(agentRefreshToken)) return;
     if (httpsBusy || !ensureWifiForHttps()) return;
 
-    static char url[256];
-    snprintf(url, sizeof(url), "%s/api/agent/heartbeat/followup", agentBaseUrl);
+    snprintf(gHbUrl, sizeof(gHbUrl), "%s/api/agent/heartbeat/followup", agentBaseUrl);
 
-    static char body[2048];
-    size_t pos = snprintf(body, sizeof(body), "{\"device_id\":\"%s\",\"sim_numbers\":[", agentDeviceId);
+    size_t pos = snprintf(gHbBody, sizeof(gHbBody), "{\"device_id\":\"%s\",\"sim_numbers\":[", agentDeviceId);
 
     bool firstNum = true;
-    for (int i = 0; i < SIM_COUNT && pos < sizeof(body) - 300; i++) {
+    for (int i = 0; i < SIM_COUNT && pos < sizeof(gHbBody) - 300; i++) {
         if (!simInHeartbeatReport(i)) continue;
-        char normalizedNum[PHONE_BUFFER_SIZE];
-        normalizeSimNumber(simStates[i].number, normalizedNum, sizeof(normalizedNum));
-        char numEsc[64];
-        jsonEscape(normalizedNum, numEsc, sizeof(numEsc));
-        if (!firstNum) pos += snprintf(body + pos, sizeof(body) - pos, ",");
+        normalizeSimNumber(simStates[i].number, gHbNormNum, sizeof(gHbNormNum));
+        jsonEscape(gHbNormNum, gHbNumEsc, sizeof(gHbNumEsc));
+        if (!firstNum) pos += snprintf(gHbBody + pos, sizeof(gHbBody) - pos, ",");
         firstNum = false;
-        pos += snprintf(body + pos, sizeof(body) - pos, "%s", numEsc);
+        pos += snprintf(gHbBody + pos, sizeof(gHbBody) - pos, "%s", gHbNumEsc);
     }
 
-    pos += snprintf(body + pos, sizeof(body) - pos, "],\"sim_slots\":[");
+    pos += snprintf(gHbBody + pos, sizeof(gHbBody) - pos, "],\"sim_slots\":[");
     bool firstSlot = true;
-    for (int i = 0; i < SIM_COUNT && pos < sizeof(body) - 200; i++) {
+    for (int i = 0; i < SIM_COUNT && pos < sizeof(gHbBody) - 200; i++) {
         if (!simInHeartbeatReport(i)) continue;
-        char normalizedNum[PHONE_BUFFER_SIZE];
-        normalizeSimNumber(simStates[i].number, normalizedNum, sizeof(normalizedNum));
-        char numEsc[64];
-        jsonEscape(normalizedNum, numEsc, sizeof(numEsc));
-        if (!firstSlot) pos += snprintf(body + pos, sizeof(body) - pos, ",");
+        normalizeSimNumber(simStates[i].number, gHbNormNum, sizeof(gHbNormNum));
+        jsonEscape(gHbNormNum, gHbNumEsc, sizeof(gHbNumEsc));
+        if (!firstSlot) pos += snprintf(gHbBody + pos, sizeof(gHbBody) - pos, ",");
         firstSlot = false;
-        pos += snprintf(body + pos, sizeof(body) - pos, "{\"number\":%s,\"slot\":%d}", numEsc, i);
+        pos += snprintf(gHbBody + pos, sizeof(gHbBody) - pos, "{\"number\":%s,\"slot\":%d}", gHbNumEsc, i);
     }
-    pos += snprintf(body + pos, sizeof(body) - pos, "]}");
+    pos += snprintf(gHbBody + pos, sizeof(gHbBody) - pos, "]}");
 
     if (firstNum) {
         return;
@@ -1459,49 +1690,33 @@ static void fetchHeartbeatFollowup() {
     logMsg("[HEARTBEAT] Followup POST");
     httpsBusy = true;
     wifiPrepareForHttps();
-    HTTPClient http;
-    WiFiClientSecure clientSecure;
-    WiFiClient clientPlain;
-    const bool isHttps = (strncmp(url, "https://", 8) == 0);
-    bool begun = false;
 
-    if (isHttps) {
-        clientSecure.setInsecure();
-        clientSecure.setTimeout(25000);
-        begun = http.begin(clientSecure, url);
-    } else {
-        clientPlain.setTimeout(25000);
-        begun = http.begin(clientPlain, url);
-    }
-
-    if (!begun) {
+    if (!hbHttpBegin(gHbUrl, 25000)) {
         httpsBusy = false;
         wifiRecoverAfterHttps();
         return;
     }
 
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(25000);
-    static char authHdrFollow[AGENT_AUTH_HDR_SIZE];
-    formatBearerHeader(authHdrFollow, sizeof(authHdrFollow), agentBearerToken);
-    http.addHeader("Authorization", authHdrFollow);
+    gHbHttp.addHeader("Content-Type", "application/json");
+    gHbHttp.setTimeout(25000);
+    formatBearerHeader(gHbAuthHdr, sizeof(gHbAuthHdr), agentBearerToken);
+    gHbHttp.addHeader("Authorization", gHbAuthHdr);
 
-    const int code = http.POST(body);
+    const int code = gHbHttp.POST(gHbBody);
 
-    static char respBuf[2048];
-    respBuf[0] = '\0';
+    gHbResp[0] = '\0';
     if (code > 0) {
-        WiFiClient* stream = http.getStreamPtr();
+        WiFiClient* stream = gHbHttp.getStreamPtr();
         if (stream) {
-            unsigned long t0 = millis();
+            const unsigned long t0 = millis();
             int total = 0;
-            while (millis() - t0 < 6000 && total < (int)sizeof(respBuf) - 1) {
+            while (millis() - t0 < 6000 && total < (int)sizeof(gHbResp) - 1) {
                 if (stream->available()) {
-                    int n = stream->read((uint8_t*)(respBuf + total), sizeof(respBuf) - 1 - total);
+                    const int n = stream->read((uint8_t*)(gHbResp + total), sizeof(gHbResp) - 1 - total);
                     if (n > 0) {
                         total += n;
                     }
-                } else if (!http.connected()) {
+                } else if (!gHbHttp.connected()) {
                     break;
                 } else {
                     handleWebRequests();
@@ -1509,21 +1724,16 @@ static void fetchHeartbeatFollowup() {
                     delay(2);
                 }
             }
-            respBuf[total] = '\0';
+            gHbResp[total] = '\0';
         }
     }
 
-    http.end();
-    if (isHttps) {
-        clientSecure.stop();
-    } else {
-        clientPlain.stop();
-    }
+    hbHttpEnd();
     httpsBusy = false;
     wifiRecoverAfterHttps();
 
-    if (code >= 200 && code < 300 && respBuf[0] != '\0') {
-        parseActiveSessionsFromJson(respBuf);
+    if (code >= 200 && code < 300 && gHbResp[0] != '\0') {
+        parseActiveSessionsFromJson(gHbResp);
         if (activeSessionCount > 0) {
             logMsgInt("[HEARTBEAT] Followup sessions", activeSessionCount);
         }
@@ -1531,12 +1741,6 @@ static void fetchHeartbeatFollowup() {
         pruneExpiredActiveSessions();
         maintenanceOnSessionsUpdated();
     }
-}
-
-static bool agentInventoryHeartbeatDone = false;
-
-void resetAgentInventoryHeartbeat() {
-    agentInventoryHeartbeatDone = false;
 }
 
 static int heartbeatLowestBatteryPercent() {
@@ -1555,10 +1759,20 @@ static int heartbeatLowestBatteryPercent() {
 }
 
 static void performHeartbeatPing() {
+    if (!ensureWifiForHttps()) {
+        logMsg("[HEARTBEAT] Ping skipped (no WiFi)");
+        return;
+    }
+    if (httpsBusy || httpsStackNeedsSettle()) {
+        return;
+    }
+    if (isSmsForwardPriorityActive()) {
+        logHeartbeatWaitThrottled("pending SMS forward");
+        return;
+    }
+
     lastHeartbeatMs = millis();
-    httpsBusy = true;
-    pauseSmsPolling(HEARTBEAT_PING_PAUSE_MS);
-    wifiPrepareForHttps();
+    pauseSmsPolling(2000);
     logMsg("[HEARTBEAT] Ping starting");
     appendMonitorLog("[HEARTBEAT] Ping starting");
 
@@ -1568,55 +1782,14 @@ static void performHeartbeatPing() {
         delay(200);
     }
 
-    char url[256];
-    snprintf(url, sizeof(url), "%s/api/agent/ping", agentBaseUrl);
-    const bool isHttps = (strncmp(url, "https://", 8) == 0);
-
-    HTTPClient http;
-    WiFiClientSecure clientSecure;
-    WiFiClient client;
-
-    if (isHttps) {
-        clientSecure.setInsecure();
-        clientSecure.setTimeout(HEARTBEAT_PING_TIMEOUT_MS);
-        if (!http.begin(clientSecure, url)) {
-            logMsg("[HEARTBEAT] Ping begin failed");
-            httpsBusy = false;
-            wifiRecoverAfterHttps();
-            resumeSmsPolling();
-            return;
-        }
-    } else if (!http.begin(client, url)) {
-        logMsg("[HEARTBEAT] Ping begin failed");
-        httpsBusy = false;
-        wifiRecoverAfterHttps();
-        resumeSmsPolling();
-        return;
-    }
-
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(HEARTBEAT_PING_TIMEOUT_MS);
-
-    static char authHdr[AGENT_AUTH_HDR_SIZE];
-    if (!charBufIsEmpty(agentBearerToken)) {
-        formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
-        http.addHeader("Authorization", authHdr);
-    }
-
-    static char body[128];
-    snprintf(body, sizeof(body),
+    snprintf(gHbUrl, sizeof(gHbUrl), "%s/api/agent/ping", agentBaseUrl);
+    snprintf(gHbBody, sizeof(gHbBody),
         "{\"device_id\":\"%s\",\"battery_level\":%d}",
         agentDeviceId,
         heartbeatLowestBatteryPercent());
 
-    handleWebRequests();
-    int code = http.POST(body);
-    http.end();
-    clientSecure.stop();
-    client.stop();
-
-    httpsBusy = false;
-    wifiRecoverAfterHttps();
+    const int code = agentHttpsPostJson(
+        gHbUrl, gHbBody, HEARTBEAT_PING_TIMEOUT_MS, true, nullptr, 0, "ping");
     resumeSmsPolling();
 
     if (code >= 200 && code < 300) {
@@ -1641,16 +1814,12 @@ void performHeartbeat() {
     if (isSimBusy() || millis() < modemGatewayStableUntilMs) {
         return;
     }
-    if (getPendingSmsCount() > 0) {
+    if (!agentInventoryHeartbeatDone && getPendingSmsCount() > 0) {
+        logHeartbeatWaitThrottled("pending SMS (full sync)");
         return;
     }
     if (charBufIsEmpty(agentBearerToken) || charBufIsEmpty(agentRefreshToken)) {
-        static unsigned long lastAuthSkipLogMs = 0;
-        unsigned long now = millis();
-        if (now - lastAuthSkipLogMs > 15000UL) {
-            lastAuthSkipLogMs = now;
-            appendMonitorLog("[HEARTBEAT] Skipped (not signed in)");
-        }
+        logHeartbeatWaitThrottled("not signed in");
         return;
     }
     
@@ -1686,119 +1855,93 @@ void performHeartbeat() {
         delay(500);
     }
     
-    // Send heartbeat to backend
-    char url[256];
-    snprintf(url, sizeof(url), "%s/api/agent/heartbeat", agentBaseUrl);
-    
-    bool isHttps = (strncmp(url, "https://", 8) == 0);
-    
-    HTTPClient http;
-    WiFiClientSecure clientSecure;
-    WiFiClient client;
-    
-    if (isHttps) {
-        clientSecure.setInsecure();
-        clientSecure.setTimeout(HEARTBEAT_FULL_TIMEOUT_MS);
-        if (!http.begin(clientSecure, url)) {
-            logMsg("[HEARTBEAT] HTTPS begin failed");
-            appendMonitorLog("[HEARTBEAT] HTTPS begin failed");
-            httpsBusy = false;
-            wifiRecoverAfterHttps();
-            resumeSmsPolling();
-            return;
-        }
-    } else {
-        if (!http.begin(client, url)) {
-            logMsg("[HEARTBEAT] HTTP begin failed");
-            appendMonitorLog("[HEARTBEAT] HTTP begin failed");
-            httpsBusy = false;
-            wifiRecoverAfterHttps();
-            resumeSmsPolling();
-            return;
-        }
+    snprintf(gHbUrl, sizeof(gHbUrl), "%s/api/agent/heartbeat", agentBaseUrl);
+
+    if (!hbHttpBegin(gHbUrl, HEARTBEAT_FULL_TIMEOUT_MS)) {
+        logMsg("[HEARTBEAT] HTTPS begin failed");
+        appendMonitorLog("[HEARTBEAT] HTTPS begin failed");
+        httpsBusy = false;
+        wifiRecoverAfterHttps();
+        resumeSmsPolling();
+        return;
     }
-    
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(HEARTBEAT_FULL_TIMEOUT_MS);
-    
-    static char authHdr[AGENT_AUTH_HDR_SIZE];
+
+    gHbHttp.addHeader("Content-Type", "application/json");
+    gHbHttp.setTimeout(HEARTBEAT_FULL_TIMEOUT_MS);
+
     if (!charBufIsEmpty(agentBearerToken)) {
-        formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
-        http.addHeader("Authorization", authHdr);
+        formatBearerHeader(gHbAuthHdr, sizeof(gHbAuthHdr), agentBearerToken);
+        gHbHttp.addHeader("Authorization", gHbAuthHdr);
     }
 
     if (HEARTBEAT_DEBUG) {
-        http.addHeader("x-heartbeat-debug", "1");
+        gHbHttp.addHeader("x-heartbeat-debug", "1");
     }
 
-    // Full inventory sync once after modem init (signal/slot/number + optional disable missing)
-    static char body[3072];
     const int lowestBatteryPercent = heartbeatLowestBatteryPercent();
-    
+
     size_t pos = 0;
-    pos += snprintf(body + pos, sizeof(body) - pos,
+    pos += snprintf(gHbBody + pos, sizeof(gHbBody) - pos,
         "{\"device_id\":\"%s\",\"battery_level\":%d,\"inventory_sync\":true,\"sims\":[",
         agentDeviceId,
         lowestBatteryPercent
     );
 
     bool first = true;
-    for (int i = 0; i < SIM_COUNT && pos < sizeof(body) - 300; i++) {
+    for (int i = 0; i < SIM_COUNT && pos < sizeof(gHbBody) - 300; i++) {
         if (!simInHeartbeatReport(i)) continue;
 
-        if (!first) pos += snprintf(body + pos, sizeof(body) - pos, ",");
+        if (!first) pos += snprintf(gHbBody + pos, sizeof(gHbBody) - pos, ",");
         first = false;
 
-        char numEsc[64];
-        char normalizedNum[PHONE_BUFFER_SIZE];
-        normalizeSimNumber(simStates[i].number, normalizedNum, sizeof(normalizedNum));
-        jsonEscape(normalizedNum, numEsc, sizeof(numEsc));
-        
-        int signal = extractSignalQuality(simStates[i].csq);
+        normalizeSimNumber(simStates[i].number, gHbNormNum, sizeof(gHbNormNum));
+        jsonEscape(gHbNormNum, gHbNumEsc, sizeof(gHbNumEsc));
+
+        const int signal = extractSignalQuality(simStates[i].csq);
         const char* netType = simStates[i].networkType[0] ? simStates[i].networkType : "2G";
-        
-        pos += snprintf(body + pos, sizeof(body) - pos,
+
+        pos += snprintf(gHbBody + pos, sizeof(gHbBody) - pos,
             "{\"number\":%s,\"slot\":%d,\"status\":\"ACTIVE\",\"signal_strength\":%d,\"network_type\":\"%s\"}",
-            numEsc,
+            gHbNumEsc,
             i,
             signal,
             netType
         );
     }
 
-    pos += snprintf(body + pos, sizeof(body) - pos, "]}");
+    pos += snprintf(gHbBody + pos, sizeof(gHbBody) - pos, "]}");
 
     if (HEARTBEAT_DEBUG) {
         logMsg("[HEARTBEAT][DBG] Request body:");
         appendMonitorLog("[HEARTBEAT][DBG] Request body:");
-        logMsg(body);
-        appendMonitorLog(body);
+        logMsg(gHbBody);
+        appendMonitorLog(gHbBody);
     }
 
-    static char respBuf[2048];
-    respBuf[0] = '\0';
+    gHbResp[0] = '\0';
 
     int attempt = 0;
     int code = -1;
 
     while (attempt < 2) {
         handleWebRequests();
-        code = http.POST(body);
+        yield();
+        code = gHbHttp.POST(gHbBody);
         if (code > 0) {
-            WiFiClient* stream = http.getStreamPtr();
+            WiFiClient* stream = gHbHttp.getStreamPtr();
             if (stream) {
                 size_t total = 0;
-                unsigned long t0 = millis();
-                while (millis() - t0 < 20000UL && total < sizeof(respBuf) - 1) {
+                const unsigned long t0 = millis();
+                while (millis() - t0 < 20000UL && total < sizeof(gHbResp) - 1) {
                     if (stream->available()) {
                         const int n = stream->read(
-                            (uint8_t*)(respBuf + total),
-                            (int)(sizeof(respBuf) - 1 - total)
+                            (uint8_t*)(gHbResp + total),
+                            (int)(sizeof(gHbResp) - 1 - total)
                         );
                         if (n > 0) {
                             total += (size_t)n;
                         }
-                    } else if (!http.connected()) {
+                    } else if (!gHbHttp.connected()) {
                         break;
                     } else {
                         handleWebRequests();
@@ -1806,46 +1949,32 @@ void performHeartbeat() {
                         delay(5);
                     }
                 }
-                respBuf[total] = '\0';
+                gHbResp[total] = '\0';
             }
         }
-        http.end();
-        
-        // HTTP status received — done (even 4xx/5xx)
+        gHbHttp.end();
+
         if (code > 0) break;
 
-        // Connection error — one retry without disconnecting WiFi (ensureWifiForHttps drops STA)
         if (code < 0 && attempt == 0) {
             logMsgInt("[HEARTBEAT] Conn error, retrying", code);
-            clientSecure.stop();
-            client.stop();
+            hbHttpEnd();
             for (int i = 0; i < 5; i++) {
                 handleWebRequests();
                 delay(30);
             }
-            if (!WiFi.isConnected()) {
-                if (!ensureWifiForHttps()) {
-                    break;
-                }
+            if (!WiFi.isConnected() && !ensureWifiForHttps()) {
+                break;
             }
             delay(200);
-
-            if (isHttps) {
-                clientSecure.setInsecure();
-                clientSecure.setTimeout(15000);
-                if (!http.begin(clientSecure, url)) {
-                    break;
-                }
-            } else {
-                if (!http.begin(client, url)) {
-                    break;
-                }
+            if (!hbHttpBegin(gHbUrl, 15000)) {
+                break;
             }
-            http.addHeader("Content-Type", "application/json");
-            http.setTimeout(15000);
+            gHbHttp.addHeader("Content-Type", "application/json");
+            gHbHttp.setTimeout(15000);
             if (!charBufIsEmpty(agentBearerToken)) {
-                formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
-                http.addHeader("Authorization", authHdr);
+                formatBearerHeader(gHbAuthHdr, sizeof(gHbAuthHdr), agentBearerToken);
+                gHbHttp.addHeader("Authorization", gHbAuthHdr);
             }
         }
         attempt++;
@@ -1855,8 +1984,7 @@ void performHeartbeat() {
         logMsgInt("[HEARTBEAT] Failed, code", code);
         appendMonitorLogInt("[HEARTBEAT] Failed", code);
         appendErrorLogInt("[HEARTBEAT] Connection failed", code);
-        clientSecure.stop();
-        client.stop();
+        hbHttpEnd();
         httpsBusy = false;
         wifiRecoverAfterHttps();
         resumeSmsPolling();
@@ -1865,54 +1993,48 @@ void performHeartbeat() {
         appendMonitorLog("[HEARTBEAT] Backoff 2m");
         return;
     }
-    
+
     if (code == 401) {
-        // Stop previous connection before refresh
-        http.end();
-        clientSecure.stop();
-        client.stop();
-        delay(100);  // Let TCP fully close
-        
+        hbHttpEnd();
+        delay(100);
+
         if (refreshAgentToken()) {
-            if (isHttps) {
-                clientSecure.setInsecure();
-                http.begin(clientSecure, url);
-            } else {
-                http.begin(client, url);
-            }
-            http.addHeader("Content-Type", "application/json");
-            if (!charBufIsEmpty(agentBearerToken)) {
-                formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
-                http.addHeader("Authorization", authHdr);
-            }
-            code = http.POST(body);
-            respBuf[0] = '\0';
-            if (code > 0) {
-                WiFiClient* stream = http.getStreamPtr();
-                if (stream) {
-                    size_t total = 0;
-                    unsigned long t0 = millis();
-                    while (millis() - t0 < 20000UL && total < sizeof(respBuf) - 1) {
-                        if (stream->available()) {
-                            const int n = stream->read(
-                                (uint8_t*)(respBuf + total),
-                                (int)(sizeof(respBuf) - 1 - total)
-                            );
-                            if (n > 0) {
-                                total += (size_t)n;
-                            }
-                        } else if (!http.connected()) {
-                            break;
-                        } else {
-                            handleWebRequests();
-                            yield();
-                            delay(5);
-                        }
-                    }
-                    respBuf[total] = '\0';
+            if (hbHttpBegin(gHbUrl, HEARTBEAT_FULL_TIMEOUT_MS)) {
+                gHbHttp.addHeader("Content-Type", "application/json");
+                gHbHttp.setTimeout(HEARTBEAT_FULL_TIMEOUT_MS);
+                if (!charBufIsEmpty(agentBearerToken)) {
+                    formatBearerHeader(gHbAuthHdr, sizeof(gHbAuthHdr), agentBearerToken);
+                    gHbHttp.addHeader("Authorization", gHbAuthHdr);
                 }
+                code = gHbHttp.POST(gHbBody);
+                gHbResp[0] = '\0';
+                if (code > 0) {
+                    WiFiClient* stream = gHbHttp.getStreamPtr();
+                    if (stream) {
+                        size_t total = 0;
+                        const unsigned long t0 = millis();
+                        while (millis() - t0 < 20000UL && total < sizeof(gHbResp) - 1) {
+                            if (stream->available()) {
+                                const int n = stream->read(
+                                    (uint8_t*)(gHbResp + total),
+                                    (int)(sizeof(gHbResp) - 1 - total)
+                                );
+                                if (n > 0) {
+                                    total += (size_t)n;
+                                }
+                            } else if (!gHbHttp.connected()) {
+                                break;
+                            } else {
+                                handleWebRequests();
+                                yield();
+                                delay(5);
+                            }
+                        }
+                        gHbResp[total] = '\0';
+                    }
+                }
+                gHbHttp.end();
             }
-            http.end();
         }
     }
 
@@ -1928,25 +2050,23 @@ void performHeartbeat() {
 
     if (HEARTBEAT_DEBUG) {
         appendMonitorLogInt("[HEARTBEAT][DBG] HTTP code", code);
-        if (respBuf[0]) {
+        if (gHbResp[0]) {
             appendMonitorLog("[HEARTBEAT][DBG] Response (trunc):");
-            appendMonitorLog(respBuf);
+            appendMonitorLog(gHbResp);
         } else {
             appendMonitorLog("[HEARTBEAT][DBG] Empty response body");
         }
     }
-    
-    // http.end() already called in retry loop — do NOT call http.end() again (causes hang)
-    clientSecure.stop();
-    client.stop();
+
+    hbHttpEnd();
     delay(50);
-    
+
     httpsBusy = false;
     wifiRecoverAfterHttps();
     resumeSmsPolling();
 
-    if (code >= 200 && code < 300 && respBuf[0] != '\0') {
-        applyBackendSimStatusFromJson(respBuf);
+    if (code >= 200 && code < 300 && gHbResp[0] != '\0') {
+        applyBackendSimStatusFromJson(gHbResp);
 #if HEARTBEAT_FOLLOWUP_ENABLED
         pendingHeartbeatFollowup = !charBufIsEmpty(agentBearerToken);
 #else
