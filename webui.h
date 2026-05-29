@@ -21,6 +21,9 @@ void initWebUI();
 // Handle web requests in main loop
 void handleWebRequests();
 
+// True while web "refresh all SIMs" scan holds the modem
+bool isWebRefreshAllInProgress();
+
 // -----------------------------------------------------------------------------
 // Route Handlers - Status
 // -----------------------------------------------------------------------------
@@ -49,6 +52,15 @@ void handleSaveWifi();
 
 // GET /disconnect - Disconnect WiFi
 void handleDisconnect();
+
+// POST /modem-start - Queue SIM800 init + polling (manual Run button)
+void handleModemStart();
+
+// POST /modem-stop - Stop SMS poll / watchdog
+void handleModemStop();
+
+// POST /network-ping - DNS + TCP/HTTPS reachability test
+void handleNetworkPing();
 
 // -----------------------------------------------------------------------------
 // Route Handlers - SIM Management

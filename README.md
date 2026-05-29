@@ -63,7 +63,7 @@ gh repo create sim800_gateway --private --source=. --remote=origin --push
 
 All `.ino`, `.cpp`, `.h` files in this folder. Images (`icon-logo.png`, etc.) are included if you `git add .`.
 
-**Before pushing:** consider removing real WiFi passwords from `config.h` (`DEFAULT_WIFI_*`) or use only the web UI / NVS after first boot.
+**WiFi:** No default STA credentials in firmware — connect via the device AP and the web UI **Scan / Connect** flow. If an old network was saved in flash, use **Disconnect** and pick your network again.
 
 ---
 

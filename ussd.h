@@ -29,3 +29,6 @@ void ussdWriteBulkStatusJson(char* buf, size_t bufSize);
 bool ussdManualInProgress();
 bool ussdStartManual(int slot);
 void ussdWriteManualStatusJson(char* buf, size_t bufSize);
+
+// True while *143# manual/bulk (or gap between bulk slots) — block SMS poll
+bool ussdBlocksSmsPoll();

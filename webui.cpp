@@ -13,6 +13,7 @@
 #include "utils.h"
 #include "ussd.h"
 #include "maintenance.h"
+#include "network_ping.h"
 #include <WiFi.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
@@ -46,11 +47,12 @@ extern int readErrorsFromFile(char* buf, size_t bufSize, int maxErrors);
 // External state from main .ino
 extern SimState simStates[SIM_COUNT];
 extern char wifiSsid[64];
+extern unsigned long wifiUserSetupUntilMs;
 extern char wifiPassword[64];
 extern char agentBaseUrl[128];
 extern char agentDeviceId[64];
-extern char agentBearerToken[1024];  // JWT tokens can be 700+ chars
-extern char agentRefreshToken[512];
+extern char agentBearerToken[AGENT_BEARER_TOKEN_SIZE];
+extern char agentRefreshToken[AGENT_REFRESH_TOKEN_SIZE];
 extern char agentSimNumber[PHONE_BUFFER_SIZE];
 extern int agentSimSlot;
 extern char agentApiPath[64];
@@ -1326,6 +1328,11 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
           <span class="nav-item-label">Messages</span>
           <span class="nav-badge" id="msgBadge">0</span>
         </div>
+        <div class="nav-item" data-tab="account" onclick="switchTab('account')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+          <span class="nav-item-label">Account</span>
+          <span class="nav-badge" id="accountNavBadge" style="display:none;">!</span>
+        </div>
         <div class="nav-item" data-tab="settings" onclick="switchTab('settings')">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
           <span class="nav-item-label">Settings</span>
@@ -1355,7 +1362,8 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
           <div class="logo-icon" style="width:28px;height:28px;font-size:14px;">OT</div>
           <span style="font-weight:600;">OTPocket Agent</span>
         </div>
-        <div class="header-status">
+        <div class="header-status" style="display:flex;align-items:center;gap:8px;">
+          <span class="badge warning hide" id="offlineModeBadge" style="font-size:11px;">Offline</span>
           <div class="status-dot" id="statusDot"></div>
         </div>
       </header>
@@ -1365,8 +1373,8 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
         Scheduled restart in <span class="mobile-restart-strip-timer" id="mobileRestartTimer">—</span>
       </div>
     
-    <!-- Login Page (shown when not logged in) -->
-    <div id="loginPage" class="container login-container">
+    <!-- Legacy login page (hidden — use Account tab) -->
+    <div id="loginPage" class="container login-container hide">
       <div style="max-width:400px;width:100%;">
         <!-- Logo -->
         <div style="text-align:center;margin-bottom:24px;">
@@ -1401,14 +1409,51 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
           </div>
           <button class="btn full" id="loginBtn" style="margin-top:8px;">Sign In</button>
         </form>
+
+        <div id="loginGraceBanner" class="hide" style="margin-top:12px;padding:12px;border-radius:8px;background:rgba(34,197,94,0.12);border:1px solid rgba(34,197,94,0.25);">
+          <p style="font-size:13px;color:var(--success);margin:0 0 6px 0;" id="loginGraceText">Signed in — WiFi details stay visible below.</p>
+          <button type="button" class="btn sm secondary" id="loginGraceContinueBtn">Open dashboard now</button>
+        </div>
         
-        <p class="muted text-sm" style="margin-top:12px;text-align:center;">Configure WiFi in Settings after sign in.</p>
+        <div class="card" id="loginModemRunCard" style="margin-top:12px;">
+          <div class="card-header" style="border-bottom:1px solid var(--border);padding-bottom:10px;margin-bottom:12px;">
+            <div class="card-title" style="font-size:14px;">SIM800 gateway</div>
+            <span class="badge warning" id="loginModemRunBadge">Idle</span>
+          </div>
+          <p class="muted text-sm" style="margin-bottom:10px;" id="loginModemRunHint">Connect WiFi first, then run SIM init when modems are powered.</p>
+          <button type="button" class="btn full" id="loginModemRunBtn">Run — init SIM slots</button>
+        </div>
+
+        <div class="card" style="margin-top:12px;">
+          <div class="card-header" style="border-bottom:1px solid var(--border);padding-bottom:10px;margin-bottom:12px;">
+            <div class="card-title" style="font-size:14px;">WiFi Setup (AP mode)</div>
+            <span class="badge danger" id="loginWifiBadge">Disconnected</span>
+          </div>
+          <p class="muted text-sm" style="margin-bottom:10px;">
+            Not connected yet? Configure WiFi here so the gateway can go online.
+          </p>
+          <div id="loginWifiConnected" class="hide" style="margin-bottom:10px;">
+            <div class="row mb-2"><span class="muted text-sm">Network</span><span class="text-sm" id="loginWifiSsid">-</span></div>
+            <div class="row mb-2"><span class="muted text-sm">IP</span><span class="text-sm" id="loginWifiIp">-</span></div>
+            <div class="row mb-2"><span class="muted text-sm">Gateway</span><span class="text-sm" id="loginWifiGw">-</span></div>
+            <div class="row mb-2"><span class="muted text-sm">DNS</span><span class="text-sm" id="loginWifiDns">-</span></div>
+            <div class="row mb-2"><span class="muted text-sm">URL</span><span class="text-sm" id="loginWifiUrl">-</span></div>
+            <p id="loginWifiNetWarn" class="hide text-sm" style="color:var(--warning);margin-bottom:8px;">WiFi connected but gateway or DNS missing — login/HTTPS may fail. Disable guest isolation or use 2.4GHz WPA2.</p>
+            <button class="btn secondary full mb-2" id="copyLoginStaUrlBtn">Copy STA URL</button>
+            <button class="btn secondary full mb-2" id="loginDisconnectBtn">Disconnect WiFi</button>
+          </div>
+          <button class="btn secondary full mb-2" id="loginScanBtn">Scan Networks</button>
+          <div id="loginScanResults" class="grid mb-2"></div>
+          <input id="loginManualSsid" placeholder="SSID" style="margin-bottom:8px;" autocomplete="off" />
+          <input id="loginManualPw" type="password" placeholder="Password" style="margin-bottom:8px;" />
+          <button class="btn full" id="loginConnectBtn">Connect WiFi</button>
+        </div>
       </div>
     </div>
   </div>
   
-  <!-- Main app (shown when logged in) -->
-  <div id="dashboardPage" class="container hide">
+  <!-- Main app (always available; sign-in optional) -->
+  <div id="dashboardPage" class="container">
     
     <!-- SIM Slots Tab -->
     <div class="tab-content active" id="tab-sims">
@@ -1426,6 +1471,18 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
         <div id="ussdBulkCollapse" class="ussd-bulk-collapse">
           <div id="ussdBulkBody" class="muted text-sm" style="padding:0 16px 14px;">*143# All: slots with a number only (Off OK).</div>
         </div>
+      </div>
+
+      <div class="card" id="modemRunCard" style="margin-bottom:12px;">
+        <div class="card-header" style="border-bottom:1px solid var(--border);padding-bottom:10px;margin-bottom:12px;">
+          <div>
+            <div class="card-title" style="font-size:15px;">SIM800 gateway</div>
+            <p class="muted text-sm" id="modemRunHint">Idle — init modems and start SMS polling when ready.</p>
+          </div>
+          <span class="badge warning" id="modemRunBadge">Idle</span>
+        </div>
+        <button type="button" class="btn full" id="modemRunBtn">Run — init SIM slots &amp; start polling</button>
+        <button type="button" class="btn secondary full hide" id="modemStopBtn" style="margin-top:8px;">Stop modem tasks</button>
       </div>
 
       <div class="card sim-slots-card">
@@ -1486,6 +1543,59 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
       </div>
     </div>
     
+    <!-- Account Tab (optional sign-in) -->
+    <div class="tab-content" id="tab-account">
+      <div class="page-header">
+        <h1 class="page-title">Account</h1>
+        <p class="page-subtitle">Sign in to enable cloud SMS forward and heartbeat</p>
+      </div>
+
+      <div class="card" id="accountOfflineCard">
+        <div class="card-header">
+          <div class="card-title">Offline mode</div>
+          <span class="badge warning" id="accountModeBadge">Not signed in</span>
+        </div>
+        <p class="muted text-sm" style="margin-bottom:12px;">
+          The full panel works without login. SIM init, WiFi, ping, and logs run locally.
+          SMS forward, heartbeat, and other backend HTTP calls stay disabled until you sign in.
+        </p>
+      </div>
+
+      <div class="card" id="accountLoginCard">
+        <div class="card-header" style="border-bottom:1px solid var(--border);padding-bottom:12px;margin-bottom:16px;">
+          <div class="card-title">Sign in</div>
+        </div>
+        <div id="accountLoginError" class="hide" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);border-radius:8px;padding:12px;margin-bottom:16px;">
+          <p style="font-size:13px;color:var(--danger);" id="accountLoginErrorText"></p>
+        </div>
+        <form onsubmit="return false;">
+          <div class="form-group">
+            <label for="accountLoginEmail">Email</label>
+            <input id="accountLoginEmail" type="email" placeholder="your@email.com" autocomplete="email" />
+          </div>
+          <div class="form-group">
+            <label for="accountLoginPassword">Password</label>
+            <input id="accountLoginPassword" type="password" placeholder="Password" autocomplete="current-password" />
+          </div>
+          <button class="btn full" id="accountLoginBtn" type="button">Sign in</button>
+        </form>
+      </div>
+
+      <div class="card hide" id="accountSignedInCard">
+        <div class="card-header">
+          <div class="card-title">Signed in</div>
+          <span class="badge success">Online</span>
+        </div>
+        <div class="row mb-2"><span class="muted text-sm">Device</span><span class="badge primary" id="accountDeviceBadge">-</span></div>
+        <div class="row mb-2"><span class="muted text-sm">SIMs registered</span><span class="text-sm" id="accountSimsRegCount">-</span></div>
+        <div class="btn-group">
+          <button class="btn sm secondary" id="accountRegisterDeviceBtn">Register device</button>
+          <button class="btn sm secondary" id="accountRefreshTokenBtn">Refresh token</button>
+          <button class="btn sm danger" id="accountLogoutBtn">Sign out</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Settings Tab -->
     <div class="tab-content" id="tab-settings">
       <div class="page-header">
@@ -1500,6 +1610,11 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
         <div id="wifiConnected" class="hide">
           <div class="row mb-2"><span class="muted text-sm">Network</span><span class="text-sm" id="wifiSsid">-</span></div>
           <div class="row mb-2"><span class="muted text-sm">IP</span><span class="text-sm" id="wifiIp">-</span></div>
+          <div class="row mb-2"><span class="muted text-sm">Gateway</span><span class="text-sm" id="wifiGw">-</span></div>
+          <div class="row mb-2"><span class="muted text-sm">DNS</span><span class="text-sm" id="wifiDns">-</span></div>
+          <div class="row mb-2"><span class="muted text-sm">URL</span><span class="text-sm" id="wifiUrl">-</span></div>
+          <p id="wifiNetWarn" class="hide text-sm" style="color:var(--warning);margin-bottom:8px;">Connected to router but no internet route (bad gateway/DNS).</p>
+          <button class="btn secondary sm" id="copyStaUrlBtn">Copy STA URL</button>
           <button class="btn secondary sm" id="disconnectBtn">Disconnect</button>
         </div>
         <div id="wifiSetup">
@@ -1511,16 +1626,40 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
         </div>
       </div>
 
+      <div class="card" id="networkTestCard">
+        <div class="card-header">
+          <div class="card-title">Ping</div>
+        </div>
+        <p class="muted text-sm" style="margin-bottom:10px;">Like <code>ping google.com</code> on a PC — 4 probes to any host or URL.</p>
+        <div class="form-group">
+          <label for="pingHost">Host, IP, or URL</label>
+          <input id="pingHost" placeholder="google.com" autocomplete="off" />
+        </div>
+        <div class="btn-group mb-2" style="flex-wrap:wrap;gap:6px;">
+          <button type="button" class="btn sm secondary ping-preset" data-host="google.com">Google</button>
+          <button type="button" class="btn sm secondary ping-preset" data-host="8.8.8.8">8.8.8.8</button>
+          <button type="button" class="btn sm secondary ping-preset" data-host="seller.otpocket.app">Backend</button>
+        </div>
+        <button type="button" class="btn secondary full mb-2" id="pingHostBtn">Ping</button>
+        <pre id="pingResult" class="muted text-sm" style="white-space:pre-wrap;margin:0;padding:10px;background:var(--bg-secondary);border-radius:8px;min-height:48px;">Not tested yet.</pre>
+      </div>
+
       <div class="card" id="authCard">
         <div class="card-header">
-          <div class="card-title">Account</div>
-          <span class="badge success" id="authBadge">Logged In</span>
+          <div class="card-title">Cloud sync</div>
+          <span class="badge warning" id="authBadge">Offline</span>
         </div>
-        <div class="row mb-2"><span class="muted text-sm">Device</span><span class="badge primary" id="deviceBadge">-</span></div>
-        <div class="row mb-2"><span class="muted text-sm">SIMs</span><span class="text-sm" id="simsRegCount">-</span></div>
-        <div class="btn-group">
-          <button class="btn sm secondary" id="registerDeviceBtn">Register</button>
-          <button class="btn sm danger" id="logoutBtn">Logout</button>
+        <div id="authSignedOutView">
+          <p class="muted text-sm" style="margin-bottom:10px;">Not signed in — no SMS forward or heartbeat. Use <strong>Account</strong> in the sidebar to sign in.</p>
+          <button type="button" class="btn secondary full" onclick="switchTab('account')">Open Account</button>
+        </div>
+        <div id="authSignedInView" class="hide">
+          <div class="row mb-2"><span class="muted text-sm">Device</span><span class="badge primary" id="deviceBadge">-</span></div>
+          <div class="row mb-2"><span class="muted text-sm">SIMs</span><span class="text-sm" id="simsRegCount">-</span></div>
+          <div class="btn-group">
+            <button class="btn sm secondary" id="registerDeviceBtn">Register</button>
+            <button class="btn sm danger" id="logoutBtn">Logout</button>
+          </div>
         </div>
       </div>
       
@@ -1926,9 +2065,17 @@ function switchLogTab(tab) {
   updateLogFooterMeta();
 }
 
-async function get(path) {
-  const r = await fetch(path, {cache:'no-store'});
-  return r.json();
+async function get(path, timeoutMs) {
+  const ms = timeoutMs || 20000;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const r = await fetch(path, {cache:'no-store', signal: ctrl.signal});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function getText(path) {
@@ -1936,9 +2083,12 @@ async function getText(path) {
   return r.text();
 }
 
-async function post(path, data) {
+async function post(path, data, timeoutMs) {
+  const ms = timeoutMs || 15000;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms);
   try {
-    const r = await fetch(path, {method:'POST', body: new URLSearchParams(data)});
+    const r = await fetch(path, {method:'POST', body: new URLSearchParams(data), signal: ctrl.signal});
     if (!r.ok) {
       throw new Error('HTTP ' + r.status);
     }
@@ -1946,20 +2096,39 @@ async function post(path, data) {
   } catch (e) {
     console.error('POST error:', path, e);
     throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function updateStaNetworkUi(s, isLogin) {
+  const gwEl = $(isLogin ? 'loginWifiGw' : 'wifiGw');
+  const dnsEl = $(isLogin ? 'loginWifiDns' : 'wifiDns');
+  const warnEl = $(isLogin ? 'loginWifiNetWarn' : 'wifiNetWarn');
+  if (!s || !s.sta_connected) {
+    if (gwEl) gwEl.textContent = '-';
+    if (dnsEl) dnsEl.textContent = '-';
+    if (warnEl) warnEl.classList.add('hide');
+    return;
+  }
+  if (gwEl) gwEl.textContent = s.sta_gateway || '0.0.0.0';
+  if (dnsEl) dnsEl.textContent = s.sta_dns || '0.0.0.0';
+  if (warnEl) {
+    if (s.sta_internet_ready === false) warnEl.classList.remove('hide');
+    else warnEl.classList.add('hide');
   }
 }
 
 function signalBars(rssi) {
-  if (rssi >= -50) return '▂▄▆█';
-  if (rssi >= -60) return '▂▄▆ ';
-  if (rssi >= -70) return '▂▄  ';
-  if (rssi >= -80) return '▂   ';
-  return '    ';
+  const level = rssi >= -55 ? 4 : rssi >= -65 ? 3 : rssi >= -75 ? 2 : rssi >= -85 ? 1 : 0;
+  const bar = (on, h) => `<span style="display:inline-block;width:3px;height:${h}px;margin-right:2px;border-radius:2px;background:${on ? 'var(--text)' : 'var(--border)'}"></span>`;
+  return `<span style="display:inline-flex;align-items:flex-end;height:12px;">${bar(level >= 1, 4)}${bar(level >= 2, 6)}${bar(level >= 3, 9)}${bar(level >= 4, 12)}</span>`;
 }
 
 async function refreshStatus() {
   try {
     const s = await get('/status');
+    window.lastStatus = s;
     
     // WiFi status
     const wifiBadge = $('wifiBadge');
@@ -1972,6 +2141,8 @@ async function refreshStatus() {
         wifiBadge.textContent = 'Connected';
         if ($('wifiSsid')) $('wifiSsid').textContent = s.sta_ssid || 'Unknown';
         if ($('wifiIp')) $('wifiIp').textContent = s.sta_ip;
+        if ($('wifiUrl')) $('wifiUrl').textContent = s.sta_ip ? ('http://' + s.sta_ip) : '-';
+        updateStaNetworkUi(s, false);
         wifiConnected.classList.remove('hide');
         wifiSetup.classList.add('hide');
       } else {
@@ -1981,20 +2152,69 @@ async function refreshStatus() {
         wifiSetup.classList.remove('hide');
       }
     }
+
+    // Login-page WiFi status (available before sign-in)
+    const loginWifiBadge = $('loginWifiBadge');
+    const loginWifiConnected = $('loginWifiConnected');
+    const loginScanBtn = $('loginScanBtn');
+    const loginScanResults = $('loginScanResults');
+    const loginManualSsid = $('loginManualSsid');
+    const loginManualPw = $('loginManualPw');
+    const loginConnectBtn = $('loginConnectBtn');
+    if (loginWifiBadge) {
+      const keepWifiSetup = !s.sta_connected || Date.now() < loginWifiUiGraceUntil;
+      if (s.sta_connected) {
+        loginWifiBadge.className = 'badge success';
+        loginWifiBadge.textContent = 'Connected';
+        if ($('loginWifiSsid')) $('loginWifiSsid').textContent = s.sta_ssid || 'Unknown';
+        if ($('loginWifiIp')) $('loginWifiIp').textContent = s.sta_ip || '-';
+        if ($('loginWifiUrl')) $('loginWifiUrl').textContent = s.sta_ip ? ('http://' + s.sta_ip) : '-';
+        updateStaNetworkUi(s, true);
+        if (loginWifiConnected) loginWifiConnected.classList.remove('hide');
+        if (!keepWifiSetup) {
+          if (loginScanBtn) loginScanBtn.classList.add('hide');
+          if (loginScanResults) loginScanResults.classList.add('hide');
+          if (loginManualSsid) loginManualSsid.classList.add('hide');
+          if (loginManualPw) loginManualPw.classList.add('hide');
+          if (loginConnectBtn) loginConnectBtn.classList.add('hide');
+        } else {
+          if (loginScanBtn) loginScanBtn.classList.remove('hide');
+          if (loginManualSsid) loginManualSsid.classList.remove('hide');
+          if (loginManualPw) loginManualPw.classList.remove('hide');
+          if (loginConnectBtn) loginConnectBtn.classList.remove('hide');
+        }
+      } else {
+        loginWifiBadge.className = 'badge danger';
+        loginWifiBadge.textContent = 'Disconnected';
+        if (loginWifiConnected) loginWifiConnected.classList.add('hide');
+        if (loginScanBtn) loginScanBtn.classList.remove('hide');
+        if (loginScanResults) loginScanResults.classList.remove('hide');
+        if (loginManualSsid) loginManualSsid.classList.remove('hide');
+        if (loginManualPw) loginManualPw.classList.remove('hide');
+        if (loginConnectBtn) loginConnectBtn.classList.remove('hide');
+      }
+    }
     
     // Header status
     const statusDot = $('statusDot');
     if (statusDot) {
       statusDot.className = s.sta_connected ? 'status-dot ok' : 'status-dot warn';
     }
+    const offlineBadge = $('offlineModeBadge');
+    const signedIn = s.signed_in === true || (s.bearer_token && s.bearer_token.length > 0);
+    if (offlineBadge) offlineBadge.classList.toggle('hide', signedIn);
     
     // Config
     if ($('baseUrl')) $('baseUrl').value = s.base_url || '';
     if ($('apiPath')) $('apiPath').value = s.api_path || '/api/agent/incoming-sms';
+    if ($('pingHost') && !$('pingHost').dataset.userEdited) {
+      $('pingHost').value = 'google.com';
+    }
     if ($('deviceId')) $('deviceId').value = s.device_id || '';
     
     updateGatewayServicesUi(s);
     updateScheduledRestartNav(s);
+    updateModemRunUi(s);
     
     updateFirmwareCard(s);
     
@@ -2217,16 +2437,27 @@ async function refreshErrorLog() {
   }
 }
 
-async function scanNetworks() {
-  const btn = $('scanBtn');
-  const list = $('scanResults');
+function wifiUi(isLogin) {
+  return {
+    btn: $(isLogin ? 'loginScanBtn' : 'scanBtn'),
+    list: $(isLogin ? 'loginScanResults' : 'scanResults'),
+    ssidInput: $(isLogin ? 'loginManualSsid' : 'manualSsid'),
+    pwInput: $(isLogin ? 'loginManualPw' : 'manualPw'),
+    connectBtn: $(isLogin ? 'loginConnectBtn' : 'connectBtn'),
+  };
+}
+
+async function scanNetworksFor(isLogin) {
+  const ui = wifiUi(!!isLogin);
+  const btn = ui.btn;
+  const list = ui.list;
   if (!btn || !list) return;
   
   btn.innerHTML = '<span class="spinner"></span> Scanning...';
   btn.disabled = true;
   
   try {
-    const nets = await get('/scan');
+    const nets = await get('/scan', 25000);
     list.innerHTML = '';
     
     if (nets.length === 0) {
@@ -2243,22 +2474,25 @@ async function scanNetworks() {
           </div>
           <div class="net-icon">${signalBars(n.rssi)}</div>
         `;
-        div.onclick = () => selectNetwork(n.ssid, n.secure);
+        div.onclick = (ev) => selectNetworkFor(n.ssid, n.secure, !!isLogin, ev.currentTarget);
         list.appendChild(div);
       });
     }
   } catch(e) {
-    toast('Scan failed');
+    console.error('Scan error:', e);
+    list.innerHTML = '<div class="muted" style="text-align:center;padding:20px;color:var(--danger);">Scan failed — stay on gateway AP and try again.<br><small>' + escHtml(e.message || String(e)) + '</small></div>';
+    toast('Scan failed — keep AP WiFi connected');
   }
   
-  btn.textContent = 'Scan Networks';
+  btn.textContent = isLogin ? 'Scan Networks' : 'Scan';
   btn.disabled = false;
 }
 
-function selectNetwork(ssid, secure) {
+function selectNetworkFor(ssid, secure, isLogin, clickedEl) {
   currentNetwork = ssid;
-  const ssidInput = $('manualSsid');
-  const pwInput = $('manualPw');
+  const ui = wifiUi(!!isLogin);
+  const ssidInput = ui.ssidInput;
+  const pwInput = ui.pwInput;
   if (ssidInput) ssidInput.value = ssid;
   if (pwInput) {
     pwInput.value = '';
@@ -2267,17 +2501,18 @@ function selectNetwork(ssid, secure) {
   
   // Highlight selected
   document.querySelectorAll('.net-item').forEach(el => el.classList.remove('selected'));
-  if (event && event.currentTarget) event.currentTarget.classList.add('selected');
+  if (clickedEl) clickedEl.classList.add('selected');
   
   if (!secure) {
-    connectWifi();
+    connectWifiFor(!!isLogin);
   }
 }
 
-async function connectWifi() {
-  const ssidInput = $('manualSsid');
-  const pwInput = $('manualPw');
-  const btn = $('connectBtn');
+async function connectWifiFor(isLogin) {
+  const ui = wifiUi(!!isLogin);
+  const ssidInput = ui.ssidInput;
+  const pwInput = ui.pwInput;
+  const btn = ui.connectBtn;
   
   const ssid = ssidInput ? ssidInput.value.trim() : '';
   const pw = pwInput ? pwInput.value : '';
@@ -2293,9 +2528,10 @@ async function connectWifi() {
   }
   
   try {
-    const r = await post('/save-wifi', {ssid, password: pw});
+    const r = await post('/save-wifi', {ssid, password: pw}, 15000);
     if (r.success) {
       toast('Connecting to ' + ssid + '...');
+      loginWifiUiGraceUntil = Date.now() + LOGIN_UI_GRACE_MS;
       setTimeout(refreshStatus, 3000);
     } else {
       toast(r.error || 'Connection failed');
@@ -2305,15 +2541,45 @@ async function connectWifi() {
   }
   
   if (btn) {
-    btn.textContent = 'Connect';
+    btn.textContent = isLogin ? 'Connect WiFi' : 'Connect';
     btn.disabled = false;
   }
 }
+
+async function scanNetworks() { return scanNetworksFor(false); }
+async function scanNetworksLogin() { return scanNetworksFor(true); }
+function selectNetwork(ssid, secure) { return selectNetworkFor(ssid, secure, false, null); }
+async function connectWifi() { return connectWifiFor(false); }
+async function connectWifiLogin() { return connectWifiFor(true); }
 
 async function disconnectWifi() {
   await fetch('/disconnect');
   toast('Disconnected');
   setTimeout(refreshStatus, 1000);
+}
+
+async function copyStaUrl() {
+  const s = window.lastStatus || {};
+  const url = s && s.sta_ip ? ('http://' + s.sta_ip) : '';
+  if (!url) {
+    toast('No STA IP yet');
+    return;
+  }
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(url);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = url;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    toast('Copied: ' + url);
+  } catch (e) {
+    toast('Copy failed');
+  }
 }
 
 function toggleUssdBulkPanel() {
@@ -2719,6 +2985,68 @@ function setStatusPill(el, state, label) {
   el.className = 'status-pill ' + state;
   const dotClass = state === 'on' ? 'ok' : (state === 'warn' ? 'warn' : '');
   el.innerHTML = '<span class="status-dot' + (dotClass ? ' ' + dotClass : '') + '"></span> ' + label;
+}
+
+function updateModemRunUi(s) {
+  const running = !!(s && s.modem_running);
+  const queued = !!(s && s.modem_start_queued);
+  const apply = (badgeId, hintId, runBtnId, stopBtnId) => {
+    const badge = $(badgeId);
+    const hint = $(hintId);
+    const runBtn = $(runBtnId);
+    const stopBtn = stopBtnId ? $(stopBtnId) : null;
+    if (badge) {
+      if (running) {
+        badge.className = 'badge success';
+        badge.textContent = 'Running';
+      } else if (queued) {
+        badge.className = 'badge warning';
+        badge.textContent = 'Starting…';
+      } else {
+        badge.className = 'badge warning';
+        badge.textContent = 'Idle';
+      }
+    }
+    if (hint) {
+      if (running) {
+        hint.textContent = 'SMS polling and slot watchdog are active.';
+      } else if (queued) {
+        hint.textContent = 'Initializing all SIM slots — keep this page open.';
+      } else {
+        hint.textContent = 'Idle — press Run when SIM800 modules are powered and wired.';
+      }
+    }
+    if (runBtn) {
+      runBtn.disabled = running || queued;
+      runBtn.textContent = queued ? 'Starting…' : 'Run — init SIM slots & start polling';
+    }
+    if (stopBtn) {
+      if (running) stopBtn.classList.remove('hide');
+      else stopBtn.classList.add('hide');
+    }
+  };
+  apply('modemRunBadge', 'modemRunHint', 'modemRunBtn', 'modemStopBtn');
+  apply('loginModemRunBadge', 'loginModemRunHint', 'loginModemRunBtn', null);
+}
+
+async function startModemGateway() {
+  try {
+    const r = await post('/modem-start', {}, 8000);
+    toast(r.message || r.error || 'Start queued');
+    refreshStatus();
+  } catch (e) {
+    toast('Failed to queue start');
+  }
+}
+
+async function stopModemGatewayUi() {
+  try {
+    await post('/modem-stop', {}, 8000);
+    toast('Modem stopped');
+    refreshStatus();
+  } catch (e) {
+    toast('Stop failed');
+  }
 }
 
 function updateGatewayServicesUi(s) {
@@ -3251,17 +3579,55 @@ async function clearLog() {
 }
 
 // Auth functions
+let loginClientCooldownUntil = 0;
+let loginClientFailStreak = 0;
+const LOGIN_UI_GRACE_MS = 30000;
+let dashboardGraceUntil = 0;
+let loginWifiUiGraceUntil = 0;
+
+function showLoginGraceBanner(on, secondsLeft) {
+  const box = $('loginGraceBanner');
+  const text = $('loginGraceText');
+  if (!box) return;
+  if (on) {
+    const sec = secondsLeft != null ? secondsLeft : Math.ceil((dashboardGraceUntil - Date.now()) / 1000);
+    if (text) {
+      text.textContent = 'Signed in — STA WiFi info below for ' + Math.max(0, sec) + 's (AP page stays open).';
+    }
+    box.classList.remove('hide');
+  } else {
+    box.classList.add('hide');
+  }
+}
+
+function openDashboardNow() {
+  dashboardGraceUntil = 0;
+  loginWifiUiGraceUntil = 0;
+  showLoginGraceBanner(false);
+  checkAuthStatus();
+}
+
 async function doLogin() {
-  const email = $('loginEmail').value.trim();
-  const password = $('loginPassword').value;
+  const email = ($('accountLoginEmail')?.value || $('loginEmail')?.value || '').trim();
+  const password = ($('accountLoginPassword')?.value || $('loginPassword')?.value || '');
   
   if (!email || !password) {
     toast('Enter email and password');
     return;
   }
+
+  const now = Date.now();
+  if (now < loginClientCooldownUntil) {
+    const msg = 'Too many attempts — wait 1 minute before login again';
+    showLoginError(msg);
+    return;
+  }
   
-  $('loginBtn').innerHTML = '<span class="spinner"></span> Logging in...';
-  $('loginBtn').disabled = true;
+  const loginBtn = $('accountLoginBtn') || $('loginBtn');
+  if (loginBtn) {
+    loginBtn.innerHTML = '<span class="spinner"></span> Signing in...';
+    loginBtn.disabled = true;
+  }
   
   try {
     // Send as JSON, not URLSearchParams
@@ -3273,19 +3639,55 @@ async function doLogin() {
     const r = await res.json();
     
     if (r.success) {
-      toast('Logged in successfully');
-      refreshStatus();
-      checkAuthStatus();
+      loginClientFailStreak = 0;
+      loginClientCooldownUntil = 0;
+      showLoginError('');
+      toast('Signed in successfully');
+      setTimeout(() => {
+        refreshStatus();
+        checkAuthStatus();
+      }, 600);
     } else {
-      toast(r.error || 'Login failed');
+      const msg = r.error || 'Login failed';
+      showLoginError(msg);
+      loginClientFailStreak++;
+      if (loginClientFailStreak >= 3) {
+        loginClientFailStreak = 0;
+        loginClientCooldownUntil = Date.now() + 60000;
+      }
     }
   } catch(e) {
-    toast('Login failed');
+    const msg = 'Cannot reach gateway — stay on the device AP or gateway WiFi IP';
+    showLoginError(msg);
     console.error('Login error:', e);
   }
   
-  $('loginBtn').textContent = 'Login';
-  $('loginBtn').disabled = false;
+  if (loginBtn) {
+    loginBtn.textContent = 'Sign in';
+    const waitMs = Math.max(0, loginClientCooldownUntil - Date.now());
+    if (waitMs > 0) {
+      loginBtn.disabled = true;
+      setTimeout(() => { loginBtn.disabled = false; }, waitMs);
+    } else {
+      loginBtn.disabled = false;
+    }
+  }
+}
+
+function showLoginError(msg) {
+  const boxes = [
+    { box: $('accountLoginError'), text: $('accountLoginErrorText') },
+    { box: $('loginError'), text: $('loginErrorText') }
+  ];
+  boxes.forEach(({ box, text }) => {
+    if (!box || !text) return;
+    if (msg) {
+      text.textContent = msg;
+      box.classList.remove('hide');
+    } else {
+      box.classList.add('hide');
+    }
+  });
 }
 
 async function doLogout() {
@@ -3342,42 +3744,51 @@ async function registerSimSlot(idx) {
 async function checkAuthStatus() {
   try {
     const s = await get('/status');
-    const hasToken = s.bearer_token && s.bearer_token.length > 0;
+    const hasToken = s.signed_in === true || (s.bearer_token && s.bearer_token.length > 0);
 
-    // Switch between login page and dashboard
-    const loginPage = $('loginPage');
-    const dashboardPage = $('dashboardPage');
-    
+    $('loginPage')?.classList.add('hide');
+    $('dashboardPage')?.classList.remove('hide');
+
+    const offlineBadge = $('offlineModeBadge');
+    const accountNavBadge = $('accountNavBadge');
+    if (offlineBadge) offlineBadge.classList.toggle('hide', hasToken);
+    if (accountNavBadge) accountNavBadge.style.display = hasToken ? 'none' : 'inline-flex';
+
+    $('accountLoginCard')?.classList.toggle('hide', hasToken);
+    $('accountSignedInCard')?.classList.toggle('hide', !hasToken);
+    $('authSignedOutView')?.classList.toggle('hide', hasToken);
+    $('authSignedInView')?.classList.toggle('hide', !hasToken);
+
+    const authBadge = $('authBadge');
+    const accountModeBadge = $('accountModeBadge');
     if (hasToken) {
-      if (loginPage) loginPage.classList.add('hide');
-      if (dashboardPage) dashboardPage.classList.remove('hide');
-      
-      // Update auth badge
-      const authBadge = $('authBadge');
-      if (authBadge) {
-        authBadge.className = 'badge success';
-        authBadge.textContent = 'Logged In';
-      }
-      if ($('deviceBadge')) {
-        $('deviceBadge').textContent = s.device_registered ? 'Registered' : 'Not Registered';
-        $('deviceBadge').className = s.device_registered ? 'badge success' : 'badge warning';
-      }
-      
+      if (authBadge) { authBadge.className = 'badge success'; authBadge.textContent = 'Online'; }
+      if (accountModeBadge) { accountModeBadge.className = 'badge success'; accountModeBadge.textContent = 'Signed in'; }
+    } else {
+      if (authBadge) { authBadge.className = 'badge warning'; authBadge.textContent = 'Offline'; }
+      if (accountModeBadge) { accountModeBadge.className = 'badge warning'; accountModeBadge.textContent = 'Not signed in'; }
+    }
+
+    const setDeviceBadge = (id) => {
+      const el = $(id);
+      if (!el) return;
+      el.textContent = s.device_registered ? 'Registered' : 'Not Registered';
+      el.className = s.device_registered ? 'badge success' : 'badge warning';
+    };
+    setDeviceBadge('deviceBadge');
+    setDeviceBadge('accountDeviceBadge');
+
     updateGatewayServicesUi(s);
     updateScheduledRestartNav(s);
-    
-    // Count registered SIMs
-      try {
-        const simConfig = await get('/sim-config');
-        const regCount = simConfig.backend_registered ? simConfig.backend_registered.filter(Boolean).length : 0;
-        if ($('simsRegCount')) $('simsRegCount').textContent = regCount + ' / ' + simConfig.enabled.length;
-      } catch(e) {}
-    } else {
-      if (loginPage) loginPage.classList.remove('hide');
-      if (dashboardPage) dashboardPage.classList.add('hide');
-      
-    }
-  } catch(e) {
+
+    try {
+      const simConfig = await get('/sim-config');
+      const regCount = simConfig.backend_registered ? simConfig.backend_registered.filter(Boolean).length : 0;
+      const regText = regCount + ' / ' + simConfig.enabled.length;
+      if ($('simsRegCount')) $('simsRegCount').textContent = regText;
+      if ($('accountSimsRegCount')) $('accountSimsRegCount').textContent = regText;
+    } catch (e) {}
+  } catch (e) {
     console.error('Auth check error:', e);
   }
 }
@@ -3387,11 +3798,66 @@ function addClick(id, fn) { const el = $(id); if (el) el.onclick = fn; }
 
 addClick('scanBtn', scanNetworks);
 addClick('connectBtn', connectWifi);
+addClick('loginScanBtn', scanNetworksLogin);
+addClick('loginConnectBtn', connectWifiLogin);
 addClick('disconnectBtn', disconnectWifi);
+addClick('loginDisconnectBtn', disconnectWifi);
+addClick('copyStaUrlBtn', copyStaUrl);
+addClick('copyLoginStaUrlBtn', copyStaUrl);
 addClick('checkFirmwareBtn', checkFirmwareUpdate);
 addClick('installFirmwareBtn', installFirmwareUpdate);
 addClick('saveOtaUrlBtn', saveOtaUrl);
 addClick('toggleMissedCallBtn', toggleMissedCallForward);
+addClick('pingHostBtn', runNetworkPing);
+const pingHostInput = $('pingHost');
+if (pingHostInput) {
+  pingHostInput.addEventListener('input', () => { pingHostInput.dataset.userEdited = '1'; });
+}
+document.querySelectorAll('.ping-preset').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    const h = btn.getAttribute('data-host');
+    if (pingHostInput && h) {
+      pingHostInput.value = h;
+      pingHostInput.dataset.userEdited = '1';
+    }
+    runNetworkPing();
+  });
+});
+async function runNetworkPing() {
+  const host = ($('pingHost')?.value || '').trim();
+  const btn = $('pingHostBtn');
+  const out = $('pingResult');
+  const s = window.lastStatus || {};
+  if (!s.sta_connected) {
+    if (out) {
+      out.textContent = 'WiFi is not connected.\nConnect STA in Settings first.';
+      out.style.color = 'var(--danger)';
+    }
+    toast('WiFi not connected');
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = 'Pinging…'; }
+  if (out) { out.textContent = 'Pinging ' + (host || 'google.com') + '…'; out.style.color = ''; }
+  try {
+    const r = await post('/network-ping', { host: host || 'google.com' }, 20000);
+    if (out) {
+      out.textContent = r.output || r.summary || (r.success ? 'OK' : 'Failed');
+      out.style.color = r.success ? 'var(--success)' : 'var(--danger)';
+    }
+    toast(r.summary || (r.success ? 'Ping OK' : 'Ping failed'));
+  } catch (e) {
+    if (out) {
+      out.textContent = 'Ping failed: ' + (e.message || e);
+      out.style.color = 'var(--danger)';
+    }
+    toast('Ping failed');
+  }
+  if (btn) { btn.disabled = false; btn.textContent = 'Ping'; }
+}
+
+addClick('modemRunBtn', startModemGateway);
+addClick('modemStopBtn', stopModemGatewayUi);
+addClick('loginModemRunBtn', startModemGateway);
 addClick('checkAllBtn', checkAllSims);
 addClick('ussdBulkBtn', bulkCheckUssd);
 addClick('disableAllSimsBtn', disableAllSims);
@@ -3408,10 +3874,15 @@ addClick('clearSmsBtn', clearMessages);
 
 // Event listeners - Login page
 addClick('loginBtn', doLogin);
+addClick('accountLoginBtn', doLogin);
+addClick('loginGraceContinueBtn', openDashboardNow);
+addClick('accountLogoutBtn', doLogout);
+addClick('accountRegisterDeviceBtn', doRegisterDevice);
+addClick('accountRefreshTokenBtn', doRefreshToken);
 
 function getTabFromHash() {
   const hash = window.location.hash.slice(1);
-  return ['sims', 'messages', 'settings', 'logs'].includes(hash) ? hash : 'sims';
+  return ['sims', 'messages', 'account', 'settings', 'logs'].includes(hash) ? hash : 'sims';
 }
 
 function updateHash(tab) {
@@ -3465,6 +3936,9 @@ void initWebUI() {
     server.on("/scan", HTTP_GET, handleScan);
     server.on("/save-wifi", HTTP_POST, handleSaveWifi);
     server.on("/disconnect", HTTP_GET, handleDisconnect);
+    server.on("/modem-start", HTTP_POST, handleModemStart);
+    server.on("/modem-stop", HTTP_POST, handleModemStop);
+    server.on("/network-ping", HTTP_POST, handleNetworkPing);
     server.on("/sim-config", HTTP_GET, handleSimConfig);
     server.on("/check-sim", HTTP_GET, handleCheckSim);
     server.on("/check-all-sim", HTTP_GET, handleCheckAllSim);
@@ -3526,6 +4000,10 @@ void buildStatusJson(char* buf, size_t bufSize) {
     // Get WiFi status
     bool staConnected = WiFi.isConnected();
     IPAddress staIp = WiFi.localIP();
+    IPAddress staGw = WiFi.gatewayIP();
+    IPAddress staDns = WiFi.dnsIP();
+    IPAddress staMask = WiFi.subnetMask();
+    const bool staInternetReady = staConnected && wifiStaNetworkLooksValid();
     IPAddress apIp = WiFi.softAPIP();
     
     // Get uptime
@@ -3535,7 +4013,8 @@ void buildStatusJson(char* buf, size_t bufSize) {
     int pendingSms = getPendingSmsCount();
     
     // Check if bearer token is set (don't expose full token)
-    bool hasBearerToken = !charBufIsEmpty(agentBearerToken);
+    const bool signedIn = agentIsSignedIn();
+    bool hasBearerToken = signedIn;
     
     // Find lowest battery among responsive SIMs
     int lowestBattery = 100;
@@ -3601,7 +4080,11 @@ void buildStatusJson(char* buf, size_t bufSize) {
     snprintf(buf, bufSize,
         "{"
         "\"sta_connected\":%s,"
+        "\"sta_internet_ready\":%s,"
         "\"sta_ip\":\"%s\","
+        "\"sta_gateway\":\"%s\","
+        "\"sta_dns\":\"%s\","
+        "\"sta_subnet\":\"%s\","
         "\"sta_ssid\":\"%s\","
         "\"ap_ip\":\"%s\","
         "\"uptime_s\":%lu,"
@@ -3616,6 +4099,10 @@ void buildStatusJson(char* buf, size_t bufSize) {
         "\"api_path\":\"%s\","
         "\"device_id\":\"%s\","
         "\"bearer_token\":\"%s\","
+        "\"signed_in\":%s,"
+        "\"offline_mode\":%s,"
+        "\"modem_running\":%s,"
+        "\"modem_start_queued\":%s,"
         "\"heartbeat_paused\":%s,"
         "\"sms_polling_paused\":%s,"
         "\"missed_call_forward\":%s,"
@@ -3638,7 +4125,11 @@ void buildStatusJson(char* buf, size_t bufSize) {
         "%s"
         "}",
         staConnected ? "true" : "false",
+        staInternetReady ? "true" : "false",
         staConnected ? staIp.toString().c_str() : "",
+        staConnected ? staGw.toString().c_str() : "",
+        staConnected ? staDns.toString().c_str() : "",
+        staConnected ? staMask.toString().c_str() : "",
         staConnected ? staSsid.c_str() : "",
         apIp.toString().c_str(),
         uptimeS,
@@ -3653,6 +4144,10 @@ void buildStatusJson(char* buf, size_t bufSize) {
         agentApiPath,
         agentDeviceId,
         hasBearerToken ? "(set)" : "",
+        signedIn ? "true" : "false",
+        signedIn ? "false" : "true",
+        isModemGatewayRunning() ? "true" : "false",
+        isModemGatewayStartQueued() ? "true" : "false",
         heartbeatPaused ? "true" : "false",
         smsPollingPaused ? "true" : "false",
         missedCallForwardEnabled ? "true" : "false",
@@ -3743,7 +4238,23 @@ void handleClearErrorLog() {
 // -----------------------------------------------------------------------------
 
 void handleScan() {
-    int n = WiFi.scanNetworks();
+    wifiPrepareForScan();
+    WiFi.scanDelete();
+    delay(80);
+
+    appendMonitorLog("[WIFI] Scan start");
+    const int n = WiFi.scanNetworks(false);
+    if (n == WIFI_SCAN_FAILED) {
+        logMsg("[WIFI] Scan failed");
+        appendMonitorLog("[WIFI] Scan failed");
+        server.send(200, "application/json", "[]");
+        return;
+    }
+    {
+        char line[32];
+        snprintf(line, sizeof(line), "[WIFI] Scan %d nets", n);
+        appendMonitorLog(line);
+    }
     
     static char buf[2048];  // Static to avoid stack overflow
     size_t pos = 0;
@@ -3784,19 +4295,137 @@ void handleSaveWifi() {
     preferences.putString("pw", wifiPassword);
     preferences.end();
     
-    // Connect
-    WiFi.begin(wifiSsid, wifiPassword);
-    
+    armWifiUserSetupMs(45000);
+    WiFi.setAutoReconnect(false);
+    ensureGatewaySoftAp();
+
     logMsg2Val("[WIFI] Saved", wifiSsid, "connecting", "...");
     appendMonitorLogVal("[WIFI] Connect ", wifiSsid);
     sendJsonSuccess("WiFi saved, connecting...");
+
+    if (WiFi.status() == WL_CONNECTED) {
+        WiFi.disconnect(true, false);
+        delay(150);
+    }
+    WiFi.setSleep(WIFI_PS_NONE);
+    WiFi.begin(wifiSsid, wifiPassword);
 }
 
 void handleDisconnect() {
-    WiFi.disconnect(true);
+    armWifiUserSetupMs(WIFI_USER_SETUP_ARM_MS);
+    WiFi.setAutoReconnect(false);
+    WiFi.disconnect(true, false);
+    delay(100);
+    ensureGatewaySoftAp();
     logMsg("[WIFI] Disconnected");
     appendMonitorLog("[WIFI] Disconnected");
     sendJsonSuccess("Disconnected");
+}
+
+void handleModemStart() {
+    if (isModemGatewayRunning()) {
+        sendJsonSuccess("Gateway already running");
+        return;
+    }
+    if (isModemGatewayStartQueued()) {
+        sendJsonSuccess("Start already queued");
+        return;
+    }
+    requestModemGatewayStart();
+    sendJsonSuccess("SIM init queued — watch Logs (may take 1–2 min)");
+}
+
+void handleModemStop() {
+    stopModemGateway();
+    sendJsonSuccess("Modem tasks stopped");
+}
+
+static void extractPingHostname(const char* in, char* hostOut, size_t hostOutSize) {
+    if (!hostOut || hostOutSize < 2) return;
+    hostOut[0] = '\0';
+    if (!in || !in[0]) return;
+
+    const char* p = in;
+    if (strncmp(p, "https://", 8) == 0) p += 8;
+    else if (strncmp(p, "http://", 7) == 0) p += 7;
+
+    size_t i = 0;
+    while (p[i] && p[i] != '/' && p[i] != ':' && i < hostOutSize - 1) {
+        hostOut[i] = p[i];
+        i++;
+    }
+    hostOut[i] = '\0';
+}
+
+static volatile bool networkPingBusy = false;
+
+void handleNetworkPing() {
+    if (networkPingBusy) {
+        sendJsonError("Ping already in progress", 409);
+        return;
+    }
+    if (httpsBusy) {
+        sendJsonError("HTTPS busy — wait for heartbeat/login to finish");
+        return;
+    }
+
+    char host[96];
+    if (server.hasArg("host")) {
+        extractPingHostname(server.arg("host").c_str(), host, sizeof(host));
+    } else {
+        host[0] = '\0';
+    }
+    if (charBufIsEmpty(host)) {
+        charBufSet(host, sizeof(host), "google.com");
+    }
+
+    if (!WiFi.isConnected()) {
+        server.send(200, "application/json",
+            "{\"success\":false,\"host\":\"\",\"summary\":\"WiFi not connected\","
+            "\"output\":\"WiFi is not connected.\\nConnect STA in Settings first.\"}");
+        return;
+    }
+
+    wifiFixStaNetworkIfNeeded();
+
+    networkPingBusy = true;
+    const bool ok = gatewayPingRunBlocking(host, 25000);
+    networkPingBusy = false;
+
+    const char* summary = gatewayPingGetSummary();
+    const char* output = gatewayPingGetOutput();
+    if (!summary[0]) {
+        summary = ok ? "OK" : "Ping failed or timed out";
+    }
+
+    // Escape into the tail of webJsonBuf; build JSON at the front (no overlap).
+    constexpr size_t kPingJsonMax = 3584;
+    constexpr size_t kPingEscOutputMax = 1024;
+    constexpr size_t kPingEscSummaryMax = 256;
+    constexpr size_t kPingEscHostMax = 128;
+    static_assert(kPingJsonMax + kPingEscOutputMax + kPingEscSummaryMax + kPingEscHostMax <= sizeof(webJsonBuf),
+        "webJsonBuf too small for ping JSON");
+
+    char* escHost = webJsonBuf + kPingJsonMax + kPingEscOutputMax + kPingEscSummaryMax;
+    char* escSummary = webJsonBuf + kPingJsonMax + kPingEscOutputMax;
+    char* escOutput = webJsonBuf + kPingJsonMax;
+    char* jsonOut = webJsonBuf;
+
+    jsonEscapeNoQuotes(host, escHost, kPingEscHostMax);
+    jsonEscapeNoQuotes(summary, escSummary, kPingEscSummaryMax);
+    jsonEscapeNoQuotes(output, escOutput, kPingEscOutputMax);
+
+    snprintf(jsonOut, kPingJsonMax,
+        "{\"success\":%s,\"host\":\"%s\",\"summary\":\"%s\",\"output\":\"%s\","
+        "\"sta_ip\":\"%s\",\"sta_gateway\":\"%s\",\"sta_dns\":\"%s\"}",
+        ok ? "true" : "false",
+        escHost,
+        escSummary,
+        escOutput,
+        WiFi.localIP().toString().c_str(),
+        WiFi.gatewayIP().toString().c_str(),
+        WiFi.dnsIP().toString().c_str());
+    server.send(200, "application/json", jsonOut);
 }
 
 // -----------------------------------------------------------------------------
@@ -4503,6 +5132,147 @@ void handleAgentConfig() {
 // Route Handlers - Login/Auth
 // -----------------------------------------------------------------------------
 
+// Shared auth HTTP buffer (login + refresh) — one copy to save DRAM.
+static char gAuthRespBuf[AGENT_AUTH_RESP_SIZE];
+
+static unsigned long loginCooldownUntilMs = 0;
+static unsigned long lastLoginAttemptMs = 0;
+static uint8_t loginFailStreak = 0;
+
+static void sendAuthLoginJsonError(const char* msg) {
+    httpsBusy = false;
+    char buf[280];
+    char esc[200];
+    jsonEscapeNoQuotes(msg ? msg : "Login failed", esc, sizeof(esc));
+    snprintf(buf, sizeof(buf), "{\"success\":false,\"error\":\"%s\"}", esc);
+    server.send(200, "application/json", buf);
+}
+
+static const char* authHttpPostErrorMessage(int code) {
+    if (WiFi.status() != WL_CONNECTED) {
+        return "No WiFi — connect gateway to your router first";
+    }
+    if (code == HTTPC_ERROR_CONNECTION_REFUSED) {
+        return "Cannot reach server (connection refused)";
+    }
+    if (code == HTTPC_ERROR_CONNECTION_LOST) {
+        return "Connection lost — check WiFi or internet";
+    }
+    if (code == HTTPC_ERROR_SEND_HEADER_FAILED || code == HTTPC_ERROR_SEND_PAYLOAD_FAILED) {
+        return "Network error while sending login";
+    }
+    if (code == HTTPC_ERROR_NOT_CONNECTED) {
+        return "Not connected to network";
+    }
+    if (code == HTTPC_ERROR_READ_TIMEOUT) {
+        return "Server timeout — check internet connection";
+    }
+    if (code < 0) {
+        return "No internet or server unreachable";
+    }
+    return nullptr;
+}
+
+/** Extract a JSON string field value (supports optional space after colon). */
+static bool extractAuthJsonString(const char* json, const char* fieldName, char* out, size_t outSize, int* outLen) {
+    if (!json || !fieldName || !out || outSize < 2) return false;
+    out[0] = '\0';
+    if (outLen) *outLen = 0;
+
+    char keyPat[40];
+    snprintf(keyPat, sizeof(keyPat), "\"%s\"", fieldName);
+    const char* keyPos = strstr(json, keyPat);
+    if (!keyPos) return false;
+
+    const char* colon = strchr(keyPos, ':');
+    if (!colon) return false;
+    const char* p = colon + 1;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != '"') return false;
+    p++;
+
+    const char* end = nullptr;
+    const char* nextField = strstr(p, "\",\"");
+    if (nextField) {
+        end = nextField;
+    } else {
+        end = strchr(p, '"');
+    }
+    if (!end || end <= p) return false;
+
+    const int len = (int)(end - p);
+    if (outLen) *outLen = len;
+    if (len <= 0 || (size_t)len >= outSize) {
+        return false;
+    }
+    memcpy(out, p, (size_t)len);
+    out[len] = '\0';
+    return true;
+}
+
+static int readHttpBodyToBuffer(HTTPClient& http, char* buf, size_t bufSize) {
+    if (!buf || bufSize < 2) return 0;
+    buf[0] = '\0';
+    WiFiClient* stream = http.getStreamPtr();
+    if (!stream) return 0;
+
+    const int contentLen = http.getSize();
+    size_t total = 0;
+    unsigned long t0 = millis();
+    unsigned long lastDataMs = t0;
+    const unsigned long maxWaitMs = 8000UL;
+    const unsigned long idleDoneMs = 350UL;
+
+    while (millis() - t0 < maxWaitMs && total < bufSize - 1) {
+        if (contentLen > 0 && (int)total >= contentLen) {
+            break;
+        }
+        if (stream->available()) {
+            const int n = stream->read((uint8_t*)(buf + total), (int)(bufSize - 1 - total));
+            if (n > 0) {
+                total += (size_t)n;
+                lastDataMs = millis();
+            }
+        } else if (!http.connected()) {
+            break;
+        } else if (total > 0 && (millis() - lastDataMs) >= idleDoneMs) {
+            break;
+        } else {
+            delay(1);
+        }
+    }
+    buf[total] = '\0';
+    return (int)total;
+}
+
+/** Resume SMS poll pause when login handler exits (any return path). */
+struct LoginSmsPollGuard {
+    bool active = false;
+    ~LoginSmsPollGuard() {
+        if (active) {
+            resumeSmsPolling();
+        }
+    }
+};
+
+/** Restore WiFi power-save after login HTTPS (any return path). */
+struct LoginWifiGuard {
+    wifi_ps_type_t savedPs = WIFI_PS_MIN_MODEM;
+    bool active = false;
+    void enable() {
+        if (!active) {
+            savedPs = WiFi.getSleep();
+            WiFi.setSleep(WIFI_PS_NONE);
+            active = true;
+        }
+    }
+    ~LoginWifiGuard() {
+        if (active) {
+            WiFi.setSleep(savedPs);
+        }
+    }
+};
+
 void handleLogin() {
     // Login to backend to get JWT tokens
     if (charBufIsEmpty(agentBaseUrl)) {
@@ -4554,6 +5324,31 @@ void handleLogin() {
         sendJsonError("Email and password required");
         return;
     }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        logMsg("[AUTH] Login blocked: no WiFi");
+        appendMonitorLog("[AUTH] No WiFi");
+        sendAuthLoginJsonError("No WiFi — connect gateway to your router first");
+        return;
+    }
+
+    const unsigned long loginNowMs = millis();
+    if (loginNowMs < loginCooldownUntilMs) {
+        sendAuthLoginJsonError("Too many login attempts — wait 1 minute");
+        return;
+    }
+    if (loginNowMs - lastLoginAttemptMs < AUTH_LOGIN_MIN_INTERVAL_MS) {
+        sendAuthLoginJsonError("Please wait 10 seconds between login attempts");
+        return;
+    }
+    lastLoginAttemptMs = loginNowMs;
+
+    // Pause SIM UART polling so TLS + auth get CPU/heap (same as token refresh).
+    LoginSmsPollGuard smsGuard;
+    LoginWifiGuard wifiGuard;
+    pauseSmsPolling(20000);
+    smsGuard.active = true;
+    delay(80);
     
     // Build URL - use /api/agent/auth (not /api/agent/auth/login)
     char url[256];
@@ -4583,68 +5378,94 @@ void handleLogin() {
         return;
     }
     httpsBusy = true;
-    
+    wifiGuard.enable();
+
     logMsg2Val("[AUTH] URL", url, "", "");
+    const unsigned long authT0 = millis();
     
-    if (isHttps) {
-        clientSecure.setInsecure();
-        clientSecure.setTimeout(15000);  // 15 second timeout
-        if (!http.begin(clientSecure, url)) {
-            logMsg("[AUTH] HTTPS begin failed");
-        appendMonitorLog("[AUTH] HTTPS begin failed");
-            httpsBusy = false;
-            sendJsonError("Failed to connect to server");
-            return;
+    auto beginAuthHttp = [&]() -> bool {
+        if (isHttps) {
+            clientSecure.setInsecure();
+            clientSecure.setTimeout(12000);
+            return http.begin(clientSecure, url);
         }
-    } else {
-        if (!http.begin(client, url)) {
-            logMsg("[AUTH] HTTP begin failed");
-            appendMonitorLog("[AUTH] HTTP begin failed");
-            httpsBusy = false;
-            sendJsonError("Failed to connect to server");
-            return;
-        }
+        return http.begin(client, url);
+    };
+
+    if (!beginAuthHttp()) {
+        logMsg("[AUTH] HTTP begin failed");
+        appendMonitorLog("[AUTH] HTTP begin failed");
+        sendAuthLoginJsonError(isHttps ? "Cannot connect to server (TLS)" : "Cannot connect to server");
+        return;
     }
     
     http.addHeader("Content-Type", "application/json");
-    http.setTimeout(15000);
+    http.setTimeout(12000);
     
     int code = http.POST(payload);
-    String resp = "";
-    
+
+    const unsigned long postMs = millis() - authT0;
+    int respLen = 0;
+
     if (code > 0) {
-        resp = http.getString();
+        respLen = readHttpBodyToBuffer(http, gAuthRespBuf, sizeof(gAuthRespBuf));
+        {
+            char timing[64];
+            snprintf(timing, sizeof(timing), "[AUTH] POST %lums body %dB read %lums",
+                     (unsigned long)postMs, respLen, (unsigned long)(millis() - authT0 - postMs));
+            logMsg(timing);
+            appendMonitorLog(timing);
+        }
     } else {
         logMsgInt("[AUTH] POST failed, code", code);
         appendMonitorLogInt("[AUTH] POST failed", code);
+        http.end();
+        clientSecure.stop();
+        client.stop();
+        loginFailStreak++;
+        if (loginFailStreak >= AUTH_LOGIN_MAX_FAILS) {
+            loginFailStreak = 0;
+            loginCooldownUntilMs = millis() + AUTH_LOGIN_COOLDOWN_MS;
+        }
+        const char* netErr = authHttpPostErrorMessage(code);
+        sendAuthLoginJsonError(netErr ? netErr : "Login request failed");
+        return;
     }
     http.end();
     clientSecure.stop();
     client.stop();
     
-    // Log full response for debugging
+    // Log response size (body may be too long to print fully)
     logMsgInt("[AUTH] HTTP code", code);
-    logMsg2Val("[AUTH] Body", resp.c_str(), "", "");
+    {
+        char sizeLine[48];
+        snprintf(sizeLine, sizeof(sizeLine), "[AUTH] Body bytes=%d", respLen);
+        appendMonitorLog(sizeLine);
+    }
     
     // Check if response indicates success
     // Response format: {"success":true,"data":{"access_token":"...","refresh_token":"..."}}
     // Or error: {"success":false,"error":"..."}
     
-    if (resp.length() == 0) {
+    if (respLen <= 0) {
         logMsg("[AUTH] Empty response");
-        httpsBusy = false;
-        sendJsonError("Empty response from server");
+        appendMonitorLog("[AUTH] Empty response");
+        if (WiFi.status() != WL_CONNECTED) {
+            sendAuthLoginJsonError("No WiFi — connection dropped during login");
+        } else {
+            sendAuthLoginJsonError("Server returned empty response — check internet");
+        }
         return;
     }
     
     // Check for success flag (handle both "success":true and "success": true)
-    bool success = (strstr(resp.c_str(), "\"success\":true") != NULL || 
-                    strstr(resp.c_str(), "\"success\": true") != NULL);
+    bool success = (strstr(gAuthRespBuf, "\"success\":true") != NULL ||
+                    strstr(gAuthRespBuf, "\"success\": true") != NULL);
     
     if (!success) {
         // Extract error message
         const char* errKey = "\"error\":\"";
-        const char* errPos = strstr(resp.c_str(), errKey);
+        const char* errPos = strstr(gAuthRespBuf, errKey);
         char errorMsg[128] = "Login failed";
         
         if (errPos) {
@@ -4661,54 +5482,38 @@ void handleLogin() {
         
         logMsg2Val("[AUTH] Backend error", errorMsg, "", "");
         appendMonitorLogVal("[AUTH] Error", errorMsg);
+        httpsBusy = false;
         char buf[256];
-        snprintf(buf, sizeof(buf), "{\"success\":false,\"error\":\"%s\"}", errorMsg);
+        char esc[200];
+        jsonEscapeNoQuotes(errorMsg, esc, sizeof(esc));
+        snprintf(buf, sizeof(buf), "{\"success\":false,\"error\":\"%s\"}", esc);
         server.send(200, "application/json", buf);
         return;
     }
     
-    // Extract tokens from response - they're nested in "data"
-    // Use static buffers to avoid stack overflow (JWT tokens are 700+ chars)
-    static char accessToken[1024];
-    static char refreshToken[512];
-    accessToken[0] = '\0';
-    refreshToken[0] = '\0';
-    
-    // Simple JSON extraction - look for access_token inside data object
-    const char* atKey = "\"access_token\":\"";
-    const char* rtKey = "\"refresh_token\":\"";
-    
-    const char* atPos = strstr(resp.c_str(), atKey);
-    if (atPos) {
-        atPos += strlen(atKey);
-        const char* endQuote = strchr(atPos, '"');
-        if (endQuote) {
-            int len = endQuote - atPos;
-            if (len < (int)sizeof(accessToken)) {
-                strncpy(accessToken, atPos, len);
-                accessToken[len] = '\0';
-            }
-        }
+    // Extract tokens directly into agent buffers (no extra static copies).
+    agentBearerToken[0] = '\0';
+    agentRefreshToken[0] = '\0';
+
+    int atLen = 0;
+    int rtLen = 0;
+    const bool gotAccess = extractAuthJsonString(
+        gAuthRespBuf, "access_token", agentBearerToken, sizeof(agentBearerToken), &atLen);
+    extractAuthJsonString(
+        gAuthRespBuf, "refresh_token", agentRefreshToken, sizeof(agentRefreshToken), &rtLen);
+
+    if (!gotAccess && atLen > 0) {
+        char line[64];
+        snprintf(line, sizeof(line), "[AUTH] access_token too long (%d)", atLen);
+        logMsg(line);
+        appendMonitorLog(line);
+        sendAuthLoginJsonError("Login token too large for device storage");
+        return;
     }
     
-    const char* rtPos = strstr(resp.c_str(), rtKey);
-    if (rtPos) {
-        rtPos += strlen(rtKey);
-        const char* endQuote = strchr(rtPos, '"');
-        if (endQuote) {
-            int len = endQuote - rtPos;
-            if (len < (int)sizeof(refreshToken)) {
-                strncpy(refreshToken, rtPos, len);
-                refreshToken[len] = '\0';
-            }
-        }
-    }
-    
-    if (!charBufIsEmpty(accessToken)) {
-        // Save tokens
-        charBufSet(agentBearerToken, sizeof(agentBearerToken), accessToken);
-        charBufSet(agentRefreshToken, sizeof(agentRefreshToken), refreshToken);
-        
+    if (!charBufIsEmpty(agentBearerToken)) {
+        loginFailStreak = 0;
+        loginCooldownUntilMs = 0;
         preferences.begin("agent", false);
         preferences.putString("tok", agentBearerToken);
         preferences.putString("rtok", agentRefreshToken);
@@ -4716,30 +5521,43 @@ void handleLogin() {
         
         logMsg("[AUTH] Login successful, tokens saved");
         appendMonitorLog("[AUTH] Login OK");
-        
+        deferCloudBackend(HEARTBEAT_POST_LOGIN_DEFER_MS);
+        resetAgentInventoryHeartbeat();
+        logMsg("[CLOUD] Backend HTTPS paused 90s after login");
+        appendMonitorLog("[CLOUD] HTTPS paused 90s after login");
+
+        wifiGuard.active = false;
+        WiFi.setSleep(WIFI_PS_NONE);
+        ensureGatewaySoftAp();
+
         char buf[512];
         snprintf(buf, sizeof(buf),
             "{\"success\":true,\"message\":\"Logged in\",\"has_refresh\":%s}",
-            charBufIsEmpty(refreshToken) ? "false" : "true"
+            charBufIsEmpty(agentRefreshToken) ? "false" : "true"
         );
         httpsBusy = false;
         server.send(200, "application/json", buf);
+        for (int i = 0; i < 12; i++) {
+            handleWebRequests();
+            delay(1);
+        }
         return;
     }
     
     // Login failed - no token found
-    logMsg("[AUTH] No access_token in response");
-    appendMonitorLog("[AUTH] No token in response");
+    if (strstr(gAuthRespBuf, "access_token") == nullptr) {
+        logMsg("[AUTH] No access_token field in response");
+        appendMonitorLog("[AUTH] No access_token field");
+    } else {
+        logMsg("[AUTH] access_token present but not parsed");
+        appendMonitorLog("[AUTH] Token parse failed");
+    }
     
-    char buf[256];
-    snprintf(buf, sizeof(buf),
-        "{\"success\":false,\"error\":\"No token in response\"}"
-    );
-    httpsBusy = false;
-    server.send(200, "application/json", buf);
+    sendAuthLoginJsonError("Login succeeded but no access token in response");
 }
 
 void handleLogout() {
+    resetAgentInventoryHeartbeat();
     // Clear tokens
     agentBearerToken[0] = '\0';
     agentRefreshToken[0] = '\0';
@@ -4873,9 +5691,9 @@ bool refreshAgentToken() {
     http.setTimeout(15000);
     
     int code = http.POST(payload);
-    String resp = "";
+    int respLen = 0;
     if (code > 0) {
-        resp = http.getString();
+        respLen = readHttpBodyToBuffer(http, gAuthRespBuf, sizeof(gAuthRespBuf));
     }
     http.end();
     clientSecure.stop();
@@ -4892,59 +5710,35 @@ bool refreshAgentToken() {
         return false;
     }
     
-    if (!(code >= 200 && code < 300) || resp.length() == 0) {
+    if (!(code >= 200 && code < 300) || respLen <= 0) {
         logMsgInt("[AUTH] Token refresh failed, HTTP", code);
-        if (resp.length() > 0 && resp.length() < 200) {
-            logMsgVal("[AUTH] Response", resp.c_str());
-        }
         appendMonitorLogInt("[AUTH] Refresh HTTP", code);
         resumeSmsPolling();
         return false;
     }
     
-    static char accessToken[1024];
-    static char refreshToken[512];
-    accessToken[0] = '\0';
-    refreshToken[0] = '\0';
+    agentBearerToken[0] = '\0';
+
+    int atLen = 0;
+    extractAuthJsonString(
+        gAuthRespBuf, "access_token", agentBearerToken, sizeof(agentBearerToken), &atLen);
+
+    char newRefresh[AGENT_REFRESH_TOKEN_SIZE];
+    newRefresh[0] = '\0';
+    extractAuthJsonString(gAuthRespBuf, "refresh_token", newRefresh, sizeof(newRefresh), nullptr);
     
-    const char* atKey = "\"access_token\":\"";
-    const char* rtKey = "\"refresh_token\":\"";
-    
-    const char* atPos = strstr(resp.c_str(), atKey);
-    if (atPos) {
-        atPos += strlen(atKey);
-        const char* endQuote = strchr(atPos, '"');
-        if (endQuote) {
-            int len = (int)(endQuote - atPos);
-            if (len > 0 && len < (int)sizeof(accessToken)) {
-                strncpy(accessToken, atPos, (size_t)len);
-                accessToken[len] = '\0';
-            }
+    if (charBufIsEmpty(agentBearerToken)) {
+        if (atLen > 0) {
+            appendMonitorLogInt("[AUTH] Refresh token too long", atLen);
+        } else {
+            appendMonitorLog("[AUTH] Refresh failed: no access_token");
         }
-    }
-    
-    const char* rtPos = strstr(resp.c_str(), rtKey);
-    if (rtPos) {
-        rtPos += strlen(rtKey);
-        const char* endQuote = strchr(rtPos, '"');
-        if (endQuote) {
-            int len = (int)(endQuote - rtPos);
-            if (len > 0 && len < (int)sizeof(refreshToken)) {
-                strncpy(refreshToken, rtPos, (size_t)len);
-                refreshToken[len] = '\0';
-            }
-        }
-    }
-    
-    if (charBufIsEmpty(accessToken)) {
-        appendMonitorLog("[AUTH] Refresh failed: no access_token");
         resumeSmsPolling();
         return false;
     }
     
-    charBufSet(agentBearerToken, sizeof(agentBearerToken), accessToken);
-    if (!charBufIsEmpty(refreshToken)) {
-        charBufSet(agentRefreshToken, sizeof(agentRefreshToken), refreshToken);
+    if (!charBufIsEmpty(newRefresh)) {
+        charBufSet(agentRefreshToken, sizeof(agentRefreshToken), newRefresh);
     }
     
     preferences.begin("agent", false);

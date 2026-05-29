@@ -16,6 +16,8 @@
 
 #include "utils.h"
 
+#include "sms.h"
+
 #include <Arduino.h>
 
 #include <ctype.h>
@@ -344,6 +346,10 @@ bool ussdBulkInProgress() {
 
 }
 
+bool ussdBlocksSmsPoll() {
+    return bulkActive || manualActive;
+}
+
 
 
 int ussdBulkCurrentSlot() {
@@ -402,6 +408,12 @@ void ussdStartBulk() {
 
     appendMonitorLog("[USSD] Bulk *143# started");
 
+    if (bulkTotal > 0) {
+        const unsigned long estMs =
+            (unsigned long)bulkTotal * (USSD_BULK_SLOT_PAUSE_MS + USSD_BULK_GAP_MS) + 5000UL;
+        pauseSmsPolling(estMs);
+    }
+
 }
 
 
@@ -415,6 +427,7 @@ bool ussdRunOnSlot(int slot) {
     charBufClear(simStates[slot].ussdLastResult, sizeof(simStates[slot].ussdLastResult));
 
     const unsigned long ussdStartMs = millis();
+    pauseSmsPolling(USSD_SLOT_PAUSE_MS);
 
     setSimBusy(true);
     // Avoid webserver re-entrancy / extra heap churn while modem session is open.
@@ -478,6 +491,7 @@ bool ussdStartManual(int slot) {
     simStates[slot].ussdStatus = 3;
     simStates[slot].ussdLastDurationSec = 0;
     charBufClear(simStates[slot].ussdLastResult, sizeof(simStates[slot].ussdLastResult));
+    pauseSmsPolling(USSD_SLOT_PAUSE_MS);
     return true;
 }
 
@@ -588,6 +602,7 @@ void ussdTick() {
         bulkDone++;
 
         bulkPauseUntil = millis() + USSD_BULK_GAP_MS;
+        pauseSmsPolling(USSD_BULK_SLOT_PAUSE_MS);
 
         return;
 

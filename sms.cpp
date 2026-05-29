@@ -4,6 +4,7 @@
 
 #include "sms.h"
 #include "sim800.h"
+#include "config.h"
 #include "mux.h"
 #include "calls.h"
 #include "logger.h"
@@ -29,6 +30,24 @@ extern void appendSmsToFile(const char* time, int simSlot, const char* number, c
 static PendingSms pendingQueue[MAX_PENDING_SMS];
 static int pendingCount = 0;
 static unsigned long lastRetryMs = 0;
+static unsigned long lastSmsHttpsEndMs = 0;
+extern volatile bool httpsBusy;
+
+static void waitBetweenSmsForwards() {
+    if (lastSmsHttpsEndMs == 0) return;
+    const unsigned long gapEnd = lastSmsHttpsEndMs + SMS_FORWARD_GAP_MS;
+    while (millis() < gapEnd) {
+        handleWebRequests();
+        yield();
+        delay(10);
+    }
+}
+
+static void endSmsHttpsSession() {
+    lastSmsHttpsEndMs = millis();
+    deferHeartbeat(SMS_POST_FORWARD_HEARTBEAT_DEFER_MS);
+    httpsBusy = false;
+}
 
 // Statistics
 static unsigned long totalReceived = 0;
@@ -68,12 +87,7 @@ static void pollOneSimSlot(int slot) {
     sendATCapture("AT", 300);
     if (!strstr(getSimBuffer(), "OK")) {
         logMsgInt("[SMS] SIM not responding during poll:", slot + 1);
-        simStates[slot].consecutiveErrors++;
-        simStates[slot].responsive = false;
-        if (!simStates[slot].userDisabled) {
-            simStates[slot].enabled = false;
-        }
-        simStates[slot].basicInitDone = false;
+        simMarkSlotOffline(slot, "no AT during poll");
         return;
     }
 
@@ -127,6 +141,9 @@ static void pollOneSimSlot(int slot) {
         snprintf(line, sizeof(line), "[SMS] Poll SIM %d: error", slot + 1);
         logMsg(line);
         simStates[slot].consecutiveErrors++;
+        if (simStates[slot].consecutiveErrors >= SIM_POLL_DISABLE_THRESHOLD) {
+            simMarkSlotOffline(slot, "CMGL errors");
+        }
     }
 
     cooperativeDelayMs(80);
@@ -430,6 +447,10 @@ void clearPendingSms() {
 // -----------------------------------------------------------------------------
 
 void processPendingSmsQueue() {
+    if (cloudBackendDeferred()) {
+        return;
+    }
+
     // Check retry interval
     if (millis() - lastRetryMs < PENDING_SMS_PROCESS_GAP_MS) {
         return;
@@ -694,9 +715,24 @@ void processIncomingSMS(int simSlot, const SmsMessage* msg) {
             }
             return;
         }
-        // No existing multipart - this is an orphan continuation
-        logMsg("[SMS] Orphan continuation, forwarding as-is");
-        // Fall through to normal processing
+        // Part 2+ with no part 1 in buffer — still forward (OTP/code often in this fragment)
+        logMsg("[SMS] Orphan continuation, queued for delayed forward");
+        appendMonitorLog("[SMS] Orphan continuation queued");
+        totalReceived++;
+        persistentReceived++;
+        savePersistentStats();
+        logMsgIntVal("[SMS] SIM", simSlot + 1, "Num", simStates[simSlot].number);
+        appendMonitorLogVal("[SMS] From", senderDisplay);
+        if (msg->message && msg->message[0] != '\0') {
+            appendMonitorLogVal("[SMS] Msg", msg->message);
+        }
+        enqueuePendingSms(simSlot, simStates[simSlot].number, senderDisplay, msg->message);
+        selectSIM(simSlot);
+        if (msg->messageIndex > 0) {
+            deleteSMS(msg->messageIndex);
+            logMsgInt("[SMS] Deleted from SIM, index", msg->messageIndex);
+        }
+        return;
     }
     
     // Check if message looks truncated - start multipart collection
@@ -752,6 +788,26 @@ void processIncomingSMS(int simSlot, const SmsMessage* msg) {
 static void forwardSms(int simSlot, const char* senderDisplay, const SmsMessage* msg) {
     char fwdError[64] = "";
     extern volatile bool httpsBusy;
+    auto isHexUcs2LikeMessage = [](const char* s) -> bool {
+        if (!s) return false;
+        int hexCount = 0;
+        int total = 0;
+        for (const char* p = s; *p; p++) {
+            const char c = *p;
+            if (c == ' ' || c == '\r' || c == '\n' || c == '\t') continue;
+            total++;
+            const bool isHex = ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'));
+            if (isHex) hexCount++;
+        }
+        return total >= 24 && (hexCount * 100 / total) >= 95 && (total % 4 == 0);
+    };
+
+    if (isHexUcs2LikeMessage(msg ? msg->message : nullptr)) {
+        appendErrorLogInt("[SMS] Blocked UCS2-hex-like message SIM", simSlot + 1);
+        appendMonitorLog("[SMS] Blocked suspicious hex/UCS2 message");
+        // Do not forward/queue this payload.
+        return;
+    }
 
     if (httpsBusy) {
         enqueuePendingSms(simSlot, simStates[simSlot].number, senderDisplay, msg->message);
@@ -820,6 +876,7 @@ extern char agentBaseUrl[];
 extern char agentApiPath[];
 extern char agentDeviceId[];
 extern char agentBearerToken[];
+extern char agentRefreshToken[];
 extern char agentSimNumber[];
 extern bool agentUseAuth;
 extern SimState simStates[];
@@ -845,6 +902,11 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
         return false;
     }
 
+    if (cloudBackendDeferred()) {
+        if (errorOut) snprintf(errorOut, errorOutSize, "Cloud sync paused");
+        return false;
+    }
+
     // Check config
     if (charBufIsEmpty(agentBaseUrl)) {
         logMsg("[SMS] No backend URL");
@@ -853,9 +915,9 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
     }
 
     // Check auth
-    if (agentUseAuth && charBufIsEmpty(agentBearerToken)) {
-        logMsg("[SMS] No auth token");
-        if (errorOut) snprintf(errorOut, errorOutSize, "No auth token");
+    if (agentUseAuth && (charBufIsEmpty(agentBearerToken) || charBufIsEmpty(agentRefreshToken))) {
+        logMsg("[SMS] No auth/refresh token");
+        if (errorOut) snprintf(errorOut, errorOutSize, "No auth/refresh token");
         return false;
     }
 
@@ -866,11 +928,20 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
     // Determine SIM number (static to avoid stack)
     static char simNum[PHONE_BUFFER_SIZE];
     if (!charBufIsEmpty(simStates[msg->simSlot].number)) {
-        charBufSet(simNum, sizeof(simNum), simStates[msg->simSlot].number);
+        normalizePhNumber(simStates[msg->simSlot].number, simNum, sizeof(simNum));
     } else if (!charBufIsEmpty(agentSimNumber)) {
-        charBufSet(simNum, sizeof(simNum), agentSimNumber);
+        normalizePhNumber(agentSimNumber, simNum, sizeof(simNum));
     } else {
-        charBufSet(simNum, sizeof(simNum), "unknown");
+        simNum[0] = '\0';
+    }
+
+    if (strlen(simNum) != 13 || strncmp(simNum, "+639", 4) != 0) {
+        if (msg->simSlot >= 0 && msg->simSlot < SIM_COUNT) {
+            simStates[msg->simSlot].enabled = false;  // Turn off invalid SIM slot in UI.
+        }
+        logMsgInt("[SMS] Invalid SIM number, slot disabled", msg->simSlot + 1);
+        if (errorOut) snprintf(errorOut, errorOutSize, "Invalid SIM number");
+        return false;
     }
 
     // Use normalized sender if provided, otherwise use original
@@ -909,26 +980,34 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
     WiFiClient client;
     bool isHttps = (strncmp(url, "https://", 8) == 0);
     
-    // Wait if another HTTPS operation is in progress
+    // Wait if heartbeat/maintenance holds the TLS stack (common cause of -2)
+    const unsigned long busyWait0 = millis();
+    while (httpsBusy && (millis() - busyWait0) < 15000UL) {
+        handleWebRequests();
+        yield();
+        delay(10);
+    }
     if (httpsBusy) {
-        logMsg("[SMS] HTTPS busy, retry later");
+        logMsg("[SMS] HTTPS busy — queued for retry");
         if (errorOut) snprintf(errorOut, errorOutSize, "HTTPS busy");
         return false;
     }
+
+    waitBetweenSmsForwards();
     httpsBusy = true;
     
     if (isHttps) {
         clientSecure.setInsecure();
         if (!http.begin(clientSecure, url)) {
             logMsg("[SMS] HTTP begin failed");
-            httpsBusy = false;
+            endSmsHttpsSession();
             if (errorOut) snprintf(errorOut, errorOutSize, "HTTP begin failed");
             return false;
         }
     } else {
         if (!http.begin(client, url)) {
             logMsg("[SMS] HTTP begin failed");
-            httpsBusy = false;
+            endSmsHttpsSession();
             if (errorOut) snprintf(errorOut, errorOutSize, "HTTP begin failed");
             return false;
         }
@@ -937,7 +1016,7 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(15000);
 
-    static char authHdr[1100];
+    static char authHdr[AGENT_AUTH_HDR_SIZE];
     if (agentUseAuth && !charBufIsEmpty(agentBearerToken)) {
         formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
         http.addHeader("Authorization", authHdr);
@@ -951,7 +1030,7 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
         code = http.POST(payload);
 
         // Success or non-connection error - don't retry
-        if (code >= 0 || (code != -1 && code != -11)) break;
+        if (code >= 0 || (code != -1 && code != -11 && code != -2)) break;
 
         // Connection error - retry once
         if (code < 0 && attempt == 0) {
@@ -999,13 +1078,13 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
                 clientSecure.setInsecure();
                 if (!http.begin(clientSecure, url)) {
                     logMsg("[SMS] HTTP begin failed");
-                    httpsBusy = false;
+                    endSmsHttpsSession();
                     return false;
                 }
             } else {
                 if (!http.begin(client, url)) {
                     logMsg("[SMS] HTTP begin failed");
-                    httpsBusy = false;
+                    endSmsHttpsSession();
                     return false;
                 }
             }
@@ -1022,7 +1101,7 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
 
     clientSecure.stop();
     client.stop();
-    httpsBusy = false;
+    endSmsHttpsSession();
 
     if (code >= 200 && code < 300) {
         logMsgInt("[SMS] Forwarded OK, code", code);
@@ -1069,7 +1148,12 @@ void initSMSPolling() {
     memset(lastSlotPollMs, 0, sizeof(lastSlotPollMs));
 }
 
+extern bool modemGatewayRunning;
+
 void pollSIMsForSMS() {
+    if (!modemGatewayRunning) {
+        return;
+    }
     checkMultipartTimeout();
 
     if (millis() < pollingPauseUntil) {

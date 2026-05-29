@@ -102,7 +102,15 @@
 #define SMS_CMGL_TIMEOUT_MS         2500    // List SMS; empty SIMs return OK in <1s
 #define SMS_POLL_TIMEOUT_MS         15000   // Safety timeout
 #define SMS_RETRY_INTERVAL_MS       30000   // 30s between retry batches
-#define HEARTBEAT_INTERVAL_MS       60000   // 60s heartbeat
+#define HEARTBEAT_INTERVAL_MS       60000   // 60s heartbeat (ping after first full sync)
+#define HEARTBEAT_PING_PAUSE_MS     8000UL   // SMS poll pause during lightweight ping
+#define HEARTBEAT_FULL_PAUSE_MS     25000UL  // SMS poll pause during full inventory sync
+#define HEARTBEAT_PING_TIMEOUT_MS   12000   // HTTP timeout for /api/agent/ping
+#define HEARTBEAT_FULL_TIMEOUT_MS   25000   // HTTP timeout for full /api/agent/heartbeat
+#define HEARTBEAT_POST_LOGIN_DEFER_MS   90000UL   // keep UI responsive after sign-in
+#define HEARTBEAT_POST_FAIL_COOLDOWN_MS 120000UL  // after conn error, backoff before next HB
+#define SMS_FORWARD_GAP_MS                  3000UL   // pause between back-to-back SMS HTTPS posts
+#define SMS_POST_FORWARD_HEARTBEAT_DEFER_MS 20000UL  // defer heartbeat after any SMS forward attempt
 // Second POST after heartbeat (activeSessions + announcements). Costs another WiFi block; off by default.
 #ifndef HEARTBEAT_FOLLOWUP_ENABLED
 #define HEARTBEAT_FOLLOWUP_ENABLED  0
@@ -120,6 +128,18 @@
 #define NO_SMS_LOG_THROTTLE_MS      10000   // 10s throttle for "no SMS" logs
 #define OUTGOING_MAX_DURATION_MS    15000   // 15s max call duration
 #define MISSED_CALL_TIMEOUT_MS      30000   // 30s missed call timeout
+
+// WiFi STA reconnect (when disconnected) — slow backoff; never fight AP setup UI
+#define WIFI_RECONNECT_INTERVAL_MS      (3UL * 60UL * 1000UL)
+#define WIFI_RECONNECT_MAX_ATTEMPTS     3
+#define WIFI_RECONNECT_COOLDOWN_MS      (10UL * 60UL * 1000UL)
+#define WIFI_STA_DISCONNECT_LOG_MS      60000UL
+#define WIFI_USER_SETUP_ARM_MS          (2UL * 60UL * 1000UL)
+
+// Backend login rate limit (per device, in handleLogin)
+#define AUTH_LOGIN_MIN_INTERVAL_MS      10000UL
+#define AUTH_LOGIN_MAX_FAILS            3
+#define AUTH_LOGIN_COOLDOWN_MS          60000UL
 
 // Missed call → forward to backend as Viber-style SMS (last 6 digits of caller)
 #define MISSED_CALL_FORWARD_DEFAULT true    // NVS default; toggle in web UI
@@ -139,6 +159,11 @@ extern int missedCallWatchSlot;
 // -----------------------------------------------------------------------------
 // Buffer Sizes
 // -----------------------------------------------------------------------------
+// Supabase JWTs with Google metadata can exceed 1KB; keep headroom for Bearer header.
+#define AGENT_BEARER_TOKEN_SIZE   2048
+#define AGENT_REFRESH_TOKEN_SIZE  768
+#define AGENT_AUTH_HDR_SIZE       (AGENT_BEARER_TOKEN_SIZE + 32)
+#define AGENT_AUTH_RESP_SIZE      2560
 #define SIM_BUFFER_SIZE     2048    // Main UART response buffer (increased for SMS list responses)
 #define PHONE_BUFFER_SIZE   24      // Phone number buffer
 #define CREG_BUFFER_SIZE    32      // CREG response buffer
@@ -160,7 +185,9 @@ extern int missedCallWatchSlot;
 // Error Thresholds
 // -----------------------------------------------------------------------------
 #define SIM_ERROR_THRESHOLD    3   // Reset SIM after this many errors
-#define SIM_CONSECUTIVE_ERROR_THRESHOLD 5  // Consecutive errors before recovery attempt
+#define SIM_CONSECUTIVE_ERROR_THRESHOLD 5  // Legacy threshold (watchdog)
+#define SIM_POLL_DISABLE_THRESHOLD    3    // CMGL/poll failures → slot auto-OFF
+#define MODEM_GATEWAY_STABLE_MS       45000UL  // No heartbeat until modem/SIM settled
 // Watchdog timeout: must be long enough to survive a full heartbeat+maintenance cycle
 // (~25s heartbeat + ~30s maintenance + 12 SIMs × 3s cooldown ≈ 95s max idle time per slot)
 #define SIM_WATCHDOG_TIMEOUT_MS 300000  // 5 minutes: only trigger on genuinely dead SIMs
@@ -171,6 +198,8 @@ extern int missedCallWatchSlot;
 #define USSD_RAW_SIZE           160      // Temp buffer for modem USSD text
 #define USSD_CHECK_TIMEOUT_MS   25000
 #define USSD_BULK_GAP_MS        300      // Short gap after USSD before next slot
+#define USSD_SLOT_PAUSE_MS      18000UL  // pause SMS poll per *143# (modem busy up to ~11s)
+#define USSD_BULK_SLOT_PAUSE_MS 20000UL  // per-slot budget during bulk *143#
 #define USSD_AT_GAP_MS          400      // Cancel/close USSD session commands
 
 // -----------------------------------------------------------------------------
@@ -179,12 +208,6 @@ extern int missedCallWatchSlot;
 #define AP_SSID_PREFIX    "SIM800-Gateway-"
 #define AP_PASSWORD       ""        // Open AP (or set a password)
 #define AP_CHANNEL        1
-
-// -----------------------------------------------------------------------------
-// Default WiFi Credentials (used if not saved)
-// -----------------------------------------------------------------------------
-#define DEFAULT_WIFI_SSID       "3G"
-#define DEFAULT_WIFI_PASSWORD   "Xqwerty11"
 
 // -----------------------------------------------------------------------------
 // Default Backend Configuration
@@ -285,6 +308,12 @@ extern int errorLogCount;
 
 // Timing
 extern unsigned long lastHeartbeatMs;
+extern unsigned long heartbeatNotBeforeMs;
+void deferHeartbeat(unsigned long delayMs);
+inline void deferCloudBackend(unsigned long delayMs) { deferHeartbeat(delayMs); }
+inline bool cloudBackendDeferred() { return millis() < heartbeatNotBeforeMs; }
+void wifiRecoverAfterHttps();
+extern unsigned long modemGatewayStableUntilMs;
 extern unsigned long lastSmsPollMs;
 extern unsigned long smsPollingPauseUntilMs;
 extern bool heartbeatPaused;
@@ -292,8 +321,8 @@ extern bool heartbeatPaused;
 // Agent config
 extern char agentBaseUrl[128];
 extern char agentDeviceId[64];
-extern char agentBearerToken[1024];  // JWT tokens can be 700+ chars
-extern char agentRefreshToken[512];
+extern char agentBearerToken[AGENT_BEARER_TOKEN_SIZE];
+extern char agentRefreshToken[AGENT_REFRESH_TOKEN_SIZE];
 extern char agentSimNumber[PHONE_BUFFER_SIZE];
 extern int agentSimSlot;
 extern char agentApiPath[64];
@@ -302,16 +331,32 @@ extern char agentApiPath[64];
 bool refreshAgentToken();
 extern bool agentUseAuth;
 
-// Perform heartbeat to backend
+inline bool agentIsSignedIn() {
+    return agentBearerToken[0] != '\0' && agentRefreshToken[0] != '\0';
+}
+
+// Perform heartbeat to backend (full inventory once after init, then ping)
 void performHeartbeat();
+void resetAgentInventoryHeartbeat();
 
 // Prune expired OTP sessions (needs valid NTP time)
 void pruneExpiredActiveSessions();
 
 // HTTPS busy flag to prevent concurrent connections
 extern volatile bool httpsBusy;
+extern bool modemGatewayRunning;
+extern volatile bool modemStartRequested;
 extern volatile bool otaInProgress;
 
 // WiFi
 extern char wifiSsid[64];
+extern unsigned long wifiUserSetupUntilMs;
 extern char wifiPassword[64];
+void armWifiUserSetupMs(unsigned long durationMs);
+void ensureGatewaySoftAp();
+void wifiPrepareForUserConfig();
+void wifiPrepareForScan();
+bool wifiStaBackgroundReconnectAllowed();
+bool wifiStaNetworkLooksValid();
+void wifiLogStaNetworkDetails();
+bool wifiFixStaNetworkIfNeeded();

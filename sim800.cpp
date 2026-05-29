@@ -757,6 +757,22 @@ bool verifySIMResponsive(int expectedSlot) {
     return false;
 }
 
+void simMarkSlotOffline(int slot, const char* reason) {
+    extern SimState simStates[];
+    if (slot < 0 || slot >= SIM_COUNT) return;
+    if (simStates[slot].userDisabled) return;
+
+    simStates[slot].enabled = false;
+    simStates[slot].responsive = false;
+    simStates[slot].basicInitDone = false;
+    simStates[slot].consecutiveErrors = 0;
+
+    char line[96];
+    snprintf(line, sizeof(line), "[SIM] Slot %d OFF — %s", slot + 1, reason ? reason : "offline");
+    logMsg(line);
+    appendMonitorLog(line);
+}
+
 // Check all SIMs on startup - marks responsive SIMs and initializes them
 void checkAllSIMsOnStartup() {
     extern SimState simStates[];
@@ -832,10 +848,15 @@ void checkAllSIMsOnStartup() {
         // Debug: Show SMS storage status
         sendATCapture("AT+CPMS?", 800);
         logMsgVal("[SETUP] SMS Storage", getSimBuffer());
+        if (strstr(getSimBuffer(), "+CPMS:") == NULL) {
+            simMarkSlotOffline(i, "SMS storage not ready");
+            continue;
+        }
         // Debug: Show SMSC (SMS center number)
         sendATCapture("AT+CSCA?", 800);
         logMsgVal("[SETUP] SMSC", getSimBuffer());
         
+        simStates[i].enabled = true;
         simStates[i].basicInitDone = true;
         logMsgInt("[SETUP] SIM init sms/call cfg OK:", i + 1);
 

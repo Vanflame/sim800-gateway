@@ -64,6 +64,206 @@ int activeSim = 0;
 int currentMuxSim = 0;
 volatile bool simBusy = false;
 volatile bool httpsBusy = false;  // Prevent concurrent HTTPS
+unsigned long wifiUserSetupUntilMs = 0;  // Pause STA reconnect while user scans/saves WiFi
+bool modemGatewayRunning = false;
+volatile bool modemStartRequested = false;
+
+bool isModemGatewayRunning() {
+    return modemGatewayRunning;
+}
+
+bool isModemGatewayStartQueued() {
+    return modemStartRequested;
+}
+
+void requestModemGatewayStart() {
+    if (modemGatewayRunning || modemStartRequested) {
+        return;
+    }
+    modemStartRequested = true;
+    appendMonitorLog("[MODEM] Start queued (web UI)");
+    logMsg("[MODEM] Start queued");
+}
+
+void stopModemGateway() {
+    modemStartRequested = false;
+    if (!modemGatewayRunning) {
+        return;
+    }
+    modemGatewayRunning = false;
+    resetAgentInventoryHeartbeat();
+    pauseSmsPolling(60000);
+    appendMonitorLog("[MODEM] Stopped (web UI)");
+    logMsg("[MODEM] Stopped");
+}
+
+void modemGatewayTick() {
+    if (!modemStartRequested || modemGatewayRunning) {
+        return;
+    }
+    if (httpsBusy || isSimBusy() || otaInProgress) {
+        return;
+    }
+    if (millis() < wifiUserSetupUntilMs) {
+        return;
+    }
+
+    modemStartRequested = false;
+    appendMonitorLog("[MODEM] SIM init starting...");
+    logMsg("[MODEM] SIM init starting...");
+    checkAllSIMsOnStartup();
+    resetAgentInventoryHeartbeat();
+    modemGatewayRunning = true;
+    modemGatewayStableUntilMs = millis() + MODEM_GATEWAY_STABLE_MS;
+    deferHeartbeat(MODEM_GATEWAY_STABLE_MS);
+    appendMonitorLog("[MODEM] Running — SMS poll active");
+    logMsg("[MODEM] Running");
+    logMsg("[HEARTBEAT] Deferred until modem/SIM stable");
+}
+
+void armWifiUserSetupMs(unsigned long durationMs) {
+    const unsigned long until = millis() + durationMs;
+    if (until > wifiUserSetupUntilMs) {
+        wifiUserSetupUntilMs = until;
+    }
+}
+
+void ensureGatewaySoftAp() {
+    wifi_mode_t mode = WiFi.getMode();
+    if (mode != WIFI_MODE_AP && mode != WIFI_MODE_APSTA) {
+        WiFi.mode(WIFI_AP_STA);
+    }
+    if (WiFi.softAPIP()[0] == 0) {
+        char apSsid[32];
+        snprintf(apSsid, sizeof(apSsid), AP_SSID_PREFIX "%06X", (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF));
+        WiFi.softAP(apSsid, AP_PASSWORD, AP_CHANNEL);
+        logMsg2Val("[WIFI] AP (re)started", apSsid, "IP", WiFi.softAPIP().toString().c_str());
+        appendMonitorLogVal("[WIFI] AP up", WiFi.softAPIP().toString().c_str());
+    }
+}
+
+static void wifiWaitStaSettle(uint32_t maxMs) {
+    const unsigned long t0 = millis();
+    while (millis() - t0 < maxMs) {
+        handleWebRequests();
+        const wl_status_t st = WiFi.status();
+        if (st == WL_DISCONNECTED || st == WL_CONNECTION_LOST ||
+            st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL ||
+            st == WL_IDLE_STATUS) {
+            return;
+        }
+        delay(20);
+    }
+}
+
+void wifiPrepareForUserConfig() {
+    armWifiUserSetupMs(WIFI_USER_SETUP_ARM_MS);
+    WiFi.setAutoReconnect(false);
+    ensureGatewaySoftAp();
+    if (WiFi.status() == WL_CONNECTED) {
+        WiFi.disconnect(true, false);
+        wifiWaitStaSettle(800);
+    }
+    WiFi.mode(WIFI_AP_STA);
+    ensureGatewaySoftAp();
+}
+
+void wifiPrepareForScan() {
+    armWifiUserSetupMs(WIFI_USER_SETUP_ARM_MS);
+    WiFi.setAutoReconnect(false);
+    ensureGatewaySoftAp();
+    const wl_status_t st = WiFi.status();
+    if (st == WL_CONNECTED) {
+        WiFi.disconnect(true, false);
+        wifiWaitStaSettle(600);
+    }
+}
+
+bool wifiStaNetworkLooksValid() {
+    if (!WiFi.isConnected()) {
+        return false;
+    }
+    const IPAddress ip = WiFi.localIP();
+    const IPAddress gw = WiFi.gatewayIP();
+    const IPAddress dns = WiFi.dnsIP();
+    return ip[0] != 0 && gw[0] != 0 && dns[0] != 0;
+}
+
+void wifiLogStaNetworkDetails() {
+    if (!WiFi.isConnected()) {
+        return;
+    }
+    char line[96];
+    snprintf(line, sizeof(line), "[WIFI] IP %s GW %s",
+             WiFi.localIP().toString().c_str(),
+             WiFi.gatewayIP().toString().c_str());
+    logMsg(line);
+    appendMonitorLog(line);
+    snprintf(line, sizeof(line), "[WIFI] DNS %s MASK %s",
+             WiFi.dnsIP().toString().c_str(),
+             WiFi.subnetMask().toString().c_str());
+    logMsg(line);
+    appendMonitorLog(line);
+}
+
+bool wifiFixStaNetworkIfNeeded() {
+    if (!WiFi.isConnected()) {
+        return false;
+    }
+
+    IPAddress ip = WiFi.localIP();
+    IPAddress gw = WiFi.gatewayIP();
+    IPAddress mask = WiFi.subnetMask();
+    IPAddress dns = WiFi.dnsIP();
+    const IPAddress dns2(1, 1, 1, 1);
+
+    if (ip[0] != 0 && gw[0] != 0 && dns[0] != 0) {
+        return true;
+    }
+
+    if (mask[0] == 0) {
+        mask = IPAddress(255, 255, 255, 0);
+    }
+    if (gw[0] == 0 && ip[0] != 0) {
+        gw = IPAddress(ip[0], ip[1], ip[2], 1);
+        appendMonitorLog("[WIFI] No gateway from DHCP — using x.x.x.1");
+        logMsg("[WIFI] GW fallback x.x.x.1");
+    }
+    if (dns[0] == 0) {
+        dns = IPAddress(8, 8, 8, 8);
+        appendMonitorLog("[WIFI] No DNS from DHCP — using 8.8.8.8");
+        logMsg("[WIFI] DNS fallback 8.8.8.8");
+    }
+
+    logMsg2Val("[WIFI] STA config fix", ip.toString().c_str(), "GW", gw.toString().c_str());
+    const bool applied = WiFi.config(ip, gw, mask, dns, dns2);
+    delay(150);
+    wifiLogStaNetworkDetails();
+    if (!wifiStaNetworkLooksValid()) {
+        appendMonitorLog("[WIFI] STA has IP but no route/DNS — check router (guest/isolation?)");
+        logMsg("[WIFI] STA route/DNS still invalid");
+    }
+    return applied && wifiStaNetworkLooksValid();
+}
+
+bool wifiStaBackgroundReconnectAllowed() {
+    if (millis() < wifiUserSetupUntilMs) {
+        return false;
+    }
+    if (httpsBusy || otaInProgress) {
+        return false;
+    }
+    const wl_status_t st = WiFi.status();
+    if (st == WL_CONNECTED) {
+        return false;
+    }
+    // Do not stack reconnect on top of an in-progress association (causes "cannot set config")
+    if (st != WL_DISCONNECTED && st != WL_CONNECTION_LOST &&
+        st != WL_CONNECT_FAILED && st != WL_NO_SSID_AVAIL) {
+        return false;
+    }
+    return !charBufIsEmpty(wifiSsid);
+}
 bool smsPollingPaused = false;
 bool heartbeatPaused = false;
 bool pendingHeartbeatFollowup = false;
@@ -84,14 +284,16 @@ int errorLogCount = 0;
 
 // Timing
 unsigned long lastHeartbeatMs = 0;
+unsigned long heartbeatNotBeforeMs = 0;
+unsigned long modemGatewayStableUntilMs = 0;
 unsigned long lastSmsPollMs = 0;
 unsigned long smsPollingPauseUntil = 0;
 
 // Agent config
 char agentBaseUrl[128] = "";
 char agentDeviceId[64] = "";
-char agentBearerToken[1024] = "";  // JWT tokens can be 700+ chars
-char agentRefreshToken[512] = "";
+char agentBearerToken[AGENT_BEARER_TOKEN_SIZE] = "";
+char agentRefreshToken[AGENT_REFRESH_TOKEN_SIZE] = "";
 char agentSimNumber[PHONE_BUFFER_SIZE] = "";
 int agentSimSlot = 0;
 char agentApiPath[64] = DEFAULT_API_PATH;
@@ -525,17 +727,11 @@ void setup() {
     // Initialize web UI
     initWebUI();
     
-    // Initial SIM check on startup
-    logMsg("[SETUP] Performing initial SIM check...");
-    appendMonitorLog("[SETUP] SIM probe start");
-    checkAllSIMsOnStartup();
-    appendMonitorLog("[SETUP] SIM probe done");
-    
     logMsg("========================================");
     logMsg("Setup complete!");
     logMsg("========================================");
 
-    appendMonitorLog("[BOOT] Ready");
+    appendMonitorLog("[BOOT] Ready — press Run in web UI to init SIM800");
 }
 
 static void fetchHeartbeatFollowup();
@@ -549,22 +745,62 @@ static void wifiRestoreAfterHttps() {
     WiFi.setSleep(wifiPsBeforeHttps);
 }
 
+void deferHeartbeat(unsigned long delayMs) {
+    const unsigned long now = millis();
+    heartbeatNotBeforeMs = now + delayMs;
+    lastHeartbeatMs = now;
+}
+
+void wifiRecoverAfterHttps() {
+    wifiRestoreAfterHttps();
+    ensureGatewaySoftAp();
+    WiFi.setSleep(WIFI_PS_NONE);
+
+    if (!WiFi.isConnected() && wifiSsid[0] != '\0') {
+        logMsg("[WIFI] Recovering STA after HTTPS");
+        appendMonitorLog("[WIFI] Recovering STA");
+        WiFi.setAutoReconnect(false);
+        WiFi.begin(wifiSsid, wifiPassword);
+        for (int i = 0; i < 25; i++) {
+            handleWebRequests();
+            yield();
+            if (WiFi.status() == WL_CONNECTED) {
+                delay(150);
+                wifiFixStaNetworkIfNeeded();
+                break;
+            }
+            delay(100);
+        }
+    }
+
+    if (WiFi.isConnected()) {
+        wifiLogStaNetworkDetails();
+    } else {
+        logMsg("[WIFI] STA down — web UI on AP http://192.168.4.1");
+        appendMonitorLog("[WIFI] STA down — use AP");
+    }
+}
+
 static bool ensureWifiForHttps() {
     if (WiFi.isConnected()) {
         return true;
     }
-    if (charBufIsEmpty(wifiSsid)) {
+    if (!wifiStaBackgroundReconnectAllowed()) {
         return false;
     }
     logMsg("[WIFI] Reconnecting for HTTPS");
     appendMonitorLog("[WIFI] Reconnecting");
-    WiFi.disconnect();
-    delay(100);
+    WiFi.setAutoReconnect(false);
+    WiFi.setSleep(WIFI_PS_NONE);
+    WiFi.disconnect(true, false);
+    wifiWaitStaSettle(2000);
+    ensureGatewaySoftAp();
     WiFi.begin(wifiSsid, wifiPassword);
-    for (int i = 0; i < 60; i++) {
+    for (int i = 0; i < 16; i++) {
         if (WiFi.status() == WL_CONNECTED) {
             delay(200);
-            return true;
+            wifiFixStaNetworkIfNeeded();
+            return WiFi.isConnected();
         }
         delay(250);
         yield();
@@ -595,7 +831,22 @@ static bool scheduleBackgroundNet(unsigned long now) {
     }
 #endif
 
-    if (!heartbeatPaused && !pendingHeartbeatFollowup && !charBufIsEmpty(agentBaseUrl) &&
+    if (millis() < heartbeatNotBeforeMs) {
+        return false;
+    }
+    if (millis() < wifiUserSetupUntilMs) {
+        return false;
+    }
+    if (millis() < modemGatewayStableUntilMs) {
+        return false;
+    }
+    if (isSimBusy()) {
+        return false;
+    }
+
+    if (!heartbeatPaused && !pendingHeartbeatFollowup && agentIsSignedIn() &&
+        !charBufIsEmpty(agentBaseUrl) &&
+        getPendingSmsCount() == 0 &&
         !isSimBusy() && ensureWifiForHttps() &&
         (now - lastHeartbeatMs) >= (unsigned long)HEARTBEAT_INTERVAL_MS) {
         pruneExpiredActiveSessions();
@@ -618,9 +869,11 @@ static void runBusyWatchdog() {
     if (isSimBusy()) {
         if (simBusySince == 0) {
             simBusySince = millis();
-        } else if (millis() - simBusySince > 45000UL) {
-            logMsg("[WATCHDOG] Force clear simBusy");
+        } else if (millis() - simBusySince > 15000UL) {
+            logMsg("[WATCHDOG] Force clear simBusy (15s)");
+            appendErrorLog("[WATCHDOG] Force clear simBusy (15s)");
             setSimBusy(false);
+            initMux(); // recover mux state if it got stuck mid-switch
             simBusySince = 0;
         }
     } else {
@@ -670,52 +923,117 @@ void loop() {
         return;
     }
 
-    // Poll SIMs before missed-call scan (modem UART; heartbeat uses WiFi on same thread)
-    if (!isSimBusy() && !smsPollingPaused && !isSmsPollingPaused()) {
-        pollSIMsForSMS();
+    const bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+    static bool lastWifiConnected = true;
+    static unsigned long lastReconnectTryMs = 0;
+    static unsigned long reconnectCooldownUntilMs = 0;
+    static uint8_t reconnectFailStreak = 0;
+
+    if (wifiConnected != lastWifiConnected) {
+        lastWifiConnected = wifiConnected;
+        if (wifiConnected) {
+            reconnectFailStreak = 0;
+            reconnectCooldownUntilMs = 0;
+            logMsg("[WIFI] Connected - background tasks resumed");
+            appendMonitorLog("[WIFI] Connected - tasks resumed");
+        } else {
+            logMsg("[WIFI] Disconnected - background tasks paused");
+            appendMonitorLog("[WIFI] Disconnected - tasks paused");
+        }
     }
 
-    if (missedCallForwardEnabled && !smsPollingPaused && !isSimBusy()) {
-        pollMissedCallsFast();
+    // Pause background modem/backend work while WiFi is offline so AP setup stays responsive.
+    // User can still use web UI to scan/connect WiFi.
+    if (!wifiConnected) {
+        ensureGatewaySoftAp();
+
+        const unsigned long nowMs = millis();
+
+        if (wifiStaBackgroundReconnectAllowed() &&
+            nowMs >= reconnectCooldownUntilMs &&
+            (nowMs - lastReconnectTryMs) > WIFI_RECONNECT_INTERVAL_MS) {
+            lastReconnectTryMs = nowMs;
+            WiFi.setAutoReconnect(false);
+            WiFi.setSleep(WIFI_PS_NONE);
+            ensureGatewaySoftAp();
+            logMsg2Val("[WIFI] STA reconnect try", wifiSsid, "", "");
+            appendMonitorLogVal("[WIFI] Reconnect try", wifiSsid);
+            WiFi.begin(wifiSsid, wifiPassword);
+
+            reconnectFailStreak++;
+            if (reconnectFailStreak >= WIFI_RECONNECT_MAX_ATTEMPTS) {
+                reconnectFailStreak = 0;
+                reconnectCooldownUntilMs = nowMs + WIFI_RECONNECT_COOLDOWN_MS;
+                logMsg("[WIFI] Reconnect paused 10 min — use AP web UI to fix WiFi");
+                appendMonitorLog("[WIFI] Reconnect paused 10m");
+            }
+        }
+        delay(10);
+        return;
     }
 
-    if (!httpsBusy && !isSmsPollingPaused()) {
-        ussdTick();
+    // If an HTTPS job is running (heartbeat/forward/maintenance), keep loop lightweight
+    // so the web UI stays responsive even during repeated failures.
+    if (httpsBusy) {
+        for (int i = 0; i < 4; i++) {
+            handleWebRequests();
+            delay(1);
+        }
+        return;
+    }
+
+    modemGatewayTick();
+
+    if (modemGatewayRunning) {
+        // USSD / refresh-all before SMS poll — avoids CMGL during *143#
+        if (!httpsBusy && !isSimBusy()) {
+            ussdTick();
+        }
+
+        const bool blockSmsPoll = ussdBlocksSmsPoll() || isWebRefreshAllInProgress();
+        if (!isSimBusy() && !smsPollingPaused && !isSmsPollingPaused() && !blockSmsPoll) {
+            pollSIMsForSMS();
+        }
+
+        if (missedCallForwardEnabled && !smsPollingPaused && !isSimBusy() && !blockSmsPoll) {
+            pollMissedCallsFast();
+        }
     }
 
     unsigned long now = millis();
+    const bool authReady = !charBufIsEmpty(agentBearerToken) && !charBufIsEmpty(agentRefreshToken);
 
-    if (!httpsBusy && getPendingSmsCount() > 0) {
-        processPendingSmsQueue();
+    if (!cloudBackendDeferred()) {
+        if (authReady && !httpsBusy && getPendingSmsCount() > 0) {
+            processPendingSmsQueue();
+        }
     }
 
-    const bool netJobRan = scheduleBackgroundNet(now);
+    const bool netJobRan = authReady ? scheduleBackgroundNet(now) : false;
 
-    if (!netJobRan && !httpsBusy && !isSimBusy()) {
+    if (!cloudBackendDeferred() && authReady && !netJobRan && !httpsBusy && !isSimBusy()) {
         maintenanceTick(now);
     }
     
-    // Battery info update
-    static unsigned long lastBatteryMs = 0;
-    if (now - lastBatteryMs > BATTERY_INFO_INTERVAL_MS) {
-        lastBatteryMs = now;
-        updateBatteryInfo();
-    }
-    
-    // SIM watchdog - check for unresponsive SIMs and attempt recovery
-    static unsigned long lastWatchdogMs = 0;
-    if (now - lastWatchdogMs > 30000) {  // Check every 30 seconds
-        lastWatchdogMs = now;
-        checkAndRecoverUnresponsiveSims();
-    }
-    
-    // Periodic signal strength update for all SIMs
-    static unsigned long lastSignalUpdateMs = 0;
-    static int signalUpdateSimIdx = 0;
-    if (now - lastSignalUpdateMs > 5000) {  // Update one SIM every 5 seconds
-        lastSignalUpdateMs = now;
-        updateSimSignalStrength(signalUpdateSimIdx);
-        signalUpdateSimIdx = (signalUpdateSimIdx + 1) % SIM_COUNT;
+    if (modemGatewayRunning) {
+        static unsigned long lastBatteryMs = 0;
+        if (now - lastBatteryMs > BATTERY_INFO_INTERVAL_MS) {
+            lastBatteryMs = now;
+            updateBatteryInfo();
+        }
+        static unsigned long lastWatchdogMs = 0;
+        if (now - lastWatchdogMs > 30000) {
+            lastWatchdogMs = now;
+            checkAndRecoverUnresponsiveSims();
+        }
+
+        static unsigned long lastSignalUpdateMs = 0;
+        static int signalUpdateSimIdx = 0;
+        if (now - lastSignalUpdateMs > 5000) {
+            lastSignalUpdateMs = now;
+            updateSimSignalStrength(signalUpdateSimIdx);
+            signalUpdateSimIdx = (signalUpdateSimIdx + 1) % SIM_COUNT;
+        }
     }
     
     // Small delay to prevent tight loops
@@ -727,6 +1045,40 @@ void loop() {
 // -----------------------------------------------------------------------------
 
 void initWiFi() {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.setAutoReconnect(false);
+    WiFi.setSleep(WIFI_PS_NONE);
+    WiFi.setHostname(agentDeviceId[0] ? agentDeviceId : "sim800-gw");
+
+    static bool wifiEventRegistered = false;
+    if (!wifiEventRegistered) {
+        wifiEventRegistered = true;
+        WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+            (void)info;
+            static unsigned long lastStaDiscLogMs = 0;
+            if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+                appendMonitorLog("[WIFI] STA connected");
+                logMsg("[WIFI] STA connected");
+            } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+                wifiLogStaNetworkDetails();
+                if (!wifiFixStaNetworkIfNeeded()) {
+                    appendMonitorLog("[WIFI] WiFi linked but internet route may fail");
+                    logMsg("[WIFI] Check GW/DNS on router");
+                }
+                logMsg2Val("[WIFI] STA IP", WiFi.localIP().toString().c_str(), "SSID", WiFi.SSID().c_str());
+            } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+                WiFi.setAutoReconnect(false);
+                ensureGatewaySoftAp();
+                const unsigned long nowMs = millis();
+                if (nowMs - lastStaDiscLogMs >= WIFI_STA_DISCONNECT_LOG_MS) {
+                    lastStaDiscLogMs = nowMs;
+                    appendMonitorLog("[WIFI] STA disconnected (AP still up)");
+                    logMsg("[WIFI] STA disconnected (AP still up)");
+                }
+            }
+        });
+    }
+
     // Start in AP mode
     char apSsid[32];
     snprintf(apSsid, sizeof(apSsid), AP_SSID_PREFIX "%06X", (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF));
@@ -734,27 +1086,12 @@ void initWiFi() {
     WiFi.softAP(apSsid, AP_PASSWORD, AP_CHANNEL);
     logMsg2Val("[WIFI] AP started", apSsid, "IP", WiFi.softAPIP().toString().c_str());
     
-    // Try to connect to saved WiFi
+    // Try saved STA network in background (do not block boot — web UI stays on AP).
     if (!charBufIsEmpty(wifiSsid)) {
         logMsg2Val("[WIFI] Connecting to", wifiSsid, "", "");
         WiFi.begin(wifiSsid, wifiPassword);
-        
-        // Wait for connection with timeout
-        int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-            delay(500);
-            attempts++;
-        }
-        
-        if (WiFi.status() == WL_CONNECTED) {
-            logMsg2Val("[WIFI] Connected", WiFi.localIP().toString().c_str(), "SSID", wifiSsid);
-            
-            // Configure NTP
-            configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
-            ntpConfigured = true;
-        } else {
-            logMsg("[WIFI] Connection failed, staying in AP mode");
-        }
+    } else {
+        logMsg("[WIFI] No saved network — connect via web UI (AP mode)");
     }
 }
 
@@ -767,13 +1104,6 @@ void loadSettings() {
     preferences.getString("ssid", wifiSsid, sizeof(wifiSsid));
     preferences.getString("pw", wifiPassword, sizeof(wifiPassword));
     preferences.end();
-    
-    // Use default WiFi if not saved
-    if (charBufIsEmpty(wifiSsid)) {
-        charBufSet(wifiSsid, sizeof(wifiSsid), DEFAULT_WIFI_SSID);
-        charBufSet(wifiPassword, sizeof(wifiPassword), DEFAULT_WIFI_PASSWORD);
-        logMsg("[CONFIG] Using default WiFi credentials");
-    }
     
     preferences.begin("agent", true);
     preferences.getString("base", agentBaseUrl, sizeof(agentBaseUrl));
@@ -815,19 +1145,20 @@ void loadSettings() {
 // Heartbeat / Backend Sync
 // -----------------------------------------------------------------------------
 
-// Normalize SIM number to include + prefix for PH numbers
+// Normalize SIM number for backend sync (strict PH mobile format only)
 static void normalizeSimNumber(const char* raw, char* out, size_t outSize) {
     if (!raw || !raw[0]) {
         out[0] = '\0';
         return;
     }
-    // If already starts with +, copy as-is
-    if (raw[0] == '+') {
-        charBufSet(out, outSize, raw);
+    char normalized[PHONE_BUFFER_SIZE];
+    normalized[0] = '\0';
+    const int n = normalizePhNumber(raw, normalized, sizeof(normalized));
+    if (n == 13 && strncmp(normalized, "+639", 4) == 0) {
+        charBufSet(out, outSize, normalized);
         return;
     }
-    // Add + prefix
-    snprintf(out, outSize, "+%s", raw);
+    out[0] = '\0';
 }
 
 void pruneExpiredActiveSessions() {  // called from maintenance + heartbeat
@@ -1075,11 +1406,18 @@ static bool simInHeartbeatReport(int i) {
     if (!simStates[i].enabled) return false;
     if (!simStates[i].responsive) return false;
     if (charBufIsEmpty(simStates[i].number)) return false;
+    char normalizedNum[PHONE_BUFFER_SIZE];
+    normalizeSimNumber(simStates[i].number, normalizedNum, sizeof(normalizedNum));
+    if (charBufIsEmpty(normalizedNum)) {
+        simStates[i].enabled = false;  // Turn slot OFF in UI for invalid numbers.
+        appendErrorLogInt("[SIM] Disabled invalid number slot", i + 1);
+        return false;
+    }
     return true;
 }
 
 static void fetchHeartbeatFollowup() {
-    if (charBufIsEmpty(agentBaseUrl) || charBufIsEmpty(agentBearerToken)) return;
+    if (charBufIsEmpty(agentBaseUrl) || charBufIsEmpty(agentBearerToken) || charBufIsEmpty(agentRefreshToken)) return;
     if (httpsBusy || !ensureWifiForHttps()) return;
 
     static char url[256];
@@ -1138,13 +1476,13 @@ static void fetchHeartbeatFollowup() {
 
     if (!begun) {
         httpsBusy = false;
-        wifiRestoreAfterHttps();
+        wifiRecoverAfterHttps();
         return;
     }
 
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(25000);
-    static char authHdrFollow[1100];
+    static char authHdrFollow[AGENT_AUTH_HDR_SIZE];
     formatBearerHeader(authHdrFollow, sizeof(authHdrFollow), agentBearerToken);
     http.addHeader("Authorization", authHdrFollow);
 
@@ -1182,7 +1520,7 @@ static void fetchHeartbeatFollowup() {
         clientPlain.stop();
     }
     httpsBusy = false;
-    wifiRestoreAfterHttps();
+    wifiRecoverAfterHttps();
 
     if (code >= 200 && code < 300 && respBuf[0] != '\0') {
         parseActiveSessionsFromJson(respBuf);
@@ -1195,9 +1533,125 @@ static void fetchHeartbeatFollowup() {
     }
 }
 
+static bool agentInventoryHeartbeatDone = false;
+
+void resetAgentInventoryHeartbeat() {
+    agentInventoryHeartbeatDone = false;
+}
+
+static int heartbeatLowestBatteryPercent() {
+    int lowestBatteryPercent = 100;
+    for (int i = 0; i < SIM_COUNT; i++) {
+        if (!simStates[i].enabled) continue;
+        if (!simStates[i].responsive) continue;
+        if (simStates[i].batteryPercent > 0 && simStates[i].batteryPercent < lowestBatteryPercent) {
+            lowestBatteryPercent = simStates[i].batteryPercent;
+        }
+    }
+    if (lowestBatteryPercent == 100 && batteryPercent > 0) {
+        lowestBatteryPercent = batteryPercent;
+    }
+    return lowestBatteryPercent;
+}
+
+static void performHeartbeatPing() {
+    lastHeartbeatMs = millis();
+    httpsBusy = true;
+    pauseSmsPolling(HEARTBEAT_PING_PAUSE_MS);
+    wifiPrepareForHttps();
+    logMsg("[HEARTBEAT] Ping starting");
+    appendMonitorLog("[HEARTBEAT] Ping starting");
+
+    if (!ntpConfigured) {
+        configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+        ntpConfigured = true;
+        delay(200);
+    }
+
+    char url[256];
+    snprintf(url, sizeof(url), "%s/api/agent/ping", agentBaseUrl);
+    const bool isHttps = (strncmp(url, "https://", 8) == 0);
+
+    HTTPClient http;
+    WiFiClientSecure clientSecure;
+    WiFiClient client;
+
+    if (isHttps) {
+        clientSecure.setInsecure();
+        clientSecure.setTimeout(HEARTBEAT_PING_TIMEOUT_MS);
+        if (!http.begin(clientSecure, url)) {
+            logMsg("[HEARTBEAT] Ping begin failed");
+            httpsBusy = false;
+            wifiRecoverAfterHttps();
+            resumeSmsPolling();
+            return;
+        }
+    } else if (!http.begin(client, url)) {
+        logMsg("[HEARTBEAT] Ping begin failed");
+        httpsBusy = false;
+        wifiRecoverAfterHttps();
+        resumeSmsPolling();
+        return;
+    }
+
+    http.addHeader("Content-Type", "application/json");
+    http.setTimeout(HEARTBEAT_PING_TIMEOUT_MS);
+
+    static char authHdr[AGENT_AUTH_HDR_SIZE];
+    if (!charBufIsEmpty(agentBearerToken)) {
+        formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
+        http.addHeader("Authorization", authHdr);
+    }
+
+    static char body[128];
+    snprintf(body, sizeof(body),
+        "{\"device_id\":\"%s\",\"battery_level\":%d}",
+        agentDeviceId,
+        heartbeatLowestBatteryPercent());
+
+    handleWebRequests();
+    int code = http.POST(body);
+    http.end();
+    clientSecure.stop();
+    client.stop();
+
+    httpsBusy = false;
+    wifiRecoverAfterHttps();
+    resumeSmsPolling();
+
+    if (code >= 200 && code < 300) {
+        logMsg("[HEARTBEAT] Ping OK");
+        appendMonitorLog("[HEARTBEAT] Ping OK");
+        deviceRegistered = true;
+    } else if (code < 0) {
+        logMsgInt("[HEARTBEAT] Ping failed", code);
+        appendMonitorLogInt("[HEARTBEAT] Ping failed", code);
+        deferHeartbeat(HEARTBEAT_POST_FAIL_COOLDOWN_MS);
+    } else {
+        logMsgInt("[HEARTBEAT] Ping HTTP error", code);
+        appendMonitorLogInt("[HEARTBEAT] Ping HTTP error", code);
+    }
+    lastHeartbeatMs = millis();
+}
+
 void performHeartbeat() {
     if (charBufIsEmpty(agentBaseUrl)) {
         return;  // No backend configured
+    }
+    if (isSimBusy() || millis() < modemGatewayStableUntilMs) {
+        return;
+    }
+    if (getPendingSmsCount() > 0) {
+        return;
+    }
+    if (charBufIsEmpty(agentBearerToken) || charBufIsEmpty(agentRefreshToken)) {
+        static unsigned long lastAuthSkipLogMs = 0;
+        unsigned long now = millis();
+        if (now - lastAuthSkipLogMs > 15000UL) {
+            lastAuthSkipLogMs = now;
+            appendMonitorLog("[HEARTBEAT] Skipped (not signed in)");
+        }
+        return;
     }
     
     if (!ensureWifiForHttps()) {
@@ -1211,10 +1665,19 @@ void performHeartbeat() {
         return;
     }
 
+    if (agentInventoryHeartbeatDone) {
+        performHeartbeatPing();
+        return;
+    }
+
+    // Mark attempt immediately to prevent tight retry loops on begin/conn failures.
+    lastHeartbeatMs = millis();
+
     httpsBusy = true;
+    pauseSmsPolling(HEARTBEAT_FULL_PAUSE_MS);
     wifiPrepareForHttps();
-    logMsg("[HEARTBEAT] Starting");
-    appendMonitorLog("[HEARTBEAT] Starting");
+    logMsg("[HEARTBEAT] Full sync starting");
+    appendMonitorLog("[HEARTBEAT] Full sync starting");
     
     // Ensure NTP for TLS
     if (!ntpConfigured) {
@@ -1235,12 +1698,13 @@ void performHeartbeat() {
     
     if (isHttps) {
         clientSecure.setInsecure();
-        clientSecure.setTimeout(25000);  // 25 second timeout - backend does many DB ops
+        clientSecure.setTimeout(HEARTBEAT_FULL_TIMEOUT_MS);
         if (!http.begin(clientSecure, url)) {
             logMsg("[HEARTBEAT] HTTPS begin failed");
             appendMonitorLog("[HEARTBEAT] HTTPS begin failed");
             httpsBusy = false;
-            wifiRestoreAfterHttps();
+            wifiRecoverAfterHttps();
+            resumeSmsPolling();
             return;
         }
     } else {
@@ -1248,15 +1712,16 @@ void performHeartbeat() {
             logMsg("[HEARTBEAT] HTTP begin failed");
             appendMonitorLog("[HEARTBEAT] HTTP begin failed");
             httpsBusy = false;
-            wifiRestoreAfterHttps();
+            wifiRecoverAfterHttps();
+            resumeSmsPolling();
             return;
         }
     }
     
     http.addHeader("Content-Type", "application/json");
-    http.setTimeout(25000);  // 25 second timeout
+    http.setTimeout(HEARTBEAT_FULL_TIMEOUT_MS);
     
-    static char authHdr[1100];
+    static char authHdr[AGENT_AUTH_HDR_SIZE];
     if (!charBufIsEmpty(agentBearerToken)) {
         formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
         http.addHeader("Authorization", authHdr);
@@ -1266,26 +1731,13 @@ void performHeartbeat() {
         http.addHeader("x-heartbeat-debug", "1");
     }
 
-    // Backend expects { device_id, battery_level, sims:[{number,slot,status,signal_strength,network_type}] }
-    static char body[3072];  // Reduced from 4096
-    
-    // Find lowest battery percentage among all responsive SIMs
-    int lowestBatteryPercent = 100;
-    for (int i = 0; i < SIM_COUNT; i++) {
-        if (!simStates[i].enabled) continue;
-        if (!simStates[i].responsive) continue;
-        if (simStates[i].batteryPercent > 0 && simStates[i].batteryPercent < lowestBatteryPercent) {
-            lowestBatteryPercent = simStates[i].batteryPercent;
-        }
-    }
-    // If no SIM has battery info, use ESP32's battery (if available)
-    if (lowestBatteryPercent == 100 && batteryPercent > 0) {
-        lowestBatteryPercent = batteryPercent;
-    }
+    // Full inventory sync once after modem init (signal/slot/number + optional disable missing)
+    static char body[3072];
+    const int lowestBatteryPercent = heartbeatLowestBatteryPercent();
     
     size_t pos = 0;
     pos += snprintf(body + pos, sizeof(body) - pos,
-        "{\"device_id\":\"%s\",\"battery_level\":%d,\"sims\":[",
+        "{\"device_id\":\"%s\",\"battery_level\":%d,\"inventory_sync\":true,\"sims\":[",
         agentDeviceId,
         lowestBatteryPercent
     );
@@ -1359,27 +1811,38 @@ void performHeartbeat() {
         }
         http.end();
         
-        // Success or non-connection error - don't retry
-        if (code >= 0 && code != -1 && code != -11) break;
-        
-        // Connection error - retry once
+        // HTTP status received — done (even 4xx/5xx)
+        if (code > 0) break;
+
+        // Connection error — one retry without disconnecting WiFi (ensureWifiForHttps drops STA)
         if (code < 0 && attempt == 0) {
             logMsgInt("[HEARTBEAT] Conn error, retrying", code);
             clientSecure.stop();
             client.stop();
-            delay(500);
-            ensureWifiForHttps();
+            for (int i = 0; i < 5; i++) {
+                handleWebRequests();
+                delay(30);
+            }
+            if (!WiFi.isConnected()) {
+                if (!ensureWifiForHttps()) {
+                    break;
+                }
+            }
+            delay(200);
 
-            // Reconnect
             if (isHttps) {
                 clientSecure.setInsecure();
-                clientSecure.setTimeout(25000);
-                http.begin(clientSecure, url);
+                clientSecure.setTimeout(15000);
+                if (!http.begin(clientSecure, url)) {
+                    break;
+                }
             } else {
-                http.begin(client, url);
+                if (!http.begin(client, url)) {
+                    break;
+                }
             }
             http.addHeader("Content-Type", "application/json");
-            http.setTimeout(25000);
+            http.setTimeout(15000);
             if (!charBufIsEmpty(agentBearerToken)) {
                 formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
                 http.addHeader("Authorization", authHdr);
@@ -1395,7 +1858,11 @@ void performHeartbeat() {
         clientSecure.stop();
         client.stop();
         httpsBusy = false;
-        wifiRestoreAfterHttps();
+        wifiRecoverAfterHttps();
+        resumeSmsPolling();
+        deferHeartbeat(HEARTBEAT_POST_FAIL_COOLDOWN_MS);
+        logMsg("[HEARTBEAT] Backoff 2 min before next try");
+        appendMonitorLog("[HEARTBEAT] Backoff 2m");
         return;
     }
     
@@ -1450,8 +1917,9 @@ void performHeartbeat() {
     }
 
     if (code >= 200 && code < 300) {
-        logMsg("[HEARTBEAT] OK");
-        appendMonitorLog("[HEARTBEAT] OK");
+        logMsg("[HEARTBEAT] Full sync OK");
+        appendMonitorLog("[HEARTBEAT] Full sync OK");
+        agentInventoryHeartbeatDone = true;
     } else {
         logMsgInt("[HEARTBEAT] Failed, code", code);
         appendMonitorLogInt("[HEARTBEAT] Failed", code);
@@ -1474,7 +1942,8 @@ void performHeartbeat() {
     delay(50);
     
     httpsBusy = false;
-    wifiRestoreAfterHttps();
+    wifiRecoverAfterHttps();
+    resumeSmsPolling();
 
     if (code >= 200 && code < 300 && respBuf[0] != '\0') {
         applyBackendSimStatusFromJson(respBuf);
@@ -1501,6 +1970,7 @@ void performHeartbeat() {
         deviceRegistered = true;
     }
 
+    // lastHeartbeatMs already set at start; keep it updated here too
     lastHeartbeatMs = millis();
 }
 
@@ -1522,212 +1992,23 @@ void updateBatteryInfo() {
 // -----------------------------------------------------------------------------
 
 void checkAndRecoverUnresponsiveSims() {
+    if (!modemGatewayRunning) return;
     if (isSimBusy()) return;
-    // Do not mark SIMs stale while HTTPS blocks polling.
     if (httpsBusy || isSmsPollingPaused()) return;
-    
-    unsigned long now = millis();
-    bool attemptedRecoveryThisPass = false;
 
     for (int i = 0; i < SIM_COUNT; i++) {
-        // Skip disabled SIMs
+        if (simStates[i].userDisabled) continue;
         if (!simStates[i].enabled) continue;
-        
-        // For unresponsive SIMs, retry every 5 minutes
-        if (!simStates[i].responsive) {
-            // Check if we should retry this unresponsive SIM
-            static unsigned long lastUnresponsiveRetry[SIM_COUNT] = {0};
-            if (now - lastUnresponsiveRetry[i] < 300000) {  // 5 minutes
-                continue;
-            }
-            lastUnresponsiveRetry[i] = now;
-            
-            // Try to recover unresponsive SIM
-            appendMonitorLogInt("[WATCHDOG] Retrying unresponsive SIM", i + 1);
-            logMsgInt("[WATCHDOG] Retrying unresponsive SIM", i + 1);
-            
-            setSimBusy(true);
-            selectSIM(i);
-            delay(500);
-            
-            // Try aggressive recovery
-            initMux();
-            delay(100);
-            flushSimInput();
-            delay(100);
-            selectSIM(i);
-            delay(500);
-            
-            bool recovered = false;
-            for (int retry = 0; retry < 5 && !recovered; retry++) {
-                flushSimInput();
-                sendATCapture("AT", 2000);
-                if (strstr(getSimBuffer(), "OK") != NULL) {
-                    recovered = true;
-                } else {
-                    selectSIM(i);
-                    delay(300);
-                }
-            }
-            
-            if (recovered) {
-                // Full re-initialization
-                sendATCapture("AT", 1000);
-                sendATCapture("AT+CPIN?", 2000);
-                sendATCapture("AT+CMGF=1", 800);
-                sendATCapture("AT+CSCS=\"GSM\"", 800);
-                sendATCapture("AT+CPMS=\"SM\",\"SM\",\"SM\"", 1000);
-                sendATCapture("AT+CNMI=2,1,0,0,0", 800);
-                
-                sendATCapture("AT+CSQ", 2000);
-                charBufSet(simStates[i].csq, sizeof(simStates[i].csq), getSimBuffer());
-                simStates[i].signalStrength = extractSignalQuality(simStates[i].csq);
-                
-                simStates[i].consecutiveErrors = 0;
-                simStates[i].errorCount = 0;
-                simStates[i].lastSuccessfulPoll = millis();
-                simStates[i].responsive = true;
-                simStates[i].basicInitDone = true;
-                
-                appendMonitorLogInt("[WATCHDOG] Unresponsive SIM recovered", i + 1);
-                logMsgInt("[WATCHDOG] Unresponsive SIM recovered", i + 1);
-            }
-            
-            setSimBusy(false);
-            delay(100);
-            attemptedRecoveryThisPass = true;
-            break;
-        }
-        
-        // Check if SIM has too many consecutive errors or hasn't responded in a while
-        bool needsRecovery = false;
-        
-        // Condition 1: Too many consecutive errors
-        if (simStates[i].consecutiveErrors >= SIM_CONSECUTIVE_ERROR_THRESHOLD) {
-            needsRecovery = true;
-            appendMonitorLogInt("[WATCHDOG] SIM has consecutive errors", i + 1);
-            appendErrorLogInt("[WATCHDOG] SIM consecutive errors", i + 1);
-        }
-        
-        // Condition 2: No successful poll for too long (watchdog timeout)
-        if (simStates[i].lastSuccessfulPoll > 0 && 
-            (now - simStates[i].lastSuccessfulPoll) > SIM_WATCHDOG_TIMEOUT_MS) {
-            needsRecovery = true;
-            appendMonitorLogInt("[WATCHDOG] SIM watchdog timeout", i + 1);
-            appendErrorLogInt("[WATCHDOG] SIM watchdog timeout", i + 1);
-        }
-        
-        if (!needsRecovery) continue;
-        
-        // Attempt recovery
-        appendMonitorLogInt("[WATCHDOG] Attempting recovery for SIM", i + 1);
-        logMsgInt("[WATCHDOG] Recovering SIM", i + 1);
-        
-        setSimBusy(true);
-        selectSIM(i);
-        delay(MUX_SETTLE_MS);
-        
-        // Try to ping the SIM multiple times
-        bool recovered = false;
-        for (int retry = 0; retry < 3 && !recovered; retry++) {
-            sendATCapture("AT", 1000);
-            if (strstr(getSimBuffer(), "OK") != NULL) {
-                recovered = true;
-            } else {
-                delay(500);
-            }
-        }
-        
-        if (recovered) {
-            // Re-initialize the SIM
-            sendATCapture("AT+CPIN?", 2000);
-            sendATCapture("AT+CMGF=1", 800);
-            sendATCapture("AT+CSCS=\"GSM\"", 800);
-            
-            // Update signal and network info
-            sendATCapture("AT+CSQ", 2000);
-            charBufSet(simStates[i].csq, sizeof(simStates[i].csq), getSimBuffer());
-            simStates[i].signalStrength = extractSignalQuality(simStates[i].csq);
-            
-            // Reset error counters
-            simStates[i].consecutiveErrors = 0;
-            simStates[i].errorCount = 0;
-            simStates[i].lastSuccessfulPoll = now;
-            
-            appendMonitorLogInt("[WATCHDOG] SIM recovered (soft)", i + 1);
-            logMsgInt("[WATCHDOG] SIM recovered successfully", i + 1);
-        } else {
-            // Software recovery failed - try aggressive ESP32-side recovery
-            appendMonitorLogInt("[WATCHDOG] Soft recovery failed, trying aggressive recovery", i + 1);
-            logMsgInt("[WATCHDOG] Aggressive recovery for SIM", i + 1);
-            
-            // 1. Re-initialize MUX (toggle all control pins)
-            initMux();
-            delay(100);
-            
-            // 2. Flush serial buffer thoroughly
-            flushSimInput();
-            delay(100);
-            
-            // 3. Re-select the SIM with extra settling time
-            selectSIM(i);
-            delay(500);  // Extra settling time
-            
-            // 4. Try multiple AT commands with longer timeouts
-            bool recoveredAggressive = false;
-            for (int retry = 0; retry < 5 && !recoveredAggressive; retry++) {
-                // Longer timeout and multiple flushes
-                flushSimInput();
-                sendATCapture("AT", 2000);  // 2 second timeout
-                if (strstr(getSimBuffer(), "OK") != NULL) {
-                    recoveredAggressive = true;
-                } else {
-                    // Re-select and wait longer
-                    selectSIM(i);
-                    delay(300);
-                }
-            }
-            
-            if (recoveredAggressive) {
-                // Full re-initialization
-                sendATCapture("AT", 1000);
-                sendATCapture("AT+CPIN?", 2000);
-                sendATCapture("AT+CMGF=1", 800);
-                sendATCapture("AT+CSCS=\"GSM\"", 800);
-                sendATCapture("AT+CPMS=\"SM\",\"SM\",\"SM\"", 1000);
-                sendATCapture("AT+CNMI=2,1,0,0,0", 800);
-                
-                // Update signal
-                sendATCapture("AT+CSQ", 2000);
-                charBufSet(simStates[i].csq, sizeof(simStates[i].csq), getSimBuffer());
-                simStates[i].signalStrength = extractSignalQuality(simStates[i].csq);
-                
-                // Reset error counters
-                simStates[i].consecutiveErrors = 0;
-                simStates[i].errorCount = 0;
-                simStates[i].lastSuccessfulPoll = millis();
-                simStates[i].responsive = true;
-                simStates[i].basicInitDone = true;
-                
-                appendMonitorLogInt("[WATCHDOG] SIM recovered (aggressive)", i + 1);
-                logMsgInt("[WATCHDOG] SIM recovered after aggressive recovery", i + 1);
-            } else {
-                // Mark as unresponsive - will be retried next watchdog cycle
-                simStates[i].responsive = false;
-                appendMonitorLogInt("[WATCHDOG] SIM marked unresponsive", i + 1);
-                logMsgInt("[WATCHDOG] Failed to recover SIM", i + 1);
-            }
-        }
-        
-        setSimBusy(false);
-        delay(100);  // Small delay between SIMs
-        attemptedRecoveryThisPass = true;
-        break;
-    }
 
-    if (attemptedRecoveryThisPass) {
-        // Keep normal polling alive: only one SIM recovery per watchdog run.
-        return;
+        if (!simStates[i].responsive) {
+            simMarkSlotOffline(i, "not responsive");
+            continue;
+        }
+
+        if (simStates[i].consecutiveErrors >= SIM_POLL_DISABLE_THRESHOLD) {
+            simMarkSlotOffline(i, "poll errors");
+            continue;
+        }
     }
 }
 

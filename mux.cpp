@@ -4,6 +4,7 @@
 
 #include "mux.h"
 #include "sim800.h"
+#include "webui.h"
 #include "logger.h"
 #include <Arduino.h>
 
@@ -51,6 +52,15 @@ void initMux() {
     logMsg("[MUX] Initialized (custom slot -> mux map)");
 }
 
+static void cooperativeDelayMux(unsigned long ms) {
+    const unsigned long until = millis() + ms;
+    while ((long)(until - millis()) > 0) {
+        handleWebRequests();
+        yield();
+        delay(5);
+    }
+}
+
 void selectSIM(int slot) {
     if (slot < 0) slot = 0;
     if (slot >= SIM_COUNT) slot = SIM_COUNT - 1;
@@ -66,7 +76,7 @@ void selectSIM(int slot) {
     digitalWrite(MUX_S2, (muxChannel & 0x04) ? HIGH : LOW);
     digitalWrite(MUX_S3, (muxChannel & 0x08) ? HIGH : LOW);
 
-    delay(MUX_SETTLE_MS);
+    cooperativeDelayMux(MUX_SETTLE_MS);
 
     HardwareSerial& serial = simSerial();
     for (int pass = 0; pass < 3; pass++) {
@@ -76,7 +86,7 @@ void selectSIM(int slot) {
             flushed++;
         }
         if (flushed > 0) {
-            delay(UART_FLUSH_WAIT_MS);
+            cooperativeDelayMux(UART_FLUSH_WAIT_MS);
         }
     }
 
@@ -95,9 +105,9 @@ void resetSIM(int slot) {
     selectSIM(slot);
 
     digitalWrite(RESET_PIN, LOW);
-    delay(200);
+    cooperativeDelayMux(200);
     digitalWrite(RESET_PIN, HIGH);
-    delay(6000);
+    cooperativeDelayMux(6000);
 
     logMsgInt("[MUX] SIM reset complete", slot + 1);
 }

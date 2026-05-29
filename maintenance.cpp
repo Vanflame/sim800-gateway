@@ -20,7 +20,6 @@ extern int activeSessionCount;
 
 extern char agentBaseUrl[128];
 extern char agentDeviceId[64];
-extern char agentBearerToken[1024];
 extern volatile bool httpsBusy;
 extern bool heartbeatPaused;
 extern bool smsPollingPaused;
@@ -140,6 +139,7 @@ static bool maintenanceHttpPost(const char* body, char* respOut, size_t respSize
     if (!respOut || respSize < 2) return false;
     respOut[0] = '\0';
     if (charBufIsEmpty(agentBaseUrl) || charBufIsEmpty(agentDeviceId)) return false;
+    if (!agentIsSignedIn()) return false;
     if (!WiFi.isConnected() || httpsBusy) return false;
 
     static char url[280];
@@ -170,7 +170,7 @@ static bool maintenanceHttpPost(const char* body, char* respOut, size_t respSize
 
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(20000);
-    static char authHdr[1100];
+    static char authHdr[AGENT_AUTH_HDR_SIZE];
     if (!charBufIsEmpty(agentBearerToken)) {
         formatBearerHeader(authHdr, sizeof(authHdr), agentBearerToken);
         http.addHeader("Authorization", authHdr);
@@ -410,13 +410,14 @@ extern volatile bool otaInProgress;
 
 void maintenanceTick(unsigned long nowMs) {
     if (otaInProgress || httpsBusy) return;
+    if (cloudBackendDeferred()) return;
 
     maintenanceMaybeRunScheduledRestart();
 
     if (!WiFi.isConnected()) return;
 
     bool ranMaintPoll = false;
-    if (!charBufIsEmpty(agentBaseUrl) &&
+    if (agentIsSignedIn() && !charBufIsEmpty(agentBaseUrl) &&
         (nowMs - lastMaintenancePollMs) >= (unsigned long)MAINTENANCE_POLL_MIN_INTERVAL_MS) {
         maintenancePollBackend();
         ranMaintPoll = true;

@@ -46,6 +46,16 @@ int readLine(char* buf, size_t bufSize, unsigned long timeoutMs = 1000);
 // Check all SIMs on startup - marks responsive SIMs
 void checkAllSIMsOnStartup();
 
+// Turn slot OFF in UI + exclude from poll/heartbeat (not userDisabled)
+void simMarkSlotOffline(int slot, const char* reason);
+
+// Manual start: skip boot SIM probe; user presses Run in web UI
+bool isModemGatewayRunning();
+bool isModemGatewayStartQueued();
+void requestModemGatewayStart();
+void stopModemGateway();
+void modemGatewayTick();
+
 // Read all available data into buffer
 void readAllAvailable(char* buf, size_t bufSize);
 
