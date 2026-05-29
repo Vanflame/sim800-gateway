@@ -1572,6 +1572,51 @@ static void hbHttpEnd() {
     gHbPlain.stop();
 }
 
+void agentHttpsReleaseClient() {
+    hbHttpEnd();
+    delay(200);
+    yield();
+}
+
+bool agentHttpsBeginGet(const char* url, int connectTimeoutMs, int readTimeoutMs) {
+    if (!url || !url[0]) {
+        return false;
+    }
+    hbHttpEnd();
+    delay(50);
+    if (!hbHttpBegin(url, readTimeoutMs)) {
+        return false;
+    }
+    gHbHttp.setTimeout(readTimeoutMs);
+    gHbHttp.setConnectTimeout(connectTimeoutMs);
+    gHbHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    gHbHttp.setReuse(false);
+    gHbHttp.addHeader("Connection", "close");
+    gHbHttp.setUserAgent("sim800-gateway-ota/1.0");
+    return true;
+}
+
+int agentHttpsHead() {
+    return gHbHttp.sendRequest("HEAD");
+}
+
+int agentHttpsGet() {
+    return gHbHttp.GET();
+}
+
+int agentHttpsGetContentLength() {
+    return gHbHttp.getSize();
+}
+
+Stream* agentHttpsGetStream() {
+    return gHbHttp.getStreamPtr();
+}
+
+void agentHttpsEndSession() {
+    hbHttpEnd();
+    markHttpsSessionEnded();
+}
+
 int agentHttpsPostJson(const char* url, const char* jsonBody, int timeoutMs, bool addAuth,
     char* respOut, size_t respOutSize, const char* opLabel) {
     if (!url || !jsonBody || timeoutMs < 1000) {

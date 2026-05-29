@@ -4,6 +4,7 @@
 
 #include "ota.h"
 #include "sms.h"
+#include "sim800.h"
 #include "logger.h"
 #include "utils.h"
 #include <Arduino.h>
@@ -285,14 +286,11 @@ static bool otaFirmwareFitsUpdateSlot(int firmwareBytes, char* errorOut, size_t 
 #endif
 
 #if OTA_ENABLED
-// HTTPClient + WiFiClientSecure must NOT live on loopTask stack (~8KB) — use static globals.
-static HTTPClient gOtaHttp;
-static WiFiClientSecure gOtaTls;
+// OTA reuses the shared agent TLS client (gHbHttp) — no second WiFiClientSecure (saves ~20KB heap).
 static unsigned long gOtaProgLastMs = 0;
 
 static void otaReleaseSession() {
-    gOtaHttp.end();
-    gOtaTls.stop();
+    agentHttpsEndSession();
     delay(100);
 }
 
@@ -371,22 +369,7 @@ static void otaOnProgress(size_t current, size_t total) {
     logMsg(pbuf);
 }
 
-static void otaPrepareTlsClient() {
-    gOtaTls.setInsecure();
-    // Per-read timeout (ms) — not connect timeout.
-    gOtaTls.setTimeout(60000);
-}
-
-static void otaConfigureHttpClient() {
-    gOtaHttp.setTimeout(600000);
-    gOtaHttp.setConnectTimeout(30000);
-    gOtaHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    gOtaHttp.setReuse(false);
-    gOtaHttp.addHeader("Connection", "close");
-    gOtaHttp.setUserAgent("sim800-gateway-ota/1.0");
-}
-
-// Standard Arduino OTA: HTTPClient GET + Update.writeStream (same as ESP32 docs / examples).
+// Standard Arduino OTA: shared HTTPClient GET + Update.writeStream (same as ESP32 docs / examples).
 static bool otaStreamDownloadAndFlash(const char* url, char* errorOut, size_t errorOutSize) {
     if (errorOut && errorOutSize > 0) {
         errorOut[0] = '\0';
@@ -403,11 +386,13 @@ static bool otaStreamDownloadAndFlash(const char* url, char* errorOut, size_t er
         return false;
     }
 
+    agentHttpsReleaseClient();
     otaCooldownMs(500);
     otaLogDnsForUrl(url);
-    logMsg("[OTA] HTTP GET + Update.writeStream");
+    logMsg("[OTA] HEAD size probe, then GET flash (shared TLS)");
 
-    int lastCode = -1;
+    static char lastFail[160];
+    lastFail[0] = '\0';
 
     for (int attempt = 0; attempt < 3; attempt++) {
         if (attempt > 0) {
@@ -416,28 +401,30 @@ static bool otaStreamDownloadAndFlash(const char* url, char* errorOut, size_t er
             otaCooldownMs(3000);
         }
 
+        Update.abort();
         otaReleaseSession();
-        otaPrepareTlsClient();
 
-        if (!gOtaHttp.begin(gOtaTls, url)) {
-            logMsg("[OTA] http.begin failed");
+        // Phase 1: HEAD only — get Content-Length without holding TLS heap during Update.begin.
+        if (!agentHttpsBeginGet(url, 30000, 30000)) {
+            charBufSet(lastFail, sizeof(lastFail), "http.begin failed (HEAD)");
             continue;
         }
-        otaConfigureHttpClient();
 
-        logMsg("[OTA] Connecting...");
-        const int code = gOtaHttp.GET();
-        lastCode = code;
-        if (code != HTTP_CODE_OK) {
-            otaLogGetFailure(code);
+        logMsg("[OTA] Probing size (HEAD)...");
+        int headCode = agentHttpsHead();
+        if (headCode != HTTP_CODE_OK) {
+            snprintf(lastFail, sizeof(lastFail), "HEAD failed (%d)", headCode);
+            otaLogGetFailure(headCode);
             otaReleaseSession();
             continue;
         }
 
-        const int contentLen = gOtaHttp.getSize();
+        const int contentLen = agentHttpsGetContentLength();
+        otaReleaseSession();
+        delay(200);
+
         if (contentLen <= 0) {
-            logMsg("[OTA] No Content-Length");
-            otaReleaseSession();
+            charBufSet(lastFail, sizeof(lastFail), "No Content-Length from HEAD");
             continue;
         }
 
@@ -448,36 +435,74 @@ static bool otaStreamDownloadAndFlash(const char* url, char* errorOut, size_t er
         }
 
         if ((size_t)contentLen < OTA_MIN_APP_BYTES) {
-            if (errorOut) {
+            if (errorOut && errorOutSize > 0) {
                 snprintf(errorOut, errorOutSize, "File too small (%d bytes)", contentLen);
             }
-            otaReleaseSession();
             WiFi.setSleep(prevWifiPs);
             return false;
         }
 
         if (!otaFirmwareFitsUpdateSlot(contentLen, errorOut, errorOutSize)) {
-            otaReleaseSession();
             WiFi.setSleep(prevWifiPs);
             return false;
         }
 
-        if (!Update.begin(contentLen, U_FLASH)) {
-            logMsgVal("[OTA] Update.begin failed", Update.errorString());
-            if (errorOut) {
-                snprintf(errorOut, errorOutSize, "Update.begin: %s", Update.errorString());
-            }
+        {
+            char buf[128];
+            snprintf(
+                buf,
+                sizeof(buf),
+                "[OTA] Before begin heap=%u largest=%u",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)ESP.getMaxAllocHeap()
+            );
+            logMsg(buf);
+        }
+
+        if (!Update.begin((size_t)contentLen, U_FLASH)) {
+            snprintf(
+                lastFail,
+                sizeof(lastFail),
+                "Update.begin err=%u (%s)",
+                (unsigned)Update.getError(),
+                Update.errorString()
+            );
+            logMsgVal("[OTA] Update.begin failed", lastFail);
+            Update.abort();
+            continue;
+        }
+
+        // Phase 2: fresh GET — stream body into flash (TLS not active during begin).
+        if (!agentHttpsBeginGet(url, 30000, 600000)) {
+            charBufSet(lastFail, sizeof(lastFail), "http.begin failed (GET)");
+            Update.abort();
+            continue;
+        }
+
+        logMsg("[OTA] Connecting...");
+        const int getCode = agentHttpsGet();
+        if (getCode != HTTP_CODE_OK) {
+            snprintf(lastFail, sizeof(lastFail), "GET failed (%d)", getCode);
+            otaLogGetFailure(getCode);
+            Update.abort();
             otaReleaseSession();
             continue;
         }
 
-        WiFiClient* stream = gOtaHttp.getStreamPtr();
-        if (!stream) {
+        const int getLen = agentHttpsGetContentLength();
+        if (getLen > 0 && getLen != contentLen) {
+            snprintf(lastFail, sizeof(lastFail), "Size mismatch HEAD=%d GET=%d", contentLen, getLen);
+            logMsgVal("[OTA] Failed", lastFail);
             Update.abort();
             otaReleaseSession();
-            if (errorOut) {
-                snprintf(errorOut, errorOutSize, "No HTTP stream");
-            }
+            continue;
+        }
+
+        Stream* stream = agentHttpsGetStream();
+        if (!stream) {
+            charBufSet(lastFail, sizeof(lastFail), "No HTTP stream");
+            Update.abort();
+            otaReleaseSession();
             continue;
         }
 
@@ -490,17 +515,16 @@ static bool otaStreamDownloadAndFlash(const char* url, char* errorOut, size_t er
         otaReleaseSession();
 
         if (written != (size_t)contentLen) {
-            logMsgInt("[OTA] writeStream short", (int)written);
+            snprintf(lastFail, sizeof(lastFail), "writeStream short %u/%d", (unsigned)written, contentLen);
+            logMsgVal("[OTA] Failed", lastFail);
             Update.abort();
             continue;
         }
 
         logMsg("[OTA] Verifying...");
         if (!Update.end(true)) {
-            logMsgVal("[OTA] Update.end failed", Update.errorString());
-            if (errorOut) {
-                snprintf(errorOut, errorOutSize, "Update.end: %s", Update.errorString());
-            }
+            snprintf(lastFail, sizeof(lastFail), "Update.end: %s", Update.errorString());
+            logMsgVal("[OTA] Failed", lastFail);
             Update.abort();
             continue;
         }
@@ -513,8 +537,13 @@ static bool otaStreamDownloadAndFlash(const char* url, char* errorOut, size_t er
         return true;
     }
 
-    if (errorOut) {
-        snprintf(errorOut, errorOutSize, "HTTP GET failed (%d)", lastCode);
+    if (errorOut && errorOutSize > 0) {
+        snprintf(
+            errorOut,
+            errorOutSize,
+            "%s",
+            lastFail[0] ? lastFail : "OTA failed"
+        );
     }
     WiFi.setSleep(prevWifiPs);
     return false;
@@ -694,6 +723,14 @@ bool otaPerformUpdate(const char* url, char* errorOut, size_t errorOutSize) {
     logMsg("[OTA] Background tasks paused for download");
     appendMonitorLog("[OTA] Background tasks paused");
 
+    agentHttpsReleaseClient();
+    if (modemGatewayRunning) {
+        logMsg("[OTA] Stopping modem gateway to free RAM");
+        stopModemGateway();
+        delay(300);
+    }
+    wifiPrepareForHttps();
+
 #if !OTA_ENABLED
     otaInProgress = false;
     httpsBusy = false;
@@ -762,13 +799,14 @@ bool otaPerformUpdate(const char* url, char* errorOut, size_t errorOutSize) {
     logMsg2Val("[OTA] Starting update from", updateUrl, "", "");
     appendMonitorLog("[OTA] Download started");
     {
-        char buf[128];
+        char buf[160];
         snprintf(
             buf,
             sizeof(buf),
-            "[OTA] Free heap=%u largest=%u",
+            "[OTA] Free heap=%u largest=%u min=%u",
             (unsigned)ESP.getFreeHeap(),
-            (unsigned)ESP.getMaxAllocHeap()
+            (unsigned)ESP.getMaxAllocHeap(),
+            (unsigned)ESP.getMinFreeHeap()
         );
         logMsg(buf);
         appendMonitorLog(buf);

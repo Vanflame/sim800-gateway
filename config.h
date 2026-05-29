@@ -47,7 +47,7 @@
 // -----------------------------------------------------------------------------
 // Firmware version (shown in web UI; bump when releasing OTA builds)
 // -----------------------------------------------------------------------------
-#define FIRMWARE_VERSION    "1.0.9"
+#define FIRMWARE_VERSION    "1.0.12"
 
 // -----------------------------------------------------------------------------
 // Over-the-air updates (ESP32 HTTPS OTA from GitHub Releases or custom URL)
@@ -345,9 +345,16 @@ inline bool cloudBackendDeferred() { return millis() < heartbeatNotBeforeMs; }
 void wifiPrepareForHttps();
 bool ensureWifiForHttps();
 void wifiRecoverAfterHttps();
-// Single shared TLS client (gHbHttp) — use for SMS, ping, maintenance to avoid -1 after ping.
+// Single shared TLS client (gHbHttp) — use for SMS, ping, maintenance, and OTA to avoid -1 / low heap.
 int agentHttpsPostJson(const char* url, const char* jsonBody, int timeoutMs, bool addAuth,
     char* respOut, size_t respOutSize, const char* opLabel = nullptr);
+void agentHttpsReleaseClient();
+bool agentHttpsBeginGet(const char* url, int connectTimeoutMs, int readTimeoutMs);
+int agentHttpsHead();
+int agentHttpsGet();
+int agentHttpsGetContentLength();
+Stream* agentHttpsGetStream();
+void agentHttpsEndSession();
 unsigned long getLastSmsPollActivityMs();
 extern unsigned long lastHttpsEndMs;
 void markHttpsSessionEnded();
