@@ -1030,6 +1030,12 @@ void loop() {
 
     // During OTA only service HTTP; skip SIM/heartbeat/maintenance so WiFi/CPU focus on download.
     if (otaInProgress) {
+        static unsigned long lastOtaPauseLogMs = 0;
+        const unsigned long nowMs = millis();
+        if (nowMs - lastOtaPauseLogMs >= 30000UL) {
+            lastOtaPauseLogMs = nowMs;
+            logMsg("[OTA] SMS/heartbeat paused for firmware download");
+        }
         yield();
         return;
     }

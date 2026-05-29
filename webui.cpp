@@ -4115,7 +4115,7 @@ void buildStatusJson(char* buf, size_t bufSize) {
         "\"firmware_check_interval_h\":12,"
         "\"firmware_auto_install\":false,"
         "\"ota_url\":\"%s\","
-#if OTA_ENABLED
+#if OTA_ENABLED && OTA_WEB_INSTALL_ENABLED
         "\"ota_install_enabled\":true,"
 #else
         "\"ota_install_enabled\":false,"
@@ -6151,6 +6151,13 @@ void handleFirmwareUpdate() {
         "compile, and upload via USB once. After that, Install update works from this page.\"}");
     return;
 #endif
+#if !OTA_WEB_INSTALL_ENABLED
+    logMsg("[OTA] Web install blocked (OTA_WEB_INSTALL_ENABLED=0)");
+    server.send(200, "application/json",
+        "{\"success\":false,\"message\":\"Wireless firmware install is disabled on this device. "
+        "Flash via USB in Arduino IDE, or set OTA_WEB_INSTALL_ENABLED=1 and rebuild.\"}");
+    return;
+#endif
     if (!WiFi.isConnected()) {
         server.send(400, "application/json", "{\"success\":false,\"message\":\"WiFi required for OTA\"}");
         return;
@@ -6160,6 +6167,9 @@ void handleFirmwareUpdate() {
     if (url && url[0]) {
         otaSaveUrlToPreferences(url);
     }
+
+    logMsg("[OTA] Web install requested");
+    appendMonitorLog("[OTA] Web install requested");
 
     server.send(200, "application/json",
         "{\"success\":true,\"message\":\"Downloading firmware. Device will restart when complete.\"}");

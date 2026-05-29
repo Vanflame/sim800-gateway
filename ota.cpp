@@ -3,6 +3,7 @@
 // ============================================================================
 
 #include "ota.h"
+#include "sms.h"
 #include "logger.h"
 #include "utils.h"
 #include <Arduino.h>
@@ -288,6 +289,31 @@ static uint8_t otaDlBuffer[4096];
 static const size_t OTA_DL_CHUNK = sizeof(otaDlBuffer);
 static const unsigned long OTA_DL_STALL_MS = 90000;
 
+static void otaBetweenTlsSessions() {
+    WiFi.setSleep(WIFI_PS_NONE);
+    delay(2500);
+    for (int i = 0; i < 25; i++) {
+        yield();
+        delay(40);
+    }
+    if (WiFi.isConnected()) {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "[OTA] WiFi RSSI=%d", WiFi.RSSI());
+        logMsg(buf);
+    } else {
+        logMsg("[OTA] WiFi disconnected before download");
+    }
+}
+
+static void otaLogGetFailure(HTTPClient& http, int code) {
+    logMsgInt("[OTA] HTTP GET failed", code);
+    const String err = http.errorToString(code);
+    if (err.length() > 0) {
+        logMsgVal("[OTA] GET detail", err.c_str());
+        appendMonitorLogVal("[OTA] GET detail", err.c_str());
+    }
+}
+
 static void otaLogDlProgress(size_t written, int contentLen, unsigned long dlStartMs) {
     const unsigned long elapsedSec = (millis() - dlStartMs) / 1000UL;
     const unsigned kbps =
@@ -321,7 +347,17 @@ static bool otaStreamDownloadAndFlash(const char* url, char* errorOut, size_t er
     HTTPClient http;
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(120000);
+    client.setTimeout(90000);
+
+    if (!WiFi.isConnected()) {
+        WiFi.setSleep(prevWifiPs);
+        if (errorOut && errorOutSize > 0) {
+            snprintf(errorOut, errorOutSize, "WiFi not connected");
+        }
+        return false;
+    }
+
+    otaBetweenTlsSessions();
 
     if (!http.begin(client, url)) {
         WiFi.setSleep(prevWifiPs);
@@ -331,36 +367,43 @@ static bool otaStreamDownloadAndFlash(const char* url, char* errorOut, size_t er
         return false;
     }
 
-    http.setTimeout(300000);
-    http.setConnectTimeout(45000);
+    http.setTimeout(600000);
+    http.setConnectTimeout(60000);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     http.setReuse(false);
     http.addHeader("Connection", "close");
+    http.setUserAgent("sim800-gateway-ota/1.0");
 
     logMsg("[OTA] HTTP GET (streaming)...");
     int code = -1;
-    for (int attempt = 0; attempt < 3 && code != HTTP_CODE_OK; attempt++) {
+    for (int attempt = 0; attempt < 4 && code != HTTP_CODE_OK; attempt++) {
         if (attempt > 0) {
             logMsgInt("[OTA] GET retry", attempt + 1);
             http.end();
             client.stop();
-            delay(2000);
+            otaBetweenTlsSessions();
             if (!http.begin(client, url)) {
                 break;
             }
-            http.setTimeout(300000);
-            http.setConnectTimeout(45000);
+            http.setTimeout(600000);
+            http.setConnectTimeout(60000);
             http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
             http.setReuse(false);
             http.addHeader("Connection", "close");
+            http.setUserAgent("sim800-gateway-ota/1.0");
         }
-        code = http.sendRequest("GET");
+        logMsg("[OTA] Connecting to firmware URL...");
+        code = http.GET();
+        if (code != HTTP_CODE_OK) {
+            otaLogGetFailure(http, code);
+        }
     }
     if (code != HTTP_CODE_OK) {
         if (errorOut && errorOutSize > 0) {
             snprintf(errorOut, errorOutSize, "HTTP GET failed (%d)", code);
         }
         http.end();
+        client.stop();
         WiFi.setSleep(prevWifiPs);
         return false;
     }
@@ -371,6 +414,36 @@ static bool otaStreamDownloadAndFlash(const char* url, char* errorOut, size_t er
             snprintf(errorOut, errorOutSize, "Missing Content-Length");
         }
         http.end();
+        client.stop();
+        WiFi.setSleep(prevWifiPs);
+        return false;
+    }
+
+    {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "[OTA] Download size=%d bytes", contentLen);
+        logMsg(buf);
+        appendMonitorLog(buf);
+    }
+
+    if ((size_t)contentLen < OTA_MIN_APP_BYTES) {
+        if (errorOut && errorOutSize > 0) {
+            snprintf(
+                errorOut,
+                errorOutSize,
+                "File too small (%d bytes). Wrong .bin?",
+                contentLen
+            );
+        }
+        http.end();
+        client.stop();
+        WiFi.setSleep(prevWifiPs);
+        return false;
+    }
+
+    if (!otaFirmwareFitsUpdateSlot(contentLen, errorOut, errorOutSize)) {
+        http.end();
+        client.stop();
         WiFi.setSleep(prevWifiPs);
         return false;
     }
@@ -768,6 +841,7 @@ bool otaPerformUpdate(const char* url, char* errorOut, size_t errorOutSize) {
         return false;
     }
 
+#if OTA_PREFLIGHT_HEAD
     static char validateErr[160];
     if (!validateOtaFirmwareUrl(updateUrl, validateErr, sizeof(validateErr))) {
         otaInProgress = false;
@@ -781,6 +855,10 @@ bool otaPerformUpdate(const char* url, char* errorOut, size_t errorOutSize) {
         }
         return false;
     }
+    otaBetweenTlsSessions();
+#else
+    logMsg("[OTA] Single HTTPS GET (no HEAD preflight)");
+#endif
 
     logMsg2Val("[OTA] Starting update from", updateUrl, "", "");
     appendMonitorLog("[OTA] Download started");
@@ -804,12 +882,14 @@ bool otaPerformUpdate(const char* url, char* errorOut, size_t errorOutSize) {
     httpsBusy = false;
     smsPollingPaused = false;
     heartbeatPaused = false;
+    resumeSmsPolling();
 
     if (ok) {
         return true;
     }
 
     logMsgVal("[OTA] Failed", otaErr[0] ? otaErr : "unknown");
+    logMsg("[OTA] SMS polling resumed");
     appendMonitorLogVal("[OTA] Failed", otaErr[0] ? otaErr : "unknown");
     if (errorOut && errorOutSize > 0) {
         snprintf(errorOut, errorOutSize, "%s", otaErr[0] ? otaErr : "OTA failed");
