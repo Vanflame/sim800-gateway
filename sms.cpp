@@ -717,8 +717,37 @@ int parseSMSList(const char* response, SmsMessage* messages, int maxMessages) {
 // SMS Processing
 // -----------------------------------------------------------------------------
 
+static bool isHexUcs2LikeMessage(const char* s) {
+    if (!s) return false;
+    int hexCount = 0;
+    int total = 0;
+    for (const char* p = s; *p; p++) {
+        const char c = *p;
+        if (c == ' ' || c == '\r' || c == '\n' || c == '\t') continue;
+        total++;
+        const bool isHex = ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'));
+        if (isHex) hexCount++;
+    }
+    return total >= 24 && (hexCount * 100 / total) >= 95 && (total % 4 == 0);
+}
+
 void processIncomingSMS(int simSlot, const SmsMessage* msg) {
     if (!msg) return;
+
+    if (isHexUcs2LikeMessage(msg->message)) {
+        appendErrorLogInt("[SMS] Blocked UCS2-hex-like message SIM", simSlot + 1);
+        appendMonitorLog("[SMS] Blocked suspicious hex/UCS2 message");
+        selectSIM(simSlot);
+        if (msg->messageIndex > 0) {
+            if (deleteSMS(msg->messageIndex)) {
+                logMsgInt("[SMS] Deleted blocked message from SIM, idx", msg->messageIndex);
+                appendMonitorLogInt("[SMS] Deleted blocked idx", msg->messageIndex);
+            } else {
+                appendErrorLogInt("[SMS] Failed to delete blocked idx", msg->messageIndex);
+            }
+        }
+        return;
+    }
     
     // Extract sender first (needed for both paths)
     char rawSender[PHONE_BUFFER_SIZE];
@@ -873,23 +902,18 @@ void processIncomingSMS(int simSlot, const SmsMessage* msg) {
 // Forward SMS to backend (extracted for reuse by multipart)
 // Never run HTTPS here — poll path must stay fast; forward runs from main loop queue.
 static void forwardSms(int simSlot, const char* senderDisplay, const SmsMessage* msg) {
-    auto isHexUcs2LikeMessage = [](const char* s) -> bool {
-        if (!s) return false;
-        int hexCount = 0;
-        int total = 0;
-        for (const char* p = s; *p; p++) {
-            const char c = *p;
-            if (c == ' ' || c == '\r' || c == '\n' || c == '\t') continue;
-            total++;
-            const bool isHex = ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'));
-            if (isHex) hexCount++;
-        }
-        return total >= 24 && (hexCount * 100 / total) >= 95 && (total % 4 == 0);
-    };
-
     if (isHexUcs2LikeMessage(msg ? msg->message : nullptr)) {
         appendErrorLogInt("[SMS] Blocked UCS2-hex-like message SIM", simSlot + 1);
         appendMonitorLog("[SMS] Blocked suspicious hex/UCS2 message");
+        selectSIM(simSlot);
+        if (msg && msg->messageIndex > 0) {
+            if (deleteSMS(msg->messageIndex)) {
+                logMsgInt("[SMS] Deleted blocked message from SIM, idx", msg->messageIndex);
+                appendMonitorLogInt("[SMS] Deleted blocked idx", msg->messageIndex);
+            } else {
+                appendErrorLogInt("[SMS] Failed to delete blocked idx", msg->messageIndex);
+            }
+        }
         return;
     }
 
