@@ -43,7 +43,12 @@ extern "C" {
 
 #define LFS_MOUNT_PATH     "/littlefs"
 #define LFS_MESSAGES_PATH  LFS_MOUNT_PATH "/messages.log"
+#define LFS_MESSAGES_TEMP  LFS_MOUNT_PATH "/messages.tmp"
 #define LFS_ERRORS_PATH    LFS_MOUNT_PATH "/errors.log"
+/** Max lines in messages.log before oldest are dropped (web UI shows latest 50). */
+#define LFS_MAX_STORED_MESSAGES  30
+/** How many oldest lines to remove when at cap or LittleFS is full. */
+#define LFS_MESSAGE_PRUNE_COUNT  3
 
 // Bump when LittleFS init logic changes (forces one raw erase on next boot).
 static const uint32_t LFS_STORE_MAGIC = 4;
@@ -552,12 +557,122 @@ void savePersistentStats() {
     preferences.end();
 }
 
-// Append SMS to persistent file
+// Count complete lines in messages.log (for auto-prune).
+static int countStoredMessageLines() {
+    if (!g_littlefsReady || !lfsFileExists(LFS_MESSAGES_PATH)) {
+        return 0;
+    }
+    FILE* f = fopen(LFS_MESSAGES_PATH, "r");
+    if (!f) {
+        return 0;
+    }
+    int lines = 0;
+    int ch = 0;
+    long lastPos = -1;
+    while ((ch = fgetc(f)) != EOF) {
+        if (ch == '\n') {
+            lines++;
+        }
+        lastPos = ftell(f);
+    }
+    if (lastPos > 0) {
+        fseek(f, -1, SEEK_END);
+        ch = fgetc(f);
+        if (ch != '\n' && ch != EOF) {
+            lines++;
+        }
+    }
+    fclose(f);
+    return lines;
+}
+
+// Drop the oldest N lines from messages.log (frees LittleFS for new entries).
+static bool pruneOldestStoredMessages(int linesToRemove) {
+    if (!g_littlefsReady || linesToRemove <= 0) {
+        return false;
+    }
+    if (!lfsFileExists(LFS_MESSAGES_PATH)) {
+        return true;
+    }
+
+    const int total = countStoredMessageLines();
+    if (total <= 0) {
+        return true;
+    }
+    if (linesToRemove >= total) {
+        remove(LFS_MESSAGES_PATH);
+        logMsgInt("[STORE] Pruned all stored messages (had", total);
+        appendMonitorLogInt("[STORE] Cleared message log lines", total);
+        return true;
+    }
+
+    FILE* in = fopen(LFS_MESSAGES_PATH, "r");
+    if (!in) {
+        return false;
+    }
+
+    int skipped = 0;
+    while (skipped < linesToRemove) {
+        int ch = 0;
+        bool endedLine = false;
+        while ((ch = fgetc(in)) != EOF) {
+            if (ch == '\n') {
+                endedLine = true;
+                break;
+            }
+        }
+        if (!endedLine && feof(in)) {
+            break;
+        }
+        skipped++;
+    }
+
+    FILE* out = fopen(LFS_MESSAGES_TEMP, "w");
+    if (!out) {
+        fclose(in);
+        return false;
+    }
+
+    int ch = 0;
+    while ((ch = fgetc(in)) != EOF) {
+        if (fputc(ch, out) == EOF) {
+            fclose(in);
+            fclose(out);
+            remove(LFS_MESSAGES_TEMP);
+            return false;
+        }
+    }
+    fclose(in);
+    fclose(out);
+
+    remove(LFS_MESSAGES_PATH);
+    if (rename(LFS_MESSAGES_TEMP, LFS_MESSAGES_PATH) != 0) {
+        logMsg("[STORE] Failed to rename pruned messages.log");
+        return false;
+    }
+
+    logMsgInt("[STORE] Pruned oldest stored messages, count", skipped);
+    appendMonitorLogInt("[STORE] Pruned oldest messages", skipped);
+    return true;
+}
+
+static bool writeSmsLineToFile(const char* time, int simSlot, const char* number, const char* sender,
+                               const char* clipped) {
+    FILE* file = fopen(LFS_MESSAGES_PATH, "a");
+    if (!file) {
+        return false;
+    }
+    const int wrote = fprintf(file, "%s|%d|%s|%s|%s\n", time, simSlot, number, sender, clipped);
+    const bool ok = (wrote > 0);
+    fclose(file);
+    return ok;
+}
+
+// Append SMS to persistent file (auto-prunes oldest lines when log is full).
 void appendSmsToFile(const char* time, int simSlot, const char* number, const char* sender, const char* message) {
     if (!g_littlefsReady) {
         return;
     }
-    // Cap stored message length to keep history size predictable
     char clipped[201];
     if (message && message[0]) {
         strncpy(clipped, message, 200);
@@ -566,13 +681,23 @@ void appendSmsToFile(const char* time, int simSlot, const char* number, const ch
         clipped[0] = '\0';
     }
 
-    FILE* file = fopen(LFS_MESSAGES_PATH, "a");
-    if (!file) {
-        logMsg("[STORE] Failed to open messages.log");
-        return;
+    int stored = countStoredMessageLines();
+    if (stored >= LFS_MAX_STORED_MESSAGES) {
+        pruneOldestStoredMessages(LFS_MESSAGE_PRUNE_COUNT);
+        stored = countStoredMessageLines();
     }
-    fprintf(file, "%s|%d|%s|%s|%s\n", time, simSlot, number, sender, clipped);
-    fclose(file);
+
+    if (!writeSmsLineToFile(time, simSlot, number, sender, clipped)) {
+        pruneOldestStoredMessages(LFS_MESSAGE_PRUNE_COUNT);
+        if (!writeSmsLineToFile(time, simSlot, number, sender, clipped)) {
+            pruneOldestStoredMessages(LFS_MESSAGE_PRUNE_COUNT * 2);
+            if (!writeSmsLineToFile(time, simSlot, number, sender, clipped)) {
+                logMsg("[STORE] Failed to save message after prune");
+                appendMonitorLog("[STORE] messages.log full — prune failed");
+                return;
+            }
+        }
+    }
 }
 
 // Read SMS messages from file (returns count, fills buffer)

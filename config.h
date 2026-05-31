@@ -47,7 +47,7 @@
 // -----------------------------------------------------------------------------
 // Firmware version (shown in web UI; bump when releasing OTA builds)
 // -----------------------------------------------------------------------------
-#define FIRMWARE_VERSION    "1.0.15"
+#define FIRMWARE_VERSION    "1.0.16"
 
 // -----------------------------------------------------------------------------
 // Over-the-air updates (ESP32 HTTPS OTA from GitHub Releases or custom URL)
