@@ -352,6 +352,13 @@ unsigned long lastHeartbeatMs = 0;
 unsigned long heartbeatNotBeforeMs = 0;
 unsigned long lastHttpsEndMs = 0;
 static bool agentInventoryHeartbeatDone = false;
+static unsigned long lastFullInventorySyncMs = 0;
+
+static bool fullInventorySyncDue(unsigned long now) {
+    if (!agentInventoryHeartbeatDone) return true;
+    if (lastFullInventorySyncMs == 0) return true;
+    return (now - lastFullInventorySyncMs) >= (unsigned long)HEARTBEAT_FULL_SYNC_INTERVAL_MS;
+}
 
 void markHttpsSessionEnded() {
     lastHttpsEndMs = millis();
@@ -940,7 +947,7 @@ static bool scheduleBackgroundNet(unsigned long now) {
     }
 
     const int pendingSms = getPendingSmsCount();
-    const bool needFullSync = !agentInventoryHeartbeatDone;
+    const bool needFullSync = fullInventorySyncDue(now);
     if (needFullSync && pendingSms > 0) {
         logHeartbeatWaitThrottled("pending SMS (full sync)");
         return false;
@@ -1684,6 +1691,7 @@ int agentHttpsPostJson(const char* url, const char* jsonBody, int timeoutMs, boo
 
 void resetAgentInventoryHeartbeat() {
     agentInventoryHeartbeatDone = false;
+    lastFullInventorySyncMs = 0;
 }
 
 static void fetchHeartbeatFollowup() {
@@ -1896,7 +1904,7 @@ void performHeartbeat() {
     if (isSimBusy() || millis() < modemGatewayStableUntilMs) {
         return;
     }
-    if (!agentInventoryHeartbeatDone && getPendingSmsCount() > 0) {
+    if (fullInventorySyncDue(millis()) && getPendingSmsCount() > 0) {
         logHeartbeatWaitThrottled("pending SMS (full sync)");
         return;
     }
@@ -1918,7 +1926,7 @@ void performHeartbeat() {
         return;
     }
 
-    if (agentInventoryHeartbeatDone) {
+    if (agentInventoryHeartbeatDone && !fullInventorySyncDue(millis())) {
         performHeartbeatPing();
         return;
     }
@@ -1929,8 +1937,13 @@ void performHeartbeat() {
     httpsBusy = true;
     pauseSmsPolling(HEARTBEAT_FULL_PAUSE_MS);
     wifiPrepareForHttps();
-    logMsg("[HEARTBEAT] Full sync starting");
-    appendMonitorLog("[HEARTBEAT] Full sync starting");
+    if (agentInventoryHeartbeatDone) {
+        logMsg("[HEARTBEAT] Periodic full sync starting (30m inventory)");
+        appendMonitorLog("[HEARTBEAT] Periodic full sync (30m)");
+    } else {
+        logMsg("[HEARTBEAT] Full sync starting");
+        appendMonitorLog("[HEARTBEAT] Full sync starting");
+    }
     
     // Ensure NTP for TLS
     if (!ntpConfigured) {
@@ -2126,6 +2139,7 @@ void performHeartbeat() {
         logMsg("[HEARTBEAT] Full sync OK");
         appendMonitorLog("[HEARTBEAT] Full sync OK");
         agentInventoryHeartbeatDone = true;
+        lastFullInventorySyncMs = millis();
     } else {
         logMsgInt("[HEARTBEAT] Failed, code", code);
         appendMonitorLogInt("[HEARTBEAT] Failed", code);

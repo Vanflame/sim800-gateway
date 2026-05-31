@@ -139,7 +139,8 @@
 #define SMS_CMGL_TIMEOUT_MS         2500    // List SMS; empty SIMs return OK in <1s
 #define SMS_POLL_TIMEOUT_MS         15000   // Safety timeout
 #define SMS_RETRY_INTERVAL_MS       30000   // 30s between retry batches
-#define HEARTBEAT_INTERVAL_MS       60000   // 60s heartbeat (ping after first full sync)
+#define HEARTBEAT_INTERVAL_MS       60000   // 60s between heartbeat attempts (ping or full sync)
+#define HEARTBEAT_FULL_SYNC_INTERVAL_MS (30UL * 60UL * 1000UL)  // Full inventory sync every 30 min
 #define HEARTBEAT_PING_PAUSE_MS     8000UL   // SMS poll pause during lightweight ping
 #define HEARTBEAT_FULL_PAUSE_MS     5000UL   // brief SMS poll pause during full inventory sync
 #define HEARTBEAT_PING_TIMEOUT_MS   12000   // HTTP timeout for /api/agent/ping
@@ -404,7 +405,7 @@ inline bool agentIsSignedIn() {
     return agentBearerToken[0] != '\0' && agentRefreshToken[0] != '\0';
 }
 
-// Perform heartbeat to backend (full inventory once after init, then ping)
+// Perform heartbeat to backend (full inventory on boot + every HEARTBEAT_FULL_SYNC_INTERVAL_MS, ping between)
 void performHeartbeat();
 void resetAgentInventoryHeartbeat();
 
