@@ -132,12 +132,24 @@ static bool smsSlotEligibleForPoll(int slot) {
 static void pollOneSimSlot(int slot) {
     selectSIM(slot);
 
-    sendATCapture("AT", 300);
-    if (!strstr(getSimBuffer(), "OK")) {
+    bool atOk = false;
+    for (int retry = 0; retry < MUX_VERIFY_RETRIES; retry++) {
+        sendATCapture("AT", 400);
+        if (strstr(getSimBuffer(), "OK")) {
+            atOk = true;
+            break;
+        }
+        cooperativeDelayMs(80);
+    }
+    if (!atOk) {
         logMsgInt("[SMS] SIM not responding during poll:", slot + 1);
-        simMarkSlotOffline(slot, "no AT during poll");
+        simStates[slot].consecutiveErrors++;
+        if (simStates[slot].consecutiveErrors >= SIM_POLL_DISABLE_THRESHOLD) {
+            simMarkSlotOffline(slot, "no AT during poll");
+        }
         return;
     }
+    simStates[slot].consecutiveErrors = 0;
 
     if (!simStates[slot].basicInitDone) {
         sendATCapture("AT", 500);
@@ -410,12 +422,14 @@ static bool extractBrandFromMessage(const char* msg, char* out, size_t outSize) 
         }
     }
 
-    // Pattern 2: "<brand> sign-in code" or "<brand> verification code"
-    const char* patterns[] = {
+    // Pattern 2: "<brand> sign-in code" or "<brand> verification code" (case-insensitive scan)
+    static const char* patterns[] = {
         " sign-in code",
         " verification code",
+        " Verification Code",
         " verification",
         " code is",
+        " Code is",
         " OTP code",
     };
     for (int i = 0; i < 5; i++) {
@@ -442,6 +456,54 @@ static bool extractBrandFromMessage(const char* msg, char* out, size_t outSize) 
     }
 
     return false;
+}
+
+// Resolve display/API sender: modem field, alpha, [Brand] prefix, or message patterns.
+static void resolveSenderDisplay(const SmsMessage* msg, char* senderDisplay, size_t senderDisplaySize) {
+    if (!msg || !senderDisplay || senderDisplaySize < 2) return;
+
+    char rawSender[PHONE_BUFFER_SIZE];
+    charBufSet(rawSender, sizeof(rawSender), msg->sender);
+
+    for (size_t i = 0; rawSender[i] != '\0'; i++) {
+        if (rawSender[i] == ',' || rawSender[i] == '\r' || rawSender[i] == '\n') {
+            rawSender[i] = '\0';
+            break;
+        }
+        if (rawSender[i] == '+' && i > 0) {
+            rawSender[i] = '\0';
+            break;
+        }
+    }
+    charBufTrim(rawSender);
+
+    charBufSet(senderDisplay, senderDisplaySize, rawSender);
+    char brand[PHONE_BUFFER_SIZE];
+    brand[0] = '\0';
+
+    if (isShortCode(rawSender)) {
+        if (extractBracketPrefix(msg->message, brand, sizeof(brand))) {
+            charBufSet(senderDisplay, senderDisplaySize, brand);
+        } else if (extractBrandFromMessage(msg->message, brand, sizeof(brand))) {
+            charBufSet(senderDisplay, senderDisplaySize, brand);
+        }
+    } else if (isPhoneNumber(rawSender)) {
+        if (extractBracketPrefix(msg->message, brand, sizeof(brand))) {
+            charBufSet(senderDisplay, senderDisplaySize, brand);
+        }
+    }
+
+    if (charBufIsEmpty(senderDisplay)) {
+        if (extractBracketPrefix(msg->message, brand, sizeof(brand))) {
+            charBufSet(senderDisplay, senderDisplaySize, brand);
+        } else if (extractBrandFromMessage(msg->message, brand, sizeof(brand))) {
+            charBufSet(senderDisplay, senderDisplaySize, brand);
+        } else if (!charBufIsEmpty(rawSender)) {
+            charBufSet(senderDisplay, senderDisplaySize, rawSender);
+        } else {
+            charBufSet(senderDisplay, senderDisplaySize, "Unknown");
+        }
+    }
 }
 
 void initSMSQueue() {
@@ -666,11 +728,9 @@ int parseSMSList(const char* response, SmsMessage* messages, int maxMessages) {
         (void)extractNthQuotedField(cmgl, 2, alpha, sizeof(alpha));
         (void)extractNthQuotedField(cmgl, 3, msg->timestamp, sizeof(msg->timestamp));
         
-        // If we have an alpha field (branded sender name), use it if sender is numeric/empty
+        // Alpha field: alphanumeric sender id from network (often brand when OA is empty)
         if (alpha[0] != '\0' && !charBufIsEmpty(alpha)) {
-            // Alpha field contains the alphanumeric sender (brand name)
-            // Use it if sender is numeric or empty
-            if (charBufIsEmpty(msg->sender) || isPhoneNumber(msg->sender)) {
+            if (charBufIsEmpty(msg->sender) || isPhoneNumber(msg->sender) || isShortCode(msg->sender)) {
                 charBufSet(msg->sender, sizeof(msg->sender), alpha);
             }
         }
@@ -749,40 +809,11 @@ void processIncomingSMS(int simSlot, const SmsMessage* msg) {
         return;
     }
     
-    // Extract sender first (needed for both paths)
-    char rawSender[PHONE_BUFFER_SIZE];
-    charBufSet(rawSender, sizeof(rawSender), msg->sender);
-    
-    // Defensive cleanup
-    for (size_t i = 0; rawSender[i] != '\0'; i++) {
-        if (rawSender[i] == ',' || rawSender[i] == '\r' || rawSender[i] == '\n') {
-            rawSender[i] = '\0';
-            break;
-        }
-        if (rawSender[i] == '+' && i > 0) {
-            rawSender[i] = '\0';
-            break;
-        }
-    }
-    charBufTrim(rawSender);
-
     char senderDisplay[PHONE_BUFFER_SIZE];
-    charBufSet(senderDisplay, sizeof(senderDisplay), rawSender);
-    char brand[PHONE_BUFFER_SIZE];
-
-    // Try to extract brand name
-    if (isShortCode(rawSender)) {
-        if (extractBracketPrefix(msg->message, brand, sizeof(brand))) {
-            charBufSet(senderDisplay, sizeof(senderDisplay), brand);
-        }
-        else if (extractBrandFromMessage(msg->message, brand, sizeof(brand))) {
-            charBufSet(senderDisplay, sizeof(senderDisplay), brand);
-        }
-    } else if (isPhoneNumber(rawSender)) {
-        if (extractBracketPrefix(msg->message, brand, sizeof(brand))) {
-            charBufSet(senderDisplay, sizeof(senderDisplay), brand);
-        }
-    }
+    char rawSender[PHONE_BUFFER_SIZE];
+    resolveSenderDisplay(msg, senderDisplay, sizeof(senderDisplay));
+    charBufSet(rawSender, sizeof(rawSender), msg->sender);
+    charBufTrim(rawSender);
 
     // Check if this looks like a continuation of a previous message
     if (looksLikeContinuation(msg->message)) {
@@ -1033,8 +1064,17 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
         return false;
     }
 
-    // Use normalized sender if provided, otherwise use original
     const char* senderToUse = normalizedSender && normalizedSender[0] != '\0' ? normalizedSender : msg->sender;
+    static char senderFallback[PHONE_BUFFER_SIZE];
+    if (!senderToUse || !senderToUse[0]) {
+        senderFallback[0] = '\0';
+        if (extractBracketPrefix(msg->message, senderFallback, sizeof(senderFallback)) ||
+            extractBrandFromMessage(msg->message, senderFallback, sizeof(senderFallback))) {
+            senderToUse = senderFallback;
+        } else {
+            senderToUse = "Unknown";
+        }
+    }
 
     // Build payload (static to avoid stack overflow)
     static char payload[768];

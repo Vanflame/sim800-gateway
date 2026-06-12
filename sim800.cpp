@@ -780,6 +780,40 @@ void simMarkSlotOffline(int slot, const char* reason) {
     appendMonitorLog(line);
 }
 
+bool simTryRecoverSlot(int slot) {
+    extern SimState simStates[];
+    if (slot < 0 || slot >= SIM_COUNT) return false;
+    if (simStates[slot].userDisabled) return false;
+
+    const bool prevYield = gYieldToWebServer;
+    gYieldToWebServer = false;
+    setSimBusy(true);
+
+    selectSIM(slot);
+    delay(150);
+
+    bool ok = false;
+    for (int retry = 0; retry < MUX_VERIFY_RETRIES; retry++) {
+        sendATCapture("AT", 500);
+        if (strstr(getSimBuffer(), "OK") != NULL) {
+            ok = true;
+            break;
+        }
+        delay(100);
+    }
+
+    gYieldToWebServer = prevYield;
+    setSimBusy(false);
+
+    if (!ok) return false;
+
+    simStates[slot].responsive = true;
+    simStates[slot].enabled = true;
+    simStates[slot].consecutiveErrors = 0;
+    simStates[slot].basicInitDone = false;
+    return true;
+}
+
 // Check all SIMs on startup - marks responsive SIMs and initializes them
 static void simInitDelayMs(unsigned long ms) {
     const unsigned long until = millis() + ms;

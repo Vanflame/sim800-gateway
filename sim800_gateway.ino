@@ -1477,57 +1477,8 @@ void setSimUserDisabled(int simIdx, bool disabled) {
 }
 
 static void applyBackendSimStatusFromJson(const char* s) {
-    if (!s || !s[0]) return;
-    const char* simsKey = strstr(s, "\"sims\"");
-    if (!simsKey) return;
-    const char* p = strchr(simsKey, '[');
-    if (!p) return;
-    p++;
-
-    while (*p && *p != ']') {
-        const char* objStart = strchr(p, '{');
-        if (!objStart) break;
-        const char* objEnd = strchr(objStart, '}');
-        if (!objEnd) break;
-
-        int slot = 0;
-        const char* slotKey = strstr(objStart, "\"slot\"");
-        if (slotKey && slotKey < objEnd) {
-            const char* colon = strchr(slotKey, ':');
-            if (colon && colon < objEnd) {
-                slot = atoi(colon + 1);
-            }
-        }
-
-        char status[16];
-        status[0] = '\0';
-        const char* stKey = strstr(objStart, "\"status\":\"");
-        if (stKey && stKey < objEnd) {
-            const char* v = stKey + strlen("\"status\":\"");
-            const char* endQuote = strchr(v, '"');
-            if (endQuote && endQuote < objEnd) {
-                const int len = (int)(endQuote - v);
-                if (len > 0 && len < (int)sizeof(status)) {
-                    strncpy(status, v, (size_t)len);
-                    status[len] = '\0';
-                }
-            }
-        }
-
-        if (slot >= 0 && slot < SIM_COUNT && status[0] != '\0' &&
-            !simStates[slot].userDisabled) {
-            const bool shouldEnable =
-                (strcmp(status, "ACTIVE") == 0 || strcmp(status, "IN_USE") == 0);
-            simStates[slot].enabled = shouldEnable;
-            if (!shouldEnable) {
-                char slotBuf[8];
-                snprintf(slotBuf, sizeof(slotBuf), "%d", slot);
-                appendMonitorLogVal("[HEARTBEAT] Backend disabled SIM", slotBuf);
-            }
-        }
-
-        p = objEnd + 1;
-    }
+    (void)s;
+    // Heartbeat may include per-sim backend status; local enable/poll is not driven from that.
 }
 
 static void parseActiveSessionsFromJson(const char* s) {
@@ -2339,19 +2290,34 @@ void checkAndRecoverUnresponsiveSims() {
     if (isSimBusy()) return;
     if (httpsBusy || isSmsPollingPaused()) return;
 
-    for (int i = 0; i < SIM_COUNT; i++) {
+    static unsigned long lastRecoveryProbeMs[SIM_COUNT];
+    static int recoveryRoundRobin = 0;
+    const unsigned long now = millis();
+
+    for (int n = 0; n < SIM_COUNT; n++) {
+        const int i = (recoveryRoundRobin + n) % SIM_COUNT;
         if (simStates[i].userDisabled) continue;
-        if (!simStates[i].enabled) continue;
 
-        if (!simStates[i].responsive) {
-            simMarkSlotOffline(i, "not responsive");
+        if (simStates[i].enabled && simStates[i].responsive) {
+            if (simStates[i].consecutiveErrors >= SIM_POLL_DISABLE_THRESHOLD) {
+                simMarkSlotOffline(i, "poll errors");
+            }
             continue;
         }
 
-        if (simStates[i].consecutiveErrors >= SIM_POLL_DISABLE_THRESHOLD) {
-            simMarkSlotOffline(i, "poll errors");
+        if (now - lastRecoveryProbeMs[i] < SIM_RECOVERY_PROBE_INTERVAL_MS) {
             continue;
         }
+        lastRecoveryProbeMs[i] = now;
+        recoveryRoundRobin = (i + 1) % SIM_COUNT;
+
+        if (simTryRecoverSlot(i)) {
+            char line[48];
+            snprintf(line, sizeof(line), "[SIM] Slot %d recovered", i + 1);
+            logMsg(line);
+            appendMonitorLog(line);
+        }
+        return;
     }
 }
 

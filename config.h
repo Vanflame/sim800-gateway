@@ -47,7 +47,7 @@
 // -----------------------------------------------------------------------------
 // Firmware version (shown in web UI; bump when releasing OTA builds)
 // -----------------------------------------------------------------------------
-#define FIRMWARE_VERSION    "1.0.16"
+#define FIRMWARE_VERSION    "1.0.18"
 
 // -----------------------------------------------------------------------------
 // Over-the-air updates (ESP32 HTTPS OTA from GitHub Releases or custom URL)
@@ -238,6 +238,7 @@ extern int missedCallWatchSlot;
 #define SIM_ERROR_THRESHOLD    3   // Reset SIM after this many errors
 #define SIM_CONSECUTIVE_ERROR_THRESHOLD 5  // Legacy threshold (watchdog)
 #define SIM_POLL_DISABLE_THRESHOLD    3    // CMGL/poll failures → slot auto-OFF
+#define SIM_RECOVERY_PROBE_INTERVAL_MS 45000UL  // Re-probe offline slots (no full reboot)
 #define MODEM_GATEWAY_STABLE_MS       45000UL  // No heartbeat until modem/SIM settled
 // Watchdog timeout: must be long enough to survive a full heartbeat+maintenance cycle
 // (~25s heartbeat + ~30s maintenance + 12 SIMs × 3s cooldown ≈ 95s max idle time per slot)

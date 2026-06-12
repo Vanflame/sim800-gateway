@@ -49,6 +49,9 @@ void checkAllSIMsOnStartup();
 // Turn slot OFF in UI + exclude from poll/heartbeat (not userDisabled)
 void simMarkSlotOffline(int slot, const char* reason);
 
+// Re-probe mux channel after transient failure (AT only; SMS re-inits on next poll)
+bool simTryRecoverSlot(int slot);
+
 // Manual start: skip boot SIM probe; user presses Run in web UI
 bool isModemGatewayRunning();
 bool isModemGatewayStartQueued();
