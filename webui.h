@@ -138,6 +138,9 @@ void handleLogin();
 // GET /logout - Logout
 void handleLogout();
 
+// POST /set-tokens - Manually set JWT and refresh tokens
+void handleSetTokens();
+
 // POST /refresh-token - Refresh access token
 void handleRefreshToken();
 
@@ -158,6 +161,16 @@ void handleTogglePolling();
 
 // POST /toggle-heartbeat - Toggle heartbeat pause
 void handleToggleHeartbeat();
+
+// GET/POST /sender-map - Configurable SMS sender code → brand mapping
+void handleSenderMapGet();
+void handleSenderMapPost();
+void handleMuxMapGet();
+void handleMuxMapPost();
+
+// GET/POST /excluded-apps - Auto-exclude app names for SIM registration
+void handleExcludedAppsGet();
+void handleExcludedAppsPost();
 
 // GET /firmware-check - Compare FIRMWARE_VERSION to remote version.txt
 void handleFirmwareCheck();

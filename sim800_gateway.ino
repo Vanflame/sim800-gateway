@@ -41,6 +41,39 @@ extern "C" {
 #define ESP_PARTITION_SUBTYPE_DATA_LITTLEFS ((esp_partition_subtype_t)0x83)
 #endif
 
+// Vercel certificate for seller.otpocket.app
+const char vercel_cert[] PROGMEM = R"PEM(
+-----BEGIN CERTIFICATE-----
+MIIFADCCA+igAwIBAgISBdaYviVhWG/jYnQU/JoWK41zMA0GCSqGSIb3DQEBCwUA
+MDMxCzAJBgNVBAYTAlVTMRYwFAYDVQQKEw1MZXQncyBFbmNyeXB0MQwwCgYDVQQD
+EwNZUjEwHhcNMjYwNzIyMDYxNzQ4WhcNMjYxMDIwMDYxNzQ3WjAeMRwwGgYDVQQD
+ExNzZWxsZXIub3Rwb2NrZXQuYXBwMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIB
+CgKCAQEA/nPd1TZ6s9qYRqwjh64/O4MqJqzDEjDTomWeZTDvZl2MBbN4TF7KwKgO
+O8hq0uHtGa/qeV1HgoUb9sYrTjiD1Y8o2+FYe6qD+yM7OVyRh+JOEcwMgKglWd1M
+0C8M4/b0gVTpNuAlBJBKmfspPYl5QZwt2PspJDj2IM8AN7fjTZ9yR1tNEMc0Dd4W
+CZrOSyBFpsPY3qHuy4w+NtWUUJ49Cx5m0R9Tcl1nGSrMN9vpcWQFJr0qp0r60LiX
+sLws/5DGw0jHrK0ZrBZ6iilSh3ZnKR5gzSFX/GdxYLvccwMpcp2qbscO/03L//wL
+67WXlon3qIQftm4I/CZKzFvHIzhsBQIDAQABo4ICITCCAh0wDgYDVR0PAQH/BAQD
+AgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMAwGA1UdEwEB/wQCMAAwHQYDVR0OBBYE
+FDq6RLpcNceUUgOwaNDBymO6vSU6MB8GA1UdIwQYMBaAFB8vNb5GFILNQLGueSxV
+ePr31Gj7MDMGCCsGAQUFBwEBBCcwJTAjBggrBgEFBQcwAoYXaHR0cDovL3lyMS5p
+LmxlbmNyLm9yZy8wHgYDVR0RBBcwFYITc2VsbGVyLm90cG9ja2V0LmFwcDATBgNV
+HSAEDDAKMAgGBmeBDAECATAvBgNVHR8EKDAmMCSgIqAghh5odHRwOi8veXIxLmMu
+bGVuY3Iub3JnLzExNi5jcmwwggELBgorBgEEAdZ5AgQCBIH8BIH5APcAdQCUTkOH
++uzB74HzGSQmqBhlAcfTXzgCAT9yZ31VNy4Z2AAAAZ+IrrV+AAAEAwBGMEQCIF4w
+bi5zNj+3bQP3XY9ZdSgqlSu/bD6UNIdNu7uyKrNFAiBHJnTKxIBambTnOSxPG1Rd
+Uaom796Pfr5UkJseveo4VQB+AKgmy+MKxjUSRlM/4GXxTxnZbhkIE8Qd2W15ALMS
+PFUnAAABn4iuttcACAAABQAVdbJ8BAMARzBFAiEAjmnpKSjQpqg8Co12+tqkgJYN
+9CU9dHG7TX3pUmrrWcACICat4WOtmiyZXPc+SMBJkUIq79ZAbpHhYM+x1m3EArhY
+MA0GCSqGSIb3DQEBCwUAA4IBAQBd8PFMwGgJxN0IaCCu+ezD5GFYB+2CTEfZ6mIS
+7i4mCrfVFc/BQBko2v1KQssZuVr9FUrh/iCxHHwcCYBRLmlMc2XPCBs1p1Zd8FZR
+8KRr3NOElqzvXalrOwJlpLmkbT5dM6szZMhef0QRUfX5Vb5LRBiVtamp9MP+JAV5
+dKTweeQYAdONdd9coOYngiCX9oQW9HrzNtWVpmS7qm+7WPVub3wAEf6Klw10n2ld
+j9DweI0CmBzDKLoTHMvEQSnzp1YK3KPrza4sGEeuiaB0Hprbvw9uT/PfobAum8Eh
+DjK0eVcMkQ4yAWMUblJwZRPQ5mdq+7efyKB6vrSLXxrJOLuf
+-----END CERTIFICATE-----
+)PEM";
+
 #define LFS_MOUNT_PATH     "/littlefs"
 #define LFS_MESSAGES_PATH  LFS_MOUNT_PATH "/messages.log"
 #define LFS_MESSAGES_TEMP  LFS_MOUNT_PATH "/messages.tmp"
@@ -378,6 +411,7 @@ char agentDeviceId[64] = "";
 char agentBearerToken[AGENT_BEARER_TOKEN_SIZE] = "";
 char agentRefreshToken[AGENT_REFRESH_TOKEN_SIZE] = "";
 unsigned long agentAccessTokenExpiresAtMs = 0;
+bool agentTokensManual = false;
 char agentSimNumber[PHONE_BUFFER_SIZE] = "";
 int agentSimSlot = 0;
 char agentApiPath[64] = DEFAULT_API_PATH;
@@ -1003,8 +1037,22 @@ void wifiRecoverAfterHttps() {
     markHttpsSessionEnded();
 }
 
+bool wifiIsActuallyConnected() {
+    if (!WiFi.isConnected()) {
+        return false;
+    }
+    // Check if we have a valid IP and gateway
+    IPAddress ip = WiFi.localIP();
+    IPAddress gateway = WiFi.gatewayIP();
+    if (ip[0] == 0 || gateway[0] == 0) {
+        return false;
+    }
+    // Additional check: try to ping gateway to verify connectivity
+    return true;
+}
+
 bool ensureWifiForHttps() {
-    if (WiFi.isConnected()) {
+    if (wifiIsActuallyConnected()) {
         return true;
     }
     if (!wifiStaBackgroundReconnectAllowed()) {
@@ -1022,7 +1070,9 @@ bool ensureWifiForHttps() {
         if (WiFi.status() == WL_CONNECTED) {
             delay(200);
             wifiFixStaNetworkIfNeeded();
-            return WiFi.isConnected();
+            if (wifiIsActuallyConnected()) {
+                return true;
+            }
         }
         delay(250);
         yield();
@@ -1375,6 +1425,7 @@ void loadSettings() {
     preferences.getString("tok", agentBearerToken, sizeof(agentBearerToken));
     preferences.getString("rtok", agentRefreshToken, sizeof(agentRefreshToken));
     agentAccessTokenExpiresAtMs = preferences.getULong("tok_exp", 0);
+    agentTokensManual = preferences.getBool("tok_manual", false);
     preferences.getString("sim", agentSimNumber, sizeof(agentSimNumber));
     agentSimSlot = preferences.getInt("slot", 0);
     preferences.getString("path", agentApiPath, sizeof(agentApiPath));
@@ -1639,7 +1690,7 @@ static WiFiClient gHbPlain;
 static char gHbUrl[280];
 static char gHbAuthHdr[AGENT_AUTH_HDR_SIZE];
 static char gHbBody[3072];
-static char gHbResp[1536];
+static char gHbResp[2048]; // Increased from 1536 to handle full auth response
 static char gHbNumEsc[72];
 static char gHbNormNum[PHONE_BUFFER_SIZE];
 
@@ -1651,17 +1702,20 @@ static bool hbHttpBegin(const char* url, int timeoutMs) {
     if (isHttps) {
         gHbTls.setInsecure();
         gHbTls.setTimeout(timeoutMs);
+        // Removed setCACert to match working debug version
         return gHbHttp.begin(gHbTls, url);
     }
     gHbPlain.setTimeout(timeoutMs);
     return gHbHttp.begin(gHbPlain, url);
 }
 
-static void hbHttpEnd() {
+void hbHttpEnd() {
     gHbHttp.end();
     gHbTls.stop();
     gHbPlain.stop();
 }
+
+
 
 int agentHttpsPostJson(const char* url, const char* jsonBody, int timeoutMs, bool addAuth,
     char* respOut, size_t respOutSize, const char* opLabel) {
@@ -1688,66 +1742,111 @@ int agentHttpsPostJson(const char* url, const char* jsonBody, int timeoutMs, boo
     httpsBusy = true;
     wifiPrepareForHttps();
 
-    if (!hbHttpBegin(url, timeoutMs)) {
+    // Simple HTTPS connection approach (matching working debug)
+    gHbTls.stop();
+    gHbHttp.end();
+    gHbTls.setInsecure();
+    gHbTls.setTimeout(timeoutMs);
+    // Removed setCACert to match working debug version
+    
+    logMsg("[HTTPS] Calling HTTPClient.begin()...");
+    if (!gHbHttp.begin(gHbTls, url)) {
+        logMsg("[HTTPS] ERROR: HTTPClient.begin() failed");
         httpsBusy = false;
         wifiRecoverAfterHttps();
         return -1;
     }
+    logMsg("[HTTPS] HTTPClient.begin() succeeded");
 
-    gHbHttp.addHeader("Content-Type", "application/json");
     gHbHttp.setTimeout(timeoutMs);
+    gHbHttp.addHeader("Content-Type", "application/json");
+    gHbHttp.addHeader("Accept", "application/json");
+    gHbHttp.addHeader("User-Agent", "ESP32-SIM800-Gateway/1.0");
+    gHbHttp.addHeader("Connection", "close");
+
     if (addAuth && !charBufIsEmpty(agentBearerToken)) {
         maybeRefreshAgentTokenProactive();
         formatBearerHeader(gHbAuthHdr, sizeof(gHbAuthHdr), agentBearerToken);
         gHbHttp.addHeader("Authorization", gHbAuthHdr);
     }
 
+    logMsg("[HTTPS] Headers configured, ready to POST");
     handleWebRequests();
     yield();
-    int code = gHbHttp.POST(jsonBody);
 
+    unsigned long postStart = millis();
+    logMsg("[HTTPS] Calling POST()...");
+    int code = gHbHttp.POST((uint8_t*)jsonBody, strlen(jsonBody)); // Match debug version exactly
+    unsigned long postElapsed = millis() - postStart;
+    
+    char postTiming[64];
+    snprintf(postTiming, sizeof(postTiming), "[HTTPS] POST took %lums, code=%d", postElapsed, code);
+    logMsg(postTiming);
+
+    if (opLabel && opLabel[0]) {
+        char timingBuf[64];
+        snprintf(timingBuf, sizeof(timingBuf), "[HTTPS] %s POST took %lums", opLabel, postElapsed);
+        logMsg(timingBuf);
+    }
+    
+    if (code <= 0) {
+        String error = gHbHttp.errorToString(code);
+        char errBuf[96];
+        snprintf(errBuf, sizeof(errBuf), "[HTTPS] POST error: %s", error.c_str());
+        logMsg(errBuf);
+    }
+
+    // Handle 401 token refresh
     if (code == 401 && addAuth && refreshAgentToken()) {
+        logMsg("[HTTPS] 401 response, refreshing token and retrying");
         hbHttpEnd();
-        if (!hbHttpBegin(url, timeoutMs)) {
+        delay(100);
+        
+        gHbTls.stop();
+        gHbHttp.end();
+        gHbTls.setInsecure();
+        gHbTls.setTimeout(timeoutMs);
+        // Removed setCACert to match working debug version
+        
+        if (!gHbHttp.begin(gHbTls, url)) {
             httpsBusy = false;
             wifiRecoverAfterHttps();
             return -1;
         }
-        gHbHttp.addHeader("Content-Type", "application/json");
+
         gHbHttp.setTimeout(timeoutMs);
+        gHbHttp.addHeader("Content-Type", "application/json");
+        gHbHttp.addHeader("Accept", "application/json");
+        gHbHttp.addHeader("User-Agent", "ESP32-SIM800-Gateway/1.0");
+        gHbHttp.addHeader("Connection", "close");
+        
         if (!charBufIsEmpty(agentBearerToken)) {
             formatBearerHeader(gHbAuthHdr, sizeof(gHbAuthHdr), agentBearerToken);
             gHbHttp.addHeader("Authorization", gHbAuthHdr);
         }
+        
         handleWebRequests();
         yield();
-        code = gHbHttp.POST(jsonBody);
+        code = gHbHttp.POST((uint8_t*)jsonBody, strlen(jsonBody)); // Match debug version
     }
 
+    // Read response
     if (code > 0 && respOut && respOutSize > 1) {
-        WiFiClient* stream = gHbHttp.getStreamPtr();
-        if (stream) {
-            size_t total = 0;
-            const unsigned long t0 = millis();
-            const unsigned long readLimitMs = (unsigned long)timeoutMs + 2000UL;
-            while (millis() - t0 < readLimitMs && total < respOutSize - 1) {
-                if (stream->available()) {
-                    const int n = stream->read(
-                        (uint8_t*)(respOut + total),
-                        (int)(respOutSize - 1 - total)
-                    );
-                    if (n > 0) {
-                        total += (size_t)n;
-                    }
-                } else if (!gHbHttp.connected()) {
-                    break;
-                } else {
-                    handleWebRequests();
-                    yield();
-                    delay(2);
-                }
-            }
-            respOut[total] = '\0';
+        String response = gHbHttp.getString();
+        size_t copyLen = response.length();
+        
+        if (copyLen >= respOutSize) {
+            copyLen = respOutSize - 1;
+            logMsg("[HTTPS] WARNING: Response truncated (buffer too small)");
+        }
+        
+        memcpy(respOut, response.c_str(), copyLen);
+        respOut[copyLen] = '\0';
+        
+        if (opLabel && opLabel[0]) {
+            char respDiag[80];
+            snprintf(respDiag, sizeof(respDiag), "[HTTPS] %s response %d bytes", opLabel, (int)copyLen);
+            logMsg(respDiag);
         }
     }
 
@@ -1820,30 +1919,20 @@ static void fetchHeartbeatFollowup() {
     formatBearerHeader(gHbAuthHdr, sizeof(gHbAuthHdr), agentBearerToken);
     gHbHttp.addHeader("Authorization", gHbAuthHdr);
 
-    int code = gHbHttp.POST(gHbBody);
+    int code = gHbHttp.POST((uint8_t*)gHbBody, strlen(gHbBody)); // Match debug version
 
     gHbResp[0] = '\0';
     if (code > 0) {
-        WiFiClient* stream = gHbHttp.getStreamPtr();
-        if (stream) {
-            const unsigned long t0 = millis();
-            int total = 0;
-            while (millis() - t0 < 6000 && total < (int)sizeof(gHbResp) - 1) {
-                if (stream->available()) {
-                    const int n = stream->read((uint8_t*)(gHbResp + total), sizeof(gHbResp) - 1 - total);
-                    if (n > 0) {
-                        total += n;
-                    }
-                } else if (!gHbHttp.connected()) {
-                    break;
-                } else {
-                    handleWebRequests();
-                    yield();
-                    delay(2);
-                }
-            }
-            gHbResp[total] = '\0';
+        String response = gHbHttp.getString();
+        size_t copyLen = response.length();
+        
+        if (copyLen >= sizeof(gHbResp)) {
+            copyLen = sizeof(gHbResp) - 1;
+            logMsg("[HTTPS] WARNING: Response truncated (buffer too small)");
         }
+        
+        memcpy(gHbResp, response.c_str(), copyLen);
+        gHbResp[copyLen] = '\0';
     }
 
     if (code == 401) {
@@ -1859,30 +1948,18 @@ static void fetchHeartbeatFollowup() {
                 gHbHttp.setTimeout(25000);
                 formatBearerHeader(gHbAuthHdr, sizeof(gHbAuthHdr), agentBearerToken);
                 gHbHttp.addHeader("Authorization", gHbAuthHdr);
-                code = gHbHttp.POST(gHbBody);
+                code = gHbHttp.POST((uint8_t*)gHbBody, strlen(gHbBody)); // Match debug version
                 gHbResp[0] = '\0';
                 if (code > 0) {
-                    WiFiClient* stream = gHbHttp.getStreamPtr();
-                    if (stream) {
-                        const unsigned long t0 = millis();
-                        int total = 0;
-                        while (millis() - t0 < 6000 && total < (int)sizeof(gHbResp) - 1) {
-                            if (stream->available()) {
-                                const int n = stream->read(
-                                    (uint8_t*)(gHbResp + total), sizeof(gHbResp) - 1 - total);
-                                if (n > 0) {
-                                    total += n;
-                                }
-                            } else if (!gHbHttp.connected()) {
-                                break;
-                            } else {
-                                handleWebRequests();
-                                yield();
-                                delay(2);
-                            }
-                        }
-                        gHbResp[total] = '\0';
+                    String response = gHbHttp.getString();
+                    size_t copyLen = response.length();
+                    
+                    if (copyLen >= sizeof(gHbResp)) {
+                        copyLen = sizeof(gHbResp) - 1;
                     }
+                    
+                    memcpy(gHbResp, response.c_str(), copyLen);
+                    gHbResp[copyLen] = '\0';
                 }
                 hbHttpEnd();
             }
@@ -1953,6 +2030,17 @@ static void performHeartbeatPing() {
         "{\"device_id\":\"%s\",\"battery_level\":%d}",
         agentDeviceId,
         heartbeatLowestBatteryPercent());
+
+    // DIAGNOSTIC: Log payload size and timeout for comparison with auth
+    int hbPayloadSize = strlen(gHbBody);
+    int hbTimeoutMs = HEARTBEAT_PING_TIMEOUT_MS;
+    char hbDiag[128];
+    snprintf(hbDiag, sizeof(hbDiag), "[HEARTBEAT] DIAG payload=%dB timeout=%dms addAuth=true", hbPayloadSize, hbTimeoutMs);
+    logMsg(hbDiag);
+    appendMonitorLog(hbDiag);
+    snprintf(hbDiag, sizeof(hbDiag), "[HEARTBEAT] DIAG headers: Content-Type=application/json, Authorization=bearer");
+    logMsg(hbDiag);
+    appendMonitorLog(hbDiag);
 
     const int code = agentHttpsPostJson(
         gHbUrl, gHbBody, HEARTBEAT_PING_TIMEOUT_MS, true, nullptr, 0, "ping");
@@ -2084,11 +2172,31 @@ void performHeartbeat() {
 
     pos += snprintf(gHbBody + pos, sizeof(gHbBody) - pos, "]}");
 
+    // DIAGNOSTIC: Log payload size and timeout for comparison with auth
+    int hbFullPayloadSize = strlen(gHbBody);
+    int hbFullTimeoutMs = HEARTBEAT_FULL_TIMEOUT_MS;
+    char hbFullDiag[128];
+    snprintf(hbFullDiag, sizeof(hbFullDiag), "[HEARTBEAT] DIAG FULL payload=%dB timeout=%dms addAuth=true", hbFullPayloadSize, hbFullTimeoutMs);
+    logMsg(hbFullDiag);
+    appendMonitorLog(hbFullDiag);
+    snprintf(hbFullDiag, sizeof(hbFullDiag), "[HEARTBEAT] DIAG FULL headers: Content-Type=application/json, Authorization=bearer");
+    logMsg(hbFullDiag);
+    appendMonitorLog(hbFullDiag);
+
     if (HEARTBEAT_DEBUG) {
         logMsg("[HEARTBEAT][DBG] Request body:");
         appendMonitorLog("[HEARTBEAT][DBG] Request body:");
         logMsg(gHbBody);
         appendMonitorLog(gHbBody);
+    }
+    
+    // Log token status for debugging
+    if (!charBufIsEmpty(agentBearerToken)) {
+        char tokenDiag[80];
+        snprintf(tokenDiag, sizeof(tokenDiag), "[HEARTBEAT] Using bearer token (len=%d)", (int)strlen(agentBearerToken));
+        logMsg(tokenDiag);
+    } else {
+        logMsg("[HEARTBEAT] WARNING: No bearer token available");
     }
 
     gHbResp[0] = '\0';
@@ -2099,31 +2207,17 @@ void performHeartbeat() {
     while (attempt < 2) {
         handleWebRequests();
         yield();
-        code = gHbHttp.POST(gHbBody);
+        code = gHbHttp.POST((uint8_t*)gHbBody, strlen(gHbBody)); // Match debug version
         if (code > 0) {
-            WiFiClient* stream = gHbHttp.getStreamPtr();
-            if (stream) {
-                size_t total = 0;
-                const unsigned long t0 = millis();
-                while (millis() - t0 < 20000UL && total < sizeof(gHbResp) - 1) {
-                    if (stream->available()) {
-                        const int n = stream->read(
-                            (uint8_t*)(gHbResp + total),
-                            (int)(sizeof(gHbResp) - 1 - total)
-                        );
-                        if (n > 0) {
-                            total += (size_t)n;
-                        }
-                    } else if (!gHbHttp.connected()) {
-                        break;
-                    } else {
-                        handleWebRequests();
-                        yield();
-                        delay(5);
-                    }
-                }
-                gHbResp[total] = '\0';
+            String response = gHbHttp.getString();
+            size_t copyLen = response.length();
+            
+            if (copyLen >= sizeof(gHbResp)) {
+                copyLen = sizeof(gHbResp) - 1;
             }
+            
+            memcpy(gHbResp, response.c_str(), copyLen);
+            gHbResp[copyLen] = '\0';
         }
         gHbHttp.end();
 
@@ -2179,32 +2273,18 @@ void performHeartbeat() {
                     formatBearerHeader(gHbAuthHdr, sizeof(gHbAuthHdr), agentBearerToken);
                     gHbHttp.addHeader("Authorization", gHbAuthHdr);
                 }
-                code = gHbHttp.POST(gHbBody);
+                code = gHbHttp.POST((uint8_t*)gHbBody, strlen(gHbBody)); // Match debug version
                 gHbResp[0] = '\0';
                 if (code > 0) {
-                    WiFiClient* stream = gHbHttp.getStreamPtr();
-                    if (stream) {
-                        size_t total = 0;
-                        const unsigned long t0 = millis();
-                        while (millis() - t0 < 20000UL && total < sizeof(gHbResp) - 1) {
-                            if (stream->available()) {
-                                const int n = stream->read(
-                                    (uint8_t*)(gHbResp + total),
-                                    (int)(sizeof(gHbResp) - 1 - total)
-                                );
-                                if (n > 0) {
-                                    total += (size_t)n;
-                                }
-                            } else if (!gHbHttp.connected()) {
-                                break;
-                            } else {
-                                handleWebRequests();
-                                yield();
-                                delay(5);
-                            }
-                        }
-                        gHbResp[total] = '\0';
+                    String response = gHbHttp.getString();
+                    size_t copyLen = response.length();
+                    
+                    if (copyLen >= sizeof(gHbResp)) {
+                        copyLen = sizeof(gHbResp) - 1;
                     }
+                    
+                    memcpy(gHbResp, response.c_str(), copyLen);
+                    gHbResp[copyLen] = '\0';
                 }
                 gHbHttp.end();
             }
@@ -2229,6 +2309,17 @@ void performHeartbeat() {
             appendMonitorLog(gHbResp);
         } else {
             appendMonitorLog("[HEARTBEAT][DBG] Empty response body");
+        }
+    }
+    
+    // Add logging for 403 specifically
+    if (code == 403) {
+        logMsg("[HEARTBEAT] 403 Forbidden - checking response");
+        if (gHbResp[0]) {
+            logMsg("[HEARTBEAT] Response body:");
+            logMsg(gHbResp);
+        } else {
+            logMsg("[HEARTBEAT] Empty response for 403");
         }
     }
 

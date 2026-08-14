@@ -14,6 +14,9 @@
 #include "ussd.h"
 #include "maintenance.h"
 #include "network_ping.h"
+#include "sender_map.h"
+#include "mux_map.h"
+#include "excluded_apps.h"
 #include <WiFi.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
@@ -54,6 +57,7 @@ extern char agentDeviceId[64];
 extern char agentBearerToken[AGENT_BEARER_TOKEN_SIZE];
 extern char agentRefreshToken[AGENT_REFRESH_TOKEN_SIZE];
 extern unsigned long agentAccessTokenExpiresAtMs;
+extern bool agentTokensManual;
 extern char agentSimNumber[PHONE_BUFFER_SIZE];
 extern int agentSimSlot;
 extern char agentApiPath[64];
@@ -1580,6 +1584,41 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
           </div>
           <button class="btn full" id="accountLoginBtn" type="button">Sign in</button>
         </form>
+        <div style="margin-top:12px;text-align:center;">
+          <button type="button" class="btn sm secondary" id="accountShowManualTokenBtn" style="font-size:12px;">
+            Use manual token input instead
+          </button>
+        </div>
+      </div>
+
+      <div class="card hide" id="accountManualTokenCard">
+        <div class="card-header" style="border-bottom:1px solid var(--border);padding-bottom:12px;margin-bottom:16px;">
+          <div class="card-title">Manual token input</div>
+          <span class="badge warning">Fallback</span>
+        </div>
+        <p class="muted text-sm" style="margin-bottom:12px;">
+          If automatic login fails, you can manually paste your JWT access token and refresh token here.
+          This is useful for debugging or when the backend has connectivity issues.
+        </p>
+        <div id="accountManualTokenError" class="hide" style="background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.2);border-radius:8px;padding:12px;margin-bottom:16px;">
+          <p style="font-size:13px;color:var(--danger);" id="accountManualTokenErrorText"></p>
+        </div>
+        <form onsubmit="return false;">
+          <div class="form-group">
+            <label for="accountManualAccessToken">Access Token (JWT)</label>
+            <input id="accountManualAccessToken" type="text" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." autocomplete="off" style="font-family:'SF Mono',Consolas,monospace;font-size:11px;" />
+          </div>
+          <div class="form-group">
+            <label for="accountManualRefreshToken">Refresh Token (optional)</label>
+            <input id="accountManualRefreshToken" type="text" placeholder="Refresh token from backend..." autocomplete="off" style="font-family:'SF Mono',Consolas,monospace;font-size:11px;" />
+          </div>
+          <button class="btn full" id="accountManualTokenBtn" type="button">Save Tokens</button>
+        </form>
+        <div style="margin-top:12px;text-align:center;">
+          <button type="button" class="btn sm secondary" id="accountShowLoginBtn" style="font-size:12px;">
+            Back to email/password login
+          </button>
+        </div>
       </div>
 
       <div class="card hide" id="accountSignedInCard">
@@ -1589,6 +1628,7 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
         </div>
         <div class="row mb-2"><span class="muted text-sm">Device</span><span class="badge primary" id="accountDeviceBadge">-</span></div>
         <div class="row mb-2"><span class="muted text-sm">SIMs registered</span><span class="text-sm" id="accountSimsRegCount">-</span></div>
+        <div class="row mb-2"><span class="muted text-sm">Token mode</span><span class="badge warning" id="accountTokenModeBadge">-</span></div>
         <div class="btn-group">
           <button class="btn sm secondary" id="accountRegisterDeviceBtn">Register device</button>
           <button class="btn sm secondary" id="accountRefreshTokenBtn">Refresh token</button>
@@ -1728,6 +1768,26 @@ static const char INDEX_HTML[] PROGMEM = R"=====(<!DOCTYPE html>
             <button class="btn sm success" id="toggleMissedCallBtn">Enable forwarding</button>
           </div>
         </div>
+      </div>
+
+      <div class="card settings-card" id="muxMapCard">
+        <div class="card-header">
+          <div class="card-title">MUX slot mapping</div>
+        </div>
+        <p class="muted text-sm" style="margin-bottom:10px;">
+          Map each UI SIM slot (1–16) to a CD74HC4067 channel (0–15). Match your PCB wiring.
+          S0–S3 GPIO: 12, 11, 10, 9 on this build.
+        </p>
+        <div class="form-group">
+          <label for="muxSettleMs">Mux settle time (ms)</label>
+          <input id="muxSettleMs" type="number" min="50" max="2000" value="350" />
+        </div>
+        <div id="muxMapGrid" class="grid" style="grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px;"></div>
+        <div class="btn-group">
+          <button type="button" class="btn secondary" id="loadMuxMapBtn">Reload</button>
+          <button type="button" class="btn" id="saveMuxMapBtn">Save mapping</button>
+        </div>
+        <p id="muxMapStatus" class="muted text-sm" style="margin-top:8px;"></p>
       </div>
 
       <div class="card settings-card" id="firmwareCard">
@@ -3675,6 +3735,64 @@ async function doLogin() {
   }
 }
 
+async function doSetManualTokens() {
+  const accessToken = ($('accountManualAccessToken')?.value || '').trim();
+  const refreshToken = ($('accountManualRefreshToken')?.value || '').trim();
+  
+  if (!accessToken) {
+    toast('Enter access token (JWT)');
+    return;
+  }
+  
+  const setBtn = $('accountManualTokenBtn');
+  if (setBtn) {
+    setBtn.innerHTML = '<span class="spinner"></span> Saving...';
+    setBtn.disabled = true;
+  }
+  
+  try {
+    const res = await fetch('/set-tokens', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ access_token: accessToken, refresh_token: refreshToken })
+    });
+    const r = await res.json();
+    
+    if (r.success) {
+      showManualTokenError('');
+      toast('Tokens saved manually');
+      setTimeout(() => {
+        refreshStatus();
+        checkAuthStatus();
+      }, 600);
+    } else {
+      const msg = r.error || 'Failed to save tokens';
+      showManualTokenError(msg);
+    }
+  } catch(e) {
+    const msg = 'Cannot reach gateway — stay on the device AP or gateway WiFi IP';
+    showManualTokenError(msg);
+    console.error('Set tokens error:', e);
+  }
+  
+  if (setBtn) {
+    setBtn.textContent = 'Save Tokens';
+    setBtn.disabled = false;
+  }
+}
+
+function showManualTokenError(msg) {
+  const box = $('accountManualTokenError');
+  const text = $('accountManualTokenErrorText');
+  if (!box || !text) return;
+  if (msg) {
+    text.textContent = msg;
+    box.classList.remove('hide');
+  } else {
+    box.classList.add('hide');
+  }
+}
+
 function showLoginError(msg) {
   const boxes = [
     { box: $('accountLoginError'), text: $('accountLoginErrorText') },
@@ -3696,6 +3814,9 @@ async function doLogout() {
   toast('Logged out');
   refreshStatus();
   checkAuthStatus();
+  // Reset to login view after logout
+  $('accountManualTokenCard')?.classList.add('hide');
+  $('accountLoginCard')?.classList.remove('hide');
 }
 
 async function doRefreshToken() {
@@ -3746,6 +3867,7 @@ async function checkAuthStatus() {
   try {
     const s = await get('/status');
     const hasToken = s.signed_in === true || (s.bearer_token && s.bearer_token.length > 0);
+    const isManualToken = s.tokens_manual === true;
 
     $('loginPage')?.classList.add('hide');
     $('dashboardPage')?.classList.remove('hide');
@@ -3757,14 +3879,22 @@ async function checkAuthStatus() {
 
     $('accountLoginCard')?.classList.toggle('hide', hasToken);
     $('accountSignedInCard')?.classList.toggle('hide', !hasToken);
+    // Always hide manual token card by default (shown via button)
+    $('accountManualTokenCard')?.classList.add('hide');
     $('authSignedOutView')?.classList.toggle('hide', hasToken);
     $('authSignedInView')?.classList.toggle('hide', !hasToken);
 
       const authBadge = $('authBadge');
     const accountModeBadge = $('accountModeBadge');
     if (hasToken) {
-      if (authBadge) { authBadge.className = 'badge success'; authBadge.textContent = 'Online'; }
-      if (accountModeBadge) { accountModeBadge.className = 'badge success'; accountModeBadge.textContent = 'Signed in'; }
+      if (authBadge) {
+        authBadge.className = isManualToken ? 'badge warning' : 'badge success';
+        authBadge.textContent = isManualToken ? 'Manual' : 'Online';
+      }
+      if (accountModeBadge) {
+        accountModeBadge.className = isManualToken ? 'badge warning' : 'badge success';
+        accountModeBadge.textContent = isManualToken ? 'Manual tokens' : 'Signed in';
+      }
     } else {
       if (authBadge) { authBadge.className = 'badge warning'; authBadge.textContent = 'Offline'; }
       if (accountModeBadge) { accountModeBadge.className = 'badge warning'; accountModeBadge.textContent = 'Not signed in'; }
@@ -3778,6 +3908,21 @@ async function checkAuthStatus() {
     };
     setDeviceBadge('deviceBadge');
     setDeviceBadge('accountDeviceBadge');
+
+    // Update token mode badge
+    const tokenModeBadge = $('accountTokenModeBadge');
+    if (tokenModeBadge) {
+      if (isManualToken) {
+        tokenModeBadge.className = 'badge warning';
+        tokenModeBadge.textContent = 'Manual';
+      } else if (hasToken) {
+        tokenModeBadge.className = 'badge success';
+        tokenModeBadge.textContent = 'Auto';
+      } else {
+        tokenModeBadge.className = 'badge';
+        tokenModeBadge.textContent = '-';
+      }
+    }
 
     updateGatewayServicesUi(s);
     updateScheduledRestartNav(s);
@@ -3856,6 +4001,60 @@ async function runNetworkPing() {
   if (btn) { btn.disabled = false; btn.textContent = 'Ping'; }
 }
 
+function renderMuxMapGrid(channels) {
+  const grid = $('muxMapGrid');
+  if (!grid) return;
+  grid.innerHTML = '';
+  for (let i = 0; i < 16; i++) {
+    const wrap = document.createElement('div');
+    wrap.innerHTML = '<label class="text-sm muted">SIM ' + (i + 1) + '</label>' +
+      '<input type="number" min="0" max="15" class="mux-ch-input" data-slot="' + i + '" value="' +
+      (channels && channels[i] != null ? channels[i] : i) + '" style="width:100%;margin-top:4px;" />';
+    grid.appendChild(wrap);
+  }
+}
+
+async function loadMuxMap() {
+  const status = $('muxMapStatus');
+  try {
+    const r = await get('/mux-map');
+    const channels = r.channels || [];
+    renderMuxMapGrid(channels);
+    const settle = $('muxSettleMs');
+    if (settle && r.settle_ms != null) settle.value = r.settle_ms;
+    if (status) status.textContent = 'Loaded from device.';
+  } catch (e) {
+    if (status) status.textContent = 'Load failed: ' + (e.message || e);
+  }
+}
+
+async function saveMuxMap() {
+  const status = $('muxMapStatus');
+  const inputs = document.querySelectorAll('.mux-ch-input');
+  const channels = [];
+  inputs.forEach(function(inp) {
+    const v = parseInt(inp.value, 10);
+    channels.push(isNaN(v) ? 0 : Math.max(0, Math.min(15, v)));
+  });
+  const settleEl = $('muxSettleMs');
+  const settle_ms = settleEl ? parseInt(settleEl.value, 10) : 350;
+  try {
+    const r = await fetch('/mux-map', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ channels: channels, settle_ms: settle_ms })
+    });
+    const j = await r.json();
+    if (!r.ok || j.success === false) throw new Error(j.error || j.message || 'Save failed');
+    if (status) status.textContent = 'Saved. Re-run SIM init (Run) to apply.';
+    toast('MUX map saved');
+    await loadMuxMap();
+  } catch (e) {
+    if (status) status.textContent = 'Save failed: ' + (e.message || e);
+    toast('MUX save failed');
+  }
+}
+
 addClick('modemRunBtn', startModemGateway);
 addClick('modemStopBtn', stopModemGatewayUi);
 addClick('loginModemRunBtn', startModemGateway);
@@ -3865,6 +4064,10 @@ addClick('disableAllSimsBtn', disableAllSims);
 addClick('pausePollingBtn', togglePollingPause);
 addClick('pauseHeartbeatBtn', toggleHeartbeatPause);
 addClick('saveConfigBtn', saveConfig);
+addClick('loadMuxMapBtn', loadMuxMap);
+addClick('saveMuxMapBtn', saveMuxMap);
+renderMuxMapGrid([]);
+loadMuxMap();
 addClick('clearLogBtn', clearLog);
 addClick('clearErrorLogBtn', function() { currentLogTab = 'errors'; clearLog(); });
 addClick('resetDeviceBtn', resetDevice);
@@ -3880,6 +4083,15 @@ addClick('loginGraceContinueBtn', openDashboardNow);
 addClick('accountLogoutBtn', doLogout);
 addClick('accountRegisterDeviceBtn', doRegisterDevice);
 addClick('accountRefreshTokenBtn', doRefreshToken);
+addClick('accountManualTokenBtn', doSetManualTokens);
+addClick('accountShowManualTokenBtn', () => {
+  $('accountLoginCard')?.classList.add('hide');
+  $('accountManualTokenCard')?.classList.remove('hide');
+});
+addClick('accountShowLoginBtn', () => {
+  $('accountManualTokenCard')?.classList.add('hide');
+  $('accountLoginCard')?.classList.remove('hide');
+});
 
 function getTabFromHash() {
   const hash = window.location.hash.slice(1);
@@ -3957,6 +4169,7 @@ void initWebUI() {
     server.on("/agent-config", HTTP_POST, handleAgentConfig);
     server.on("/login", HTTP_POST, handleLogin);
     server.on("/logout", HTTP_GET, handleLogout);
+    server.on("/set-tokens", HTTP_POST, handleSetTokens);
     server.on("/refresh-token", HTTP_POST, handleRefreshToken);
     server.on("/register-device", HTTP_POST, handleRegisterDevice);
     server.on("/register-sim", HTTP_POST, handleRegisterSim);
@@ -3967,6 +4180,12 @@ void initWebUI() {
     server.on("/firmware-check", HTTP_GET, handleFirmwareCheck);
     server.on("/firmware-update", HTTP_POST, handleFirmwareUpdate);
     server.on("/firmware-config", HTTP_POST, handleFirmwareConfig);
+    server.on("/sender-map", HTTP_GET, handleSenderMapGet);
+    server.on("/sender-map", HTTP_POST, handleSenderMapPost);
+    server.on("/mux-map", HTTP_GET, handleMuxMapGet);
+    server.on("/mux-map", HTTP_POST, handleMuxMapPost);
+    server.on("/excluded-apps", HTTP_GET, handleExcludedAppsGet);
+    server.on("/excluded-apps", HTTP_POST, handleExcludedAppsPost);
     server.on("/reset", HTTP_POST, handleReset);
     
     // Start server
@@ -4101,6 +4320,7 @@ void buildStatusJson(char* buf, size_t bufSize) {
         "\"device_id\":\"%s\","
         "\"bearer_token\":\"%s\","
         "\"signed_in\":%s,"
+        "\"tokens_manual\":%s,"
         "\"offline_mode\":%s,"
         "\"modem_running\":%s,"
         "\"modem_start_queued\":%s,"
@@ -4146,6 +4366,7 @@ void buildStatusJson(char* buf, size_t bufSize) {
         agentDeviceId,
         hasBearerToken ? "(set)" : "",
         signedIn ? "true" : "false",
+        agentTokensManual ? "true" : "false",
         signedIn ? "false" : "true",
         isModemGatewayRunning() ? "true" : "false",
         isModemGatewayStartQueued() ? "true" : "false",
@@ -4296,7 +4517,7 @@ void handleSaveWifi() {
     preferences.putString("pw", wifiPassword);
     preferences.end();
     
-    armWifiUserSetupMs(45000);
+    armWifiUserSetupMs(AP_STA_GRACE_MS);
     WiFi.setAutoReconnect(false);
     ensureGatewaySoftAp();
     
@@ -4541,6 +4762,7 @@ void buildSimConfigJson(char* buf, size_t bufSize) {
 
     if (!jsonAppendFmt(buf, bufSize, &pos, "],\"numbers\":[")) goto json_fail;
     for (int i = 0; i < SIM_COUNT; i++) {
+        applyPhMobileNormalization(simStates[i].number, sizeof(simStates[i].number));
         char escaped[48];
         jsonEscape(simStates[i].number, escaped, sizeof(escaped));
         if (!jsonAppendFmt(buf, bufSize, &pos, "%s%s", i > 0 ? "," : "", escaped)) {
@@ -4796,21 +5018,8 @@ void handleCheckAllSim() {
             
             // Get phone number
             sendATCapture("AT+CNUM", 1500);
-            char numBuf[64];
-            charBufSet(numBuf, sizeof(numBuf), getSimBuffer());
-            // Parse +CNUM: ,"number",...
-            const char* numStart = strstr(numBuf, ",\"");
-            if (numStart) {
-                numStart += 2;
-                const char* numEnd = strchr(numStart, '"');
-                if (numEnd) {
-                    int len = numEnd - numStart;
-                    if (len > 0 && len < (int)sizeof(simStates[i].number)) {
-                        strncpy(simStates[i].number, numStart, len);
-                        simStates[i].number[len] = '\0';
-                    }
-                }
-            }
+            parseCnumResponseNumber(getSimBuffer(), simStates[i].number, sizeof(simStates[i].number));
+            applyPhMobileNormalization(simStates[i].number, sizeof(simStates[i].number));
             logMsg2Val("[SIM] Number", simStates[i].number, "", "");
             
             // Get battery info
@@ -4945,20 +5154,8 @@ void handleSimEnable() {
         charBufSet(simStates[simIdx].cops, sizeof(simStates[simIdx].cops), getSimBuffer());
 
         sendATCapture("AT+CNUM", 1500);
-        char numBuf[64];
-        charBufSet(numBuf, sizeof(numBuf), getSimBuffer());
-        const char* numStart = strstr(numBuf, ",\"");
-        if (numStart) {
-            numStart += 2;
-            const char* numEnd = strchr(numStart, '"');
-            if (numEnd) {
-                int len = (int)(numEnd - numStart);
-                if (len > 0 && len < (int)sizeof(simStates[simIdx].number)) {
-                    strncpy(simStates[simIdx].number, numStart, (size_t)len);
-                    simStates[simIdx].number[len] = '\0';
-                }
-            }
-        }
+        parseCnumResponseNumber(getSimBuffer(), simStates[simIdx].number, sizeof(simStates[simIdx].number));
+        applyPhMobileNormalization(simStates[simIdx].number, sizeof(simStates[simIdx].number));
 
         int pct = 0, mv = 0;
         getBatteryInfo(&pct, &mv);
@@ -5142,6 +5339,9 @@ static uint8_t loginFailStreak = 0;
 
 static void sendAuthLoginJsonError(const char* msg) {
     httpsBusy = false;
+    // Reset rate limiting on all errors to prevent blocking on connection issues
+    loginFailStreak = 0;
+    loginCooldownUntilMs = 0;
     char buf[280];
     char esc[200];
     jsonEscapeNoQuotes(msg ? msg : "Login failed", esc, sizeof(esc));
@@ -5417,10 +5617,7 @@ void handleLogin() {
         sendAuthLoginJsonError("Too many login attempts — wait 1 minute");
         return;
     }
-    if (loginNowMs - lastLoginAttemptMs < AUTH_LOGIN_MIN_INTERVAL_MS) {
-        sendAuthLoginJsonError("Please wait 10 seconds between login attempts");
-        return;
-    }
+    // Removed 10s minimum interval - allow immediate retries for debugging connection issues
     lastLoginAttemptMs = loginNowMs;
 
     // Pause SIM UART polling so TLS + auth get CPU/heap (same as token refresh).
@@ -5430,6 +5627,46 @@ void handleLogin() {
     smsGuard.active = true;
     delay(80);
     
+    // Ensure NTP is configured - required for HTTPS/TLS certificate validation
+    if (!ntpConfigured) {
+        configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+        ntpConfigured = true;
+        // Give NTP time to sync (TLS handshake fails if time is invalid)
+        unsigned long start = millis();
+        while (millis() - start < 6000) {
+            time_t now = time(nullptr);
+            if (now > 1700000000) break; // ~2023-11
+            delay(250);
+        }
+        time_t now = time(nullptr);
+        char timeBuf[64];
+        snprintf(timeBuf, sizeof(timeBuf), "[AUTH] NTP configured, time=%ld", (long)now);
+        logMsg(timeBuf);
+        appendMonitorLog(timeBuf);
+        if (now < 1700000000) {
+            logMsg("[AUTH] WARNING: Time still invalid after NTP sync");
+            appendMonitorLog("[AUTH] Time invalid - TLS may fail");
+        }
+    } else {
+        time_t now = time(nullptr);
+        char timeBuf[64];
+        snprintf(timeBuf, sizeof(timeBuf), "[AUTH] Using existing time=%ld", (long)now);
+        logMsg(timeBuf);
+        if (now < 1700000000) {
+            logMsg("[AUTH] WARNING: Existing time is invalid");
+            appendMonitorLog("[AUTH] Time invalid - forcing NTP re-sync");
+            configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+            unsigned long start = millis();
+            while (millis() - start < 6000) {
+                now = time(nullptr);
+                if (now > 1700000000) break;
+                delay(250);
+            }
+            snprintf(timeBuf, sizeof(timeBuf), "[AUTH] After re-sync time=%ld", (long)now);
+            logMsg(timeBuf);
+        }
+    }
+    
     // Build URL - use /api/agent/auth (not /api/agent/auth/login)
     char url[256];
     snprintf(url, sizeof(url), "%s/api/agent/auth", agentBaseUrl);
@@ -5437,12 +5674,6 @@ void handleLogin() {
     // Build payload
     char payload[256];
     snprintf(payload, sizeof(payload), "{\"email\":\"%s\",\"password\":\"%s\"}", email, password);
-    
-    // Make request
-    HTTPClient http;
-    WiFiClientSecure clientSecure;
-    WiFiClient client;
-    bool isHttps = (strncmp(url, "https://", 8) == 0);
     
     // Wait briefly for other HTTPS operations to finish.
     // Background HTTPS (heartbeat / maintenance / OTA) runs even when the user is not logged in,
@@ -5457,63 +5688,85 @@ void handleLogin() {
         sendJsonError("HTTPS busy, try again");
         return;
     }
-    httpsBusy = true;
     wifiGuard.enable();
-    
+
     logMsg2Val("[AUTH] URL", url, "", "");
     const unsigned long authT0 = millis();
-    
-    auto beginAuthHttp = [&]() -> bool {
-    if (isHttps) {
-        clientSecure.setInsecure();
-            clientSecure.setTimeout(12000);
-            return http.begin(clientSecure, url);
-        }
-        return http.begin(client, url);
-    };
 
-    if (!beginAuthHttp()) {
-            logMsg("[AUTH] HTTP begin failed");
-            appendMonitorLog("[AUTH] HTTP begin failed");
-        sendAuthLoginJsonError(isHttps ? "Cannot connect to server (TLS)" : "Cannot connect to server");
-            return;
-    }
-    
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(12000);
-    
-    int code = http.POST(payload);
+    // DIAGNOSTIC: Log payload size and timeout
+    int payloadSize = strlen(payload);
+    int timeoutMs = 20000;
+    char diagBuf[128];
+    snprintf(diagBuf, sizeof(diagBuf), "[AUTH] DIAG payload=%dB timeout=%dms addAuth=false", payloadSize, timeoutMs);
+    logMsg(diagBuf);
+    appendMonitorLog(diagBuf);
+    snprintf(diagBuf, sizeof(diagBuf), "[AUTH] DIAG headers: Content-Type=application/json, Authorization=none");
+    logMsg(diagBuf);
+    appendMonitorLog(diagBuf);
 
+    // Use shared HTTPS client to avoid -1 errors from client conflicts
+    // Note: agentHttpsPostJson sets httpsBusy internally, so we don't set it here
+    // Increased timeout to 20s for TLS handshake (certificate validation can be slow)
+    int code = agentHttpsPostJson(url, payload, 20000, false, gAuthRespBuf, sizeof(gAuthRespBuf), "auth");
+    
     const unsigned long postMs = millis() - authT0;
-    int respLen = 0;
+    int respLen = (code > 0) ? (int)strlen(gAuthRespBuf) : 0;
     
     if (code > 0) {
-        respLen = readHttpBodyToBuffer(http, gAuthRespBuf, sizeof(gAuthRespBuf));
-        {
-            char timing[64];
-            snprintf(timing, sizeof(timing), "[AUTH] POST %lums body %dB read %lums",
-                     (unsigned long)postMs, respLen, (unsigned long)(millis() - authT0 - postMs));
-            logMsg(timing);
-            appendMonitorLog(timing);
-        }
+        char timing[64];
+        snprintf(timing, sizeof(timing), "[AUTH] POST %lums body %dB read %lums",
+                 (unsigned long)postMs, respLen, (unsigned long)(millis() - authT0 - postMs));
+        logMsg(timing);
+        appendMonitorLog(timing);
     } else {
         logMsgInt("[AUTH] POST failed, code", code);
         appendMonitorLogInt("[AUTH] POST failed", code);
-        http.end();
-        clientSecure.stop();
-        client.stop();
-        loginFailStreak++;
-        if (loginFailStreak >= AUTH_LOGIN_MAX_FAILS) {
+
+        // DIAGNOSTIC: Log detailed error information
+        char errDiag[160];
+        snprintf(errDiag, sizeof(errDiag), "[AUTH] DIAG ERROR code=%d HTTPS_busy=%d WiFi_status=%d",
+                 code, httpsBusy ? 1 : 0, WiFi.status());
+        logMsg(errDiag);
+        appendMonitorLog(errDiag);
+
+        // Log response buffer if any data was received
+        if (gAuthRespBuf[0] != '\0') {
+            int errRespLen = strlen(gAuthRespBuf);
+            snprintf(errDiag, sizeof(errDiag), "[AUTH] DIAG ERROR response_len=%d", errRespLen);
+            logMsg(errDiag);
+            appendMonitorLog(errDiag);
+            // Log first 200 chars of response
+            if (errRespLen > 0) {
+                char preview[200];
+                strncpy(preview, gAuthRespBuf, sizeof(preview) - 1);
+                preview[sizeof(preview) - 1] = '\0';
+                logMsg("[AUTH] DIAG ERROR response_preview:");
+                logMsg(preview);
+                appendMonitorLog("[AUTH] ERR_RESP preview:");
+                appendMonitorLog(preview);
+            }
+        } else {
+            logMsg("[AUTH] DIAG ERROR response_buffer_empty");
+            appendMonitorLog("[AUTH] ERR_RESP empty");
+        }
+
+        // Only apply rate limit cooldown for actual server responses, not local connection errors
+        // -11 = HTTPS busy, -1 = connection error - these are local issues, not server rate limits
+        if (code >= 0) {
+            loginFailStreak++;
+            if (loginFailStreak >= AUTH_LOGIN_MAX_FAILS) {
+                loginFailStreak = 0;
+                loginCooldownUntilMs = millis() + AUTH_LOGIN_COOLDOWN_MS;
+            }
+        } else {
+            // Reset cooldown on local errors - these aren't server-side issues
             loginFailStreak = 0;
-            loginCooldownUntilMs = millis() + AUTH_LOGIN_COOLDOWN_MS;
+            loginCooldownUntilMs = 0;
         }
         const char* netErr = authHttpPostErrorMessage(code);
         sendAuthLoginJsonError(netErr ? netErr : "Login request failed");
         return;
     }
-    http.end();
-    clientSecure.stop();
-    client.stop();
     
     // Log response size (body may be too long to print fully)
     logMsgInt("[AUTH] HTTP code", code);
@@ -5562,7 +5815,6 @@ void handleLogin() {
         
         logMsg2Val("[AUTH] Backend error", errorMsg, "", "");
         appendMonitorLogVal("[AUTH] Error", errorMsg);
-        httpsBusy = false;
         char buf[256];
         char esc[200];
         jsonEscapeNoQuotes(errorMsg, esc, sizeof(esc));
@@ -5594,9 +5846,11 @@ void handleLogin() {
     if (!charBufIsEmpty(agentBearerToken)) {
         loginFailStreak = 0;
         loginCooldownUntilMs = 0;
+        agentTokensManual = false; // Clear manual flag on successful login
         preferences.begin("agent", false);
         preferences.putString("tok", agentBearerToken);
         preferences.putString("rtok", agentRefreshToken);
+        preferences.putBool("tok_manual", false);
         preferences.end();
         updateAccessTokenExpiryFromAuthJson(gAuthRespBuf);
         
@@ -5616,7 +5870,6 @@ void handleLogin() {
             "{\"success\":true,\"message\":\"Logged in\",\"has_refresh\":%s}",
             charBufIsEmpty(agentRefreshToken) ? "false" : "true"
         );
-        httpsBusy = false;
         server.send(200, "application/json", buf);
         for (int i = 0; i < 12; i++) {
             handleWebRequests();
@@ -5639,15 +5892,22 @@ void handleLogin() {
 
 void handleLogout() {
     resetAgentInventoryHeartbeat();
+    
+    // Clear HTTPS client state to prevent TLS conflicts on next login
+    hbHttpEnd();
+    delay(100); // Allow TCP/TLS connections to fully close
+    
     // Clear tokens
     agentBearerToken[0] = '\0';
     agentRefreshToken[0] = '\0';
     agentAccessTokenExpiresAtMs = 0;
+    agentTokensManual = false;
     
     preferences.begin("agent", false);
     preferences.remove("tok");
     preferences.remove("rtok");
     preferences.remove("tok_exp");
+    preferences.remove("tok_manual");
     preferences.end();
     
     deviceRegistered = false;
@@ -5658,10 +5918,123 @@ void handleLogout() {
     sendJsonSuccess("Logged out");
 }
 
+void handleSetTokens() {
+    // Manually set JWT and refresh tokens (fallback when auto auth fails)
+    
+    // Parse JSON body
+    String body = server.arg("plain");
+    if (body.length() == 0) {
+        body = server.arg("body");
+    }
+    
+    // Extract access_token and refresh_token from JSON
+    char accessToken[AGENT_BEARER_TOKEN_SIZE] = "";
+    char refreshToken[AGENT_REFRESH_TOKEN_SIZE] = "";
+    
+    // Simple JSON extraction
+    const char* atKey = "\"access_token\":\"";
+    const char* rtKey = "\"refresh_token\":\"";
+    
+    const char* atPos = strstr(body.c_str(), atKey);
+    if (atPos) {
+        atPos += strlen(atKey);
+        const char* endQuote = strchr(atPos, '"');
+        if (endQuote) {
+            int len = endQuote - atPos;
+            if (len < (int)sizeof(accessToken)) {
+                strncpy(accessToken, atPos, len);
+                accessToken[len] = '\0';
+            }
+        }
+    }
+    
+    const char* rtPos = strstr(body.c_str(), rtKey);
+    if (rtPos) {
+        rtPos += strlen(rtKey);
+        const char* endQuote = strchr(rtPos, '"');
+        if (endQuote) {
+            int len = endQuote - rtPos;
+            if (len < (int)sizeof(refreshToken)) {
+                strncpy(refreshToken, rtPos, len);
+                refreshToken[len] = '\0';
+            }
+        }
+    }
+    
+    if (charBufIsEmpty(accessToken)) {
+        sendJsonError("Access token (JWT) required");
+        return;
+    }
+    
+    // Store tokens
+    agentBearerToken[0] = '\0';
+    agentRefreshToken[0] = '\0';
+    
+    int atLen = (int)strlen(accessToken);
+    if (atLen >= (int)sizeof(agentBearerToken)) {
+        char line[64];
+        snprintf(line, sizeof(line), "[AUTH] Manual access token too long (%d)", atLen);
+        logMsg(line);
+        appendMonitorLog(line);
+        sendJsonError("Access token too large for device storage");
+        return;
+    }
+    
+    charBufSet(agentBearerToken, sizeof(agentBearerToken), accessToken);
+    if (!charBufIsEmpty(refreshToken)) {
+        charBufSet(agentRefreshToken, sizeof(agentRefreshToken), refreshToken);
+    }
+    
+    // Set manual flag
+    agentTokensManual = true;
+    
+    // Store in preferences
+    preferences.begin("agent", false);
+    preferences.putString("tok", agentBearerToken);
+    preferences.putString("rtok", agentRefreshToken);
+    preferences.putBool("tok_manual", true);
+    preferences.end();
+    
+    // Set token expiration to 1 hour from now as default for manual tokens
+    // (user can refresh manually if needed)
+    agentAccessTokenExpiresAtMs = millis() + 3600000UL;
+    preferences.begin("agent", false);
+    preferences.putULong("tok_exp", agentAccessTokenExpiresAtMs);
+    preferences.end();
+    
+    logMsg("[AUTH] Manual tokens set");
+    appendMonitorLog("[AUTH] Manual tokens set (user-provided)");
+    deferCloudBackend(HEARTBEAT_POST_LOGIN_DEFER_MS);
+    resetAgentInventoryHeartbeat();
+    
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+        "{\"success\":true,\"message\":\"Tokens saved manually\",\"has_refresh\":%s}",
+        charBufIsEmpty(agentRefreshToken) ? "false" : "true"
+    );
+    server.send(200, "application/json", buf);
+}
+
 bool refreshAgentToken() {
     if (charBufIsEmpty(agentRefreshToken)) {
         logMsg("[AUTH] Refresh failed: no refresh token");
         appendMonitorLog("[AUTH] Refresh failed: no refresh token");
+        return false;
+    }
+    
+    // Skip automatic refresh for manually set tokens
+    // This allows users to maintain manual control over their tokens
+    if (agentTokensManual) {
+        // Check if token is expired
+        unsigned long now = millis();
+        if (agentAccessTokenExpiresAtMs > 0 && now < agentAccessTokenExpiresAtMs) {
+            // Token still valid, skip refresh
+            logMsg("[AUTH] Manual token still valid, skipping auto-refresh");
+            return true;
+        }
+        // Token expired - don't auto-refresh manual tokens
+        // User must manually refresh or re-enter tokens
+        logMsg("[AUTH] Manual token expired, skipping auto-refresh (user action required)");
         return false;
     }
 
@@ -5746,57 +6119,20 @@ bool refreshAgentToken() {
     jsonEscape(agentRefreshToken, rtEsc, sizeof(rtEsc));
     snprintf(payload, sizeof(payload), "{\"refresh_token\":%s}", rtEsc);
     
-    // Simple HTTPS request - same pattern as handleLogin
-    HTTPClient http;
-    WiFiClientSecure clientSecure;
-    WiFiClient client;
-    bool isHttps = (strncmp(url, "https://", 8) == 0);
+    // Note: agentHttpsPostJson handles httpsBusy internally, so we don't set it here
+    // This allows nested calls from 401 handlers without conflicts
     
-    // Note: Caller (heartbeat, SMS forward, etc.) should set httpsBusy before calling
-    // We don't check/set it here to allow nested calls from 401 handlers
-    
-    if (isHttps) {
-        clientSecure.setInsecure();
-        clientSecure.setTimeout(15000);
-        if (!http.begin(clientSecure, url)) {
-            logMsg("[AUTH] HTTPS begin failed");
-            appendMonitorLog("[AUTH] HTTPS begin failed");
-            resumeSmsPolling();
-            return false;
-        }
-    } else {
-        if (!http.begin(client, url)) {
-            logMsg("[AUTH] HTTP begin failed");
-            appendMonitorLog("[AUTH] HTTP begin failed");
-            resumeSmsPolling();
-            return false;
-        }
-    }
-    
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(15000);
-    
-    int code = http.POST(payload);
-    int respLen = 0;
-    if (code > 0) {
-        respLen = readHttpBodyToBuffer(http, gAuthRespBuf, sizeof(gAuthRespBuf));
-    }
-    http.end();
-    clientSecure.stop();
-    client.stop();
+    // Use shared HTTPS client to avoid -1 errors from client conflicts
+    int code = agentHttpsPostJson(url, payload, 15000, false, gAuthRespBuf, sizeof(gAuthRespBuf), "auth-refresh");
     
     if (code < 0) {
-        String err = http.errorToString(code);
         logMsgInt("[AUTH] Refresh failed, code", code);
-        if (err.length() > 0) {
-            appendMonitorLogVal("[AUTH] HTTP err", err.c_str());
-        }
         appendMonitorLogInt("[AUTH] Refresh conn err", code);
         resumeSmsPolling();
         return false;
     }
     
-    if (!(code >= 200 && code < 300) || respLen <= 0) {
+    if (!(code >= 200 && code < 300) || strlen(gAuthRespBuf) == 0) {
         logMsgInt("[AUTH] Token refresh failed, HTTP", code);
         appendMonitorLogInt("[AUTH] Refresh HTTP", code);
         resumeSmsPolling();
@@ -5863,9 +6199,6 @@ bool registerDeviceWithBackend() {
     if (charBufIsEmpty(agentBaseUrl) || charBufIsEmpty(agentBearerToken)) {
         return false;
     }
-    if (httpsBusy) {
-        return false;
-    }
     
     if (charBufIsEmpty(agentDeviceId)) {
         generateDefaultDeviceId(agentDeviceId, sizeof(agentDeviceId));
@@ -5882,57 +6215,11 @@ bool registerDeviceWithBackend() {
         "{\"device_id\":\"%s\",\"name\":\"%s\"}",
         agentDeviceId, agentDeviceId);
     
-    HTTPClient http;
-    WiFiClientSecure clientSecure;
-    WiFiClient client;
-    const bool isHttps = (strncmp(url, "https://", 8) == 0);
+    // Use shared HTTPS client to avoid -1 errors from client conflicts
+    // Note: agentHttpsPostJson handles httpsBusy internally
+    int code = agentHttpsPostJson(url, payload, 12000, true, nullptr, 0, "register-device");
     
-    httpsBusy = true;
-    
-    bool begun = false;
-    if (isHttps) {
-        clientSecure.setInsecure();
-        clientSecure.setTimeout(12000);
-        begun = http.begin(clientSecure, url);
-    } else {
-        begun = http.begin(client, url);
-    }
-    if (!begun) {
-        httpsBusy = false;
-        return false;
-    }
-    
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
-    http.setTimeout(12000);
-    
-    int code = http.POST(payload);
-    http.end();
-
-    if (code == 401 && refreshAgentToken()) {
-        clientSecure.stop();
-        client.stop();
-        delay(100);
-            if (isHttps) {
-                clientSecure.setInsecure();
-                http.begin(clientSecure, url);
-            } else {
-                http.begin(client, url);
-            }
-            http.addHeader("Content-Type", "application/json");
-            http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
-        http.setTimeout(12000);
-            code = http.POST(payload);
-            http.end();
-        }
-
-    if (isHttps) {
-        clientSecure.stop();
-    } else {
-        client.stop();
-    }
     delay(50);
-    httpsBusy = false;
     
     if (code >= 200 && code < 300) {
         deviceRegistered = true;
@@ -5960,6 +6247,27 @@ void handleRegisterDevice() {
     } else {
         sendJsonError("Registration failed");
     }
+}
+
+static void buildRegisterSimPayload(char* payload, size_t payloadSize, int simIdx, bool forceBind) {
+    size_t pos = 0;
+    pos += snprintf(payload + pos, payloadSize - pos,
+        "{\"number\":\"%s\",\"device_id\":\"%s\",\"slot\":%d,\"carrier\":null,\"max_active_sims\":16",
+        simStates[simIdx].number, agentDeviceId, simIdx);
+    if (forceBind) {
+        pos += snprintf(payload + pos, payloadSize - pos, ",\"force_bind\":true");
+    }
+    if (excludedAppsCount() > 0) {
+        pos += snprintf(payload + pos, payloadSize - pos, ",\"excluded_apps\":[");
+        for (int i = 0; i < excludedAppsCount() && pos < payloadSize - 32; i++) {
+            char esc[64];
+            jsonEscape(excludedAppsAt(i), esc, sizeof(esc));
+            if (i > 0) pos += snprintf(payload + pos, payloadSize - pos, ",");
+            pos += snprintf(payload + pos, payloadSize - pos, "%s", esc);
+        }
+        pos += snprintf(payload + pos, payloadSize - pos, "]");
+    }
+    pos += snprintf(payload + pos, payloadSize - pos, "}");
 }
 
 void handleRegisterSim() {
@@ -5990,83 +6298,26 @@ void handleRegisterSim() {
     char url[256];
     snprintf(url, sizeof(url), "%s/api/agent/sims/register", agentBaseUrl);
     
-    char payload[512];
-    snprintf(payload, sizeof(payload),
-        "{\"number\":\"%s\",\"device_id\":\"%s\",\"slot\":%d,\"carrier\":null,\"max_active_sims\":16}",
-        simStates[simIdx].number, agentDeviceId, simIdx
-    );
-    
-    HTTPClient http;
-    WiFiClientSecure clientSecure;
-    WiFiClient client;
-    bool isHttps = (strncmp(url, "https://", 8) == 0);
+    char payload[1024];
+    buildRegisterSimPayload(payload, sizeof(payload), simIdx, false);
     
     // Wait for other HTTPS operations
     if (httpsBusy) {
         sendJsonError("HTTPS busy, try again");
         return;
     }
-    httpsBusy = true;
     
-    if (isHttps) {
-        clientSecure.setInsecure();
-        http.begin(clientSecure, url);
-    } else {
-        http.begin(client, url);
-    }
-    
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
-    http.setTimeout(10000);
-    
-    int code = http.POST(payload);
-    String resp = "";
-    if (code > 0) {
-        resp = http.getString();
-    }
-    http.end();
-
-    if (code == 401) {
-        // Stop previous connection before refresh
-        clientSecure.stop();
-        client.stop();
-        delay(100);  // Let TCP fully close
-        
-        if (refreshAgentToken()) {
-            if (isHttps) {
-                clientSecure.setInsecure();
-                http.begin(clientSecure, url);
-            } else {
-                http.begin(client, url);
-            }
-            http.addHeader("Content-Type", "application/json");
-            http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
-            http.setTimeout(10000);
-            code = http.POST(payload);
-            if (code > 0) {
-                resp = http.getString();
-            }
-            http.end();
-        }
-    }
+    // Use shared HTTPS client to avoid -1 errors from client conflicts
+    // Note: agentHttpsPostJson handles httpsBusy internally
+    int code = agentHttpsPostJson(url, payload, 10000, true, nullptr, 0, "register-sim");
     
     // Handle 409 conflict with force_bind
     if (code == 409) {
-        snprintf(payload, sizeof(payload),
-            "{\"number\":\"%s\",\"device_id\":\"%s\",\"slot\":%d,\"carrier\":null,\"max_active_sims\":16,\"force_bind\":true}",
-            simStates[simIdx].number, agentDeviceId, simIdx
-        );
-        
-        if (isHttps) {
-            http.begin(clientSecure, url);
-        } else {
-            http.begin(client, url);
-        }
-        http.addHeader("Content-Type", "application/json");
-        http.addHeader("Authorization", String("Bearer ") + agentBearerToken);
-        code = http.POST(payload);
-        http.end();
+        buildRegisterSimPayload(payload, sizeof(payload), simIdx, true);
+        code = agentHttpsPostJson(url, payload, 10000, true, nullptr, 0, "register-sim-force");
     }
+    
+    delay(50);
     
     if (code >= 200 && code < 300) {
         simStates[simIdx].backendRegistered = true;
@@ -6079,10 +6330,6 @@ void handleRegisterSim() {
         appendMonitorLogInt("[REGISTER] SIM failed", code);
         sendJsonError("SIM registration failed");
     }
-    clientSecure.stop();
-    client.stop();
-    delay(50);
-    httpsBusy = false;
 }
 
 // -----------------------------------------------------------------------------
@@ -6187,6 +6434,99 @@ void handleToggleMissedCall() {
         missedCallForwardEnabled ? "enabled" : "disabled"
     );
     server.send(200, "application/json", buf);
+}
+
+static char gConfigJsonBuf[2048];
+
+void handleSenderMapGet() {
+    const size_t n = senderMapExportJson(gConfigJsonBuf, sizeof(gConfigJsonBuf));
+    if (n == 0) {
+        sendJsonError("Export failed");
+        return;
+    }
+    sendJson(gConfigJsonBuf);
+}
+
+void handleSenderMapPost() {
+    String body = server.arg("plain");
+    if (body.length() == 0) {
+        body = server.hasArg("json") ? server.arg("json") : server.arg("body");
+    }
+    if (body.length() == 0) {
+        sendJsonError("JSON body required");
+        return;
+    }
+    if (!senderMapImportJson(body.c_str())) {
+        sendJsonError("Invalid sender map JSON");
+        return;
+    }
+    logMsg("[CONFIG] Sender map updated from app");
+    sendJsonSuccess("Sender map saved");
+}
+
+void handleMuxMapGet() {
+#if !USE_DUAL_UART
+    const size_t n = muxMapExportJson(gConfigJsonBuf, sizeof(gConfigJsonBuf));
+    if (n == 0) {
+        sendJsonError("Export failed");
+        return;
+    }
+    sendJson(gConfigJsonBuf);
+#else
+    sendJson("{\"channels\":[],\"settle_ms\":350}");
+#endif
+}
+
+void handleMuxMapPost() {
+#if !USE_DUAL_UART
+    String body = server.arg("plain");
+    if (body.length() == 0) {
+        body = server.hasArg("json") ? server.arg("json") : server.arg("body");
+    }
+    if (body.length() == 0) {
+        sendJsonError("JSON body required");
+        return;
+    }
+    if (!muxMapImportJson(body.c_str())) {
+        sendJsonError("Invalid mux map JSON");
+        return;
+    }
+    logMsg("[CONFIG] MUX map updated");
+    const size_t n = muxMapExportJson(gConfigJsonBuf, sizeof(gConfigJsonBuf));
+    if (n > 0) {
+        sendJson(gConfigJsonBuf);
+    } else {
+        sendJsonSuccess("MUX map saved — re-run SIM init to apply");
+    }
+#else
+    sendJsonError("Mux map not used in dual-UART mode");
+#endif
+}
+
+void handleExcludedAppsGet() {
+    const size_t n = excludedAppsExportJson(gConfigJsonBuf, sizeof(gConfigJsonBuf));
+    if (n == 0) {
+        sendJsonError("Export failed");
+        return;
+    }
+    sendJson(gConfigJsonBuf);
+}
+
+void handleExcludedAppsPost() {
+    String body = server.arg("plain");
+    if (body.length() == 0) {
+        body = server.hasArg("json") ? server.arg("json") : server.arg("body");
+    }
+    if (body.length() == 0) {
+        sendJsonError("JSON body required");
+        return;
+    }
+    if (!excludedAppsImportJson(body.c_str())) {
+        sendJsonError("Invalid excluded apps JSON");
+        return;
+    }
+    logMsg("[CONFIG] Excluded apps updated from app");
+    sendJsonSuccess("Excluded apps saved");
 }
 
 void handleFirmwareCheck() {

@@ -3,6 +3,7 @@
 // ============================================================================
 
 #include "mux.h"
+#include "mux_map.h"
 #include "sim800.h"
 #include "webui.h"
 #include "logger.h"
@@ -10,22 +11,25 @@
 
 #if !USE_DUAL_UART
 
-// UI slot index -> physical mux channel (see LOGICAL_TO_MUX_INIT in config.h)
-static const uint8_t LOGICAL_TO_MUX[SIM_COUNT] = LOGICAL_TO_MUX_INIT;
-
+// UI slot index -> physical mux channel (NVS-backed; see mux_map.cpp)
 static int currentSlot = 0;
+static int lastAppliedMuxChannel = -1;
+
+void muxInvalidateSelection() {
+    lastAppliedMuxChannel = -1;
+}
 
 int logicalSlotToMuxChannel(int logicalSlot) {
     if (logicalSlot < 0) logicalSlot = 0;
     if (logicalSlot >= SIM_COUNT) logicalSlot = SIM_COUNT - 1;
-    return (int)LOGICAL_TO_MUX[logicalSlot];
+    return (int)muxMapChannelForSlot(logicalSlot);
 }
 
 int muxChannelToLogicalSlot(int muxChannel) {
     if (muxChannel < 0) muxChannel = 0;
     if (muxChannel >= SIM_COUNT) muxChannel = SIM_COUNT - 1;
     for (int i = 0; i < SIM_COUNT; i++) {
-        if ((int)LOGICAL_TO_MUX[i] == muxChannel) {
+        if ((int)muxMapChannelForSlot(i) == muxChannel) {
             return i;
         }
     }
@@ -65,18 +69,18 @@ void selectSIM(int slot) {
     if (slot < 0) slot = 0;
     if (slot >= SIM_COUNT) slot = SIM_COUNT - 1;
 
-    if (currentSlot == slot) {
+    const int muxChannel = logicalSlotToMuxChannel(slot);
+
+    if (currentSlot == slot && lastAppliedMuxChannel == muxChannel) {
         return;
     }
-
-    const int muxChannel = logicalSlotToMuxChannel(slot);
 
     digitalWrite(MUX_S0, (muxChannel & 0x01) ? HIGH : LOW);
     digitalWrite(MUX_S1, (muxChannel & 0x02) ? HIGH : LOW);
     digitalWrite(MUX_S2, (muxChannel & 0x04) ? HIGH : LOW);
     digitalWrite(MUX_S3, (muxChannel & 0x08) ? HIGH : LOW);
 
-    cooperativeDelayMux(MUX_SETTLE_MS);
+    cooperativeDelayMux(muxMapSettleMs());
 
     HardwareSerial& serial = simSerial();
     for (int pass = 0; pass < 3; pass++) {
@@ -91,6 +95,7 @@ void selectSIM(int slot) {
     }
 
     currentSlot = slot;
+    lastAppliedMuxChannel = muxChannel;
 }
 
 int getCurrentLogicalSlot() {

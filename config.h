@@ -18,7 +18,7 @@
 #define UART_BAUD_RATE  115200
 
 // Mux mode (single UART)
-#define UART_RX_PIN     4       // GPIO4 - RX from multiplexer
+#define UART_RX_PIN     4     // GPIO4 - RX from multiplexer
 #define UART_TX_PIN     5       // GPIO5 - TX to all SIM RX (shared)
 
 // Dual-UART mode (two independent UARTs)
@@ -33,10 +33,11 @@
 // Multiplexer Control Pins (CD74HC4067)
 // -----------------------------------------------------------------------------
 #if !USE_DUAL_UART
-#define MUX_S0          16      // GPIO16
-#define MUX_S1          17      // GPIO17
-#define MUX_S2          18      // GPIO18
-#define MUX_S3          19      // GPIO19
+// GPIO6-11 are flash pins on ESP32 — do not use for mux control.
+#define MUX_S0       12 // 12 //16
+#define MUX_S1        11// 11 //17
+#define MUX_S2        10// 10 //18
+#define MUX_S3       9//  9 //19
 #endif
 
 // -----------------------------------------------------------------------------
@@ -47,7 +48,15 @@
 // -----------------------------------------------------------------------------
 // Firmware version (shown in web UI; bump when releasing OTA builds)
 // -----------------------------------------------------------------------------
-#define FIRMWARE_VERSION    "1.0.18"
+#define FIRMWARE_VERSION    "1.0.26"
+
+// 1 = queue SIM init + SMS polling automatically after boot (no web UI "Run" needed).
+#ifndef MODEM_AUTO_START_ON_BOOT
+#define MODEM_AUTO_START_ON_BOOT    1
+#endif
+#ifndef MODEM_AUTO_START_DELAY_MS
+#define MODEM_AUTO_START_DELAY_MS   (20UL * 1000UL)
+#endif
 
 // -----------------------------------------------------------------------------
 // Over-the-air updates (ESP32 HTTPS OTA from GitHub Releases or custom URL)
@@ -126,17 +135,19 @@
      9,  8,  7,  6 \
 }
 #endif
-#define MUX_SETTLE_MS   500     // Delay after switching MUX channel (ms) - increased for stability
-#define MUX_VERIFY_RETRIES 3    // Number of retries to verify SIM after switch
-#define UART_FLUSH_ITER 200    // Max iterations when flushing UART - increased
-#define UART_FLUSH_WAIT_MS 50  // Wait time during UART flush
+#define MUX_SETTLE_MS   350     // Mux settle after channel switch (ms); NVS can override
+#define MUX_VERIFY_RETRIES 2    // AT verify retries after mux switch
+#define UART_FLUSH_ITER 80      // Max UART flush iterations during poll
+#define UART_FLUSH_WAIT_MS 20   // Wait during UART flush
 
 // -----------------------------------------------------------------------------
 // Timing Intervals (ms)
 // -----------------------------------------------------------------------------
-#define SMS_POLL_INTERVAL_MS        400     // Min gap between each SIM slot poll (one slot per loop tick)
-#define SMS_SLOT_POLL_COOLDOWN_MS   3000    // Min gap before re-polling the same slot
-#define SMS_CMGL_TIMEOUT_MS         2500    // List SMS; empty SIMs return OK in <1s
+#define SMS_POLL_INTERVAL_MS        50      // Min gap between each SIM slot poll
+#define SMS_SLOT_POLL_COOLDOWN_MS   1200    // Min gap before re-polling the same slot
+#define SMS_CMGL_TIMEOUT_MS         900     // List SMS; empty SIMs return OK quickly
+#define SMS_POLL_AT_VERIFY_MS       200     // AT ping timeout during poll
+#define SMS_POLL_AT_VERIFY_EVERY_MS 120000UL // Re-verify AT every 2 min on healthy slots
 #define SMS_POLL_TIMEOUT_MS         15000   // Safety timeout
 #define SMS_RETRY_INTERVAL_MS       30000   // 30s between retry batches
 #define HEARTBEAT_INTERVAL_MS       60000   // 60s between heartbeat attempts (ping or full sync)
@@ -182,6 +193,7 @@
 #define WIFI_RECONNECT_COOLDOWN_MS      (10UL * 60UL * 1000UL)
 #define WIFI_STA_DISCONNECT_LOG_MS      60000UL
 #define WIFI_USER_SETUP_ARM_MS          (2UL * 60UL * 1000UL)
+#define AP_STA_GRACE_MS                 (5UL * 60UL * 1000UL)  // Keep AP 5 min after STA connects
 #define WIFI_BOOT_CONNECT_MAX_ATTEMPTS  5
 #define WIFI_BOOT_CONNECT_ATTEMPT_MS    8000UL   // max wait per boot connect try
 
@@ -272,7 +284,7 @@ extern int missedCallWatchSlot;
 // -----------------------------------------------------------------------------
 #define SMS_HEX_DEBUG     false    // Enable hex dump of SMS data
 
-#define HEARTBEAT_DEBUG   false    // Enable verbose heartbeat request/response logging
+#define HEARTBEAT_DEBUG   true     // Enable verbose heartbeat request/response logging
 
 // -----------------------------------------------------------------------------
 // Type Definitions
@@ -367,6 +379,8 @@ inline bool cloudBackendDeferred() { return millis() < heartbeatNotBeforeMs; }
 void wifiPrepareForHttps();
 bool ensureWifiForHttps();
 void wifiRecoverAfterHttps();
+// Cleanup shared HTTPS client (call after operations to reset TLS state)
+void hbHttpEnd();
 // Single shared TLS client (gHbHttp) — use for SMS, ping, maintenance to avoid -1 after ping.
 int agentHttpsPostJson(const char* url, const char* jsonBody, int timeoutMs, bool addAuth,
     char* respOut, size_t respOutSize, const char* opLabel = nullptr);
@@ -391,6 +405,8 @@ extern char agentBearerToken[AGENT_BEARER_TOKEN_SIZE];
 extern char agentRefreshToken[AGENT_REFRESH_TOKEN_SIZE];
 /** Unix ms — refresh before this (0 = unknown, use legacy interval). */
 extern unsigned long agentAccessTokenExpiresAtMs;
+/** Flag indicating tokens were set manually (skip auto-refresh unless expired). */
+extern bool agentTokensManual;
 
 // Refresh access token using refresh token (updates agentBearerToken + preferences)
 bool refreshAgentToken();
@@ -422,8 +438,12 @@ extern volatile bool otaInProgress;
 // WiFi
 extern char wifiSsid[64];
 extern unsigned long wifiUserSetupUntilMs;
+extern unsigned long apGraceUntilMs;
 extern char wifiPassword[64];
 void armWifiUserSetupMs(unsigned long durationMs);
+void armApGraceAfterStaConnect();
+bool wifiApShouldStayUp();
+void wifiApManageTick();
 void ensureGatewaySoftAp();
 void wifiPrepareForUserConfig();
 void wifiPrepareForScan();
@@ -431,3 +451,6 @@ bool wifiStaBackgroundReconnectAllowed();
 bool wifiStaNetworkLooksValid();
 void wifiLogStaNetworkDetails();
 bool wifiFixStaNetworkIfNeeded();
+bool wifiIsActuallyConnected();
+int rawTlsPost(const char* host, int port, const char* path, const char* jsonBody, 
+               int timeoutMs, char* respOut, size_t respOutSize, const char* authHeader);

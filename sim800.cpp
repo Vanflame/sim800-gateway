@@ -143,8 +143,8 @@ void sendATCapture(const char* cmd, unsigned long timeoutMs) {
         // For long responses (SMS list), wait for data to stop coming
         // before checking for completion
         if (isLongResponse) {
-            // Only check for completion if no data received in last 50ms
-            if (millis() - lastDataTime < 50) {
+            // Empty CMGL returns quickly; shorter idle = faster slot rotation.
+            if (millis() - lastDataTime < 25) {
                 // Still receiving data, continue reading
                 if (gYieldToWebServer) {
                     server.handleClient();
@@ -152,6 +152,7 @@ void sendATCapture(const char* cmd, unsigned long timeoutMs) {
                 if (statusLedIsSimInitActive()) {
                     statusLedTick();
                 }
+                yield();
                 delay(2);
                 continue;
             }
@@ -183,6 +184,7 @@ void sendATCapture(const char* cmd, unsigned long timeoutMs) {
         if (statusLedIsSimInitActive()) {
             statusLedTick();
         }
+        yield();
         delay(2);
     }
 
@@ -819,6 +821,7 @@ static void simInitDelayMs(unsigned long ms) {
     const unsigned long until = millis() + ms;
     while ((long)(until - millis()) > 0) {
         statusLedTick();
+        yield();
         delay(10);
     }
 }
@@ -836,15 +839,15 @@ void checkAllSIMsOnStartup() {
     // Pass 1: probe all SIMs with extra settling time
     for (int i = 0; i < SIM_COUNT; i++) {
         selectSIM(i);
-        simInitDelayMs(200);  // Extra settling time on first probe
+        simInitDelayMs(350);  // Extra settling time on first probe
         
         // Quick probe (empty mux channels fail fast)
         bool isResponsive = false;
-        for (int retry = 0; retry < 2 && !isResponsive; retry++) {
-            sendATCapture("AT", 400);
+        for (int retry = 0; retry < 3 && !isResponsive; retry++) {
+            sendATCapture("AT", 500);
             isResponsive = (strstr(getSimBuffer(), "OK") != NULL);
             if (!isResponsive) {
-                simInitDelayMs(100);
+                simInitDelayMs(150);
             }
         }
         
@@ -927,20 +930,8 @@ void checkAllSIMsOnStartup() {
         charBufSet(simStates[i].networkType, sizeof(simStates[i].networkType), "2G");
 
         sendATCapture("AT+CNUM", 2000);
-        char numBuf[64];
-        charBufSet(numBuf, sizeof(numBuf), getSimBuffer());
-        const char* numStart = strstr(numBuf, ",\"");
-        if (numStart) {
-            numStart += 2;
-            const char* numEnd = strchr(numStart, '"');
-            if (numEnd) {
-                int len = (int)(numEnd - numStart);
-                if (len > 0 && len < (int)sizeof(simStates[i].number)) {
-                    strncpy(simStates[i].number, numStart, (size_t)len);
-                    simStates[i].number[len] = '\0';
-                }
-            }
-        }
+        parseCnumResponseNumber(getSimBuffer(), simStates[i].number, sizeof(simStates[i].number));
+        applyPhMobileNormalization(simStates[i].number, sizeof(simStates[i].number));
 
         getBatteryInfo(&simStates[i].batteryPercent, &simStates[i].batteryMv);
         logMsgInt("[SETUP] SIM init complete:", i + 1);

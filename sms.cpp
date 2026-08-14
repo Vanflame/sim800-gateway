@@ -9,7 +9,7 @@
 #include "calls.h"
 #include "logger.h"
 #include "utils.h"
-#include "config.h"
+#include "sender_map.h"
 #include "webui.h"
 #include <Arduino.h>
 #include <WiFi.h>
@@ -129,25 +129,37 @@ static bool smsSlotEligibleForPoll(int slot) {
     return true;
 }
 
+static bool pollSkipAtVerify(int slot) {
+    if (slot < 0 || slot >= SIM_COUNT) return false;
+    if (!simStates[slot].basicInitDone) return false;
+    if (simStates[slot].consecutiveErrors > 0) return false;
+    if (!simStates[slot].responsive) return false;
+    const unsigned long last = simStates[slot].lastSuccessfulPoll;
+    if (last == 0) return false;
+    return (millis() - last) < SMS_POLL_AT_VERIFY_EVERY_MS;
+}
+
 static void pollOneSimSlot(int slot) {
     selectSIM(slot);
 
-    bool atOk = false;
-    for (int retry = 0; retry < MUX_VERIFY_RETRIES; retry++) {
-        sendATCapture("AT", 400);
-        if (strstr(getSimBuffer(), "OK")) {
-            atOk = true;
-            break;
+    if (!pollSkipAtVerify(slot)) {
+        bool atOk = false;
+        for (int retry = 0; retry < MUX_VERIFY_RETRIES; retry++) {
+            sendATCapture("AT", SMS_POLL_AT_VERIFY_MS);
+            if (strstr(getSimBuffer(), "OK")) {
+                atOk = true;
+                break;
+            }
+            cooperativeDelayMs(30);
         }
-        cooperativeDelayMs(80);
-    }
-    if (!atOk) {
-        logMsgInt("[SMS] SIM not responding during poll:", slot + 1);
-        simStates[slot].consecutiveErrors++;
-        if (simStates[slot].consecutiveErrors >= SIM_POLL_DISABLE_THRESHOLD) {
-            simMarkSlotOffline(slot, "no AT during poll");
+        if (!atOk) {
+            logMsgInt("[SMS] SIM not responding during poll:", slot + 1);
+            simStates[slot].consecutiveErrors++;
+            if (simStates[slot].consecutiveErrors >= SIM_POLL_DISABLE_THRESHOLD) {
+                simMarkSlotOffline(slot, "no AT during poll");
+            }
+            return;
         }
-        return;
     }
     simStates[slot].consecutiveErrors = 0;
 
@@ -206,7 +218,7 @@ static void pollOneSimSlot(int slot) {
         }
     }
 
-    cooperativeDelayMs(80);
+    cooperativeDelayMs(10);
 }
 
 // Multipart SMS queue
@@ -477,6 +489,12 @@ static void resolveSenderDisplay(const SmsMessage* msg, char* senderDisplay, siz
     }
     charBufTrim(rawSender);
 
+    const char* mappedBrand = senderMapLookup(rawSender);
+    if (mappedBrand && mappedBrand[0]) {
+        charBufSet(senderDisplay, senderDisplaySize, mappedBrand);
+        return;
+    }
+
     charBufSet(senderDisplay, senderDisplaySize, rawSender);
     char brand[PHONE_BUFFER_SIZE];
     brand[0] = '\0';
@@ -531,6 +549,10 @@ bool enqueuePendingSms(int simSlot, const char* simNumber, const char* sender, c
     PendingSms* p = &pendingQueue[pendingCount++];
     p->simSlot = simSlot;
     charBufSet(p->simNumber, sizeof(p->simNumber), simNumber);
+    applyPhMobileNormalization(p->simNumber, sizeof(p->simNumber));
+    if (simSlot >= 0 && simSlot < SIM_COUNT && isNormalizedPhMobile(p->simNumber)) {
+        charBufSet(simStates[simSlot].number, sizeof(simStates[simSlot].number), p->simNumber);
+    }
     charBufSet(p->sender, sizeof(p->sender), sender);
     charBufSet(p->message, sizeof(p->message), message);
     p->timestamp = millis();
@@ -573,6 +595,11 @@ static bool processOnePendingSms(bool urgent) {
 
     PendingSms* p = &pendingQueue[0];
     p->retryCount++;
+
+    applyPhMobileNormalization(p->simNumber, sizeof(p->simNumber));
+    if (p->simSlot >= 0 && p->simSlot < SIM_COUNT && isNormalizedPhMobile(p->simNumber)) {
+        charBufSet(simStates[p->simSlot].number, sizeof(simStates[p->simSlot].number), p->simNumber);
+    }
 
     static SmsMessage msg;
     msg.simSlot = p->simSlot;
@@ -777,50 +804,47 @@ int parseSMSList(const char* response, SmsMessage* messages, int maxMessages) {
 // SMS Processing
 // -----------------------------------------------------------------------------
 
-static bool isHexUcs2LikeMessage(const char* s) {
-    if (!s) return false;
-    int hexCount = 0;
-    int total = 0;
-    for (const char* p = s; *p; p++) {
-        const char c = *p;
-        if (c == ' ' || c == '\r' || c == '\n' || c == '\t') continue;
-        total++;
-        const bool isHex = ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'));
-        if (isHex) hexCount++;
+static void deleteBlockedSmsFromSim(int simSlot, const SmsMessage* msg, const char* reason) {
+    appendErrorLogInt("[SMS] Blocked undecodable UCS2 SIM", simSlot + 1);
+    appendMonitorLog(reason);
+    selectSIM(simSlot);
+    if (msg && msg->messageIndex > 0) {
+        if (deleteSMS(msg->messageIndex)) {
+            logMsgInt("[SMS] Deleted blocked message from SIM, idx", msg->messageIndex);
+        }
     }
-    return total >= 24 && (hexCount * 100 / total) >= 95 && (total % 4 == 0);
 }
 
 void processIncomingSMS(int simSlot, const SmsMessage* msg) {
     if (!msg) return;
 
-    if (isHexUcs2LikeMessage(msg->message)) {
-        appendErrorLogInt("[SMS] Blocked UCS2-hex-like message SIM", simSlot + 1);
-        appendMonitorLog("[SMS] Blocked suspicious hex/UCS2 message");
-        selectSIM(simSlot);
-        if (msg->messageIndex > 0) {
-            if (deleteSMS(msg->messageIndex)) {
-                logMsgInt("[SMS] Deleted blocked message from SIM, idx", msg->messageIndex);
-                appendMonitorLogInt("[SMS] Deleted blocked idx", msg->messageIndex);
-            } else {
-                appendErrorLogInt("[SMS] Failed to delete blocked idx", msg->messageIndex);
-            }
-        }
+    if (simSlot >= 0 && simSlot < SIM_COUNT) {
+        applyPhMobileNormalization(simStates[simSlot].number, sizeof(simStates[simSlot].number));
+    }
+
+    SmsMessage working = *msg;
+    if (!normalizeSmsBodyFromModem(working.message, sizeof(working.message))) {
+        deleteBlockedSmsFromSim(simSlot, msg, "[SMS] Blocked undecodable UCS2");
         return;
     }
+    if (looksLikeUcs2HexPayload(msg->message)) {
+        logMsgVal("[SMS] Decoded UCS2 body", working.message);
+        appendMonitorLogVal("[SMS] Decoded UCS2", working.message);
+    }
+    const SmsMessage* activeMsg = &working;
     
     char senderDisplay[PHONE_BUFFER_SIZE];
     char rawSender[PHONE_BUFFER_SIZE];
-    resolveSenderDisplay(msg, senderDisplay, sizeof(senderDisplay));
-    charBufSet(rawSender, sizeof(rawSender), msg->sender);
+    resolveSenderDisplay(activeMsg, senderDisplay, sizeof(senderDisplay));
+    charBufSet(rawSender, sizeof(rawSender), activeMsg->sender);
     charBufTrim(rawSender);
 
     // Check if this looks like a continuation of a previous message
-    if (looksLikeContinuation(msg->message)) {
-        MultipartSms* mp = findMultipartSms(simSlot, msg->sender);
+    if (looksLikeContinuation(activeMsg->message)) {
+        MultipartSms* mp = findMultipartSms(simSlot, activeMsg->sender);
         if (mp) {
             // Add as continuation
-            addMultipartPart(mp, msg->message, msg->messageIndex);
+            addMultipartPart(mp, activeMsg->message, activeMsg->messageIndex);
             logMsgInt("[SMS] Multipart continuation, part", mp->receivedParts);
             appendMonitorLogInt("[SMS] Multipart part", mp->receivedParts);
             
@@ -869,31 +893,31 @@ void processIncomingSMS(int simSlot, const SmsMessage* msg) {
         savePersistentStats();
         logMsgIntVal("[SMS] SIM", simSlot + 1, "Num", simStates[simSlot].number);
         appendMonitorLogVal("[SMS] From", senderDisplay);
-        if (msg->message && msg->message[0] != '\0') {
-            appendMonitorLogVal("[SMS] Msg", msg->message);
+        if (activeMsg->message && activeMsg->message[0] != '\0') {
+            appendMonitorLogVal("[SMS] Msg", activeMsg->message);
         }
-        enqueuePendingSms(simSlot, simStates[simSlot].number, senderDisplay, msg->message);
+        enqueuePendingSms(simSlot, simStates[simSlot].number, senderDisplay, activeMsg->message);
         selectSIM(simSlot);
-        if (msg->messageIndex > 0) {
-            deleteSMS(msg->messageIndex);
-            logMsgInt("[SMS] Deleted from SIM, index", msg->messageIndex);
+        if (activeMsg->messageIndex > 0) {
+            deleteSMS(activeMsg->messageIndex);
+            logMsgInt("[SMS] Deleted from SIM, index", activeMsg->messageIndex);
         }
         return;
     }
     
     // Check if message looks truncated - start multipart collection
-    if (looksTruncated(msg->message)) {
+    if (looksTruncated(activeMsg->message)) {
         MultipartSms* mp = createMultipartSms(simSlot, senderDisplay);
         if (mp) {
-            addMultipartPart(mp, msg->message, msg->messageIndex);
+            addMultipartPart(mp, activeMsg->message, activeMsg->messageIndex);
             logMsg("[SMS] Message truncated, waiting for more parts");
             appendMonitorLog("[SMS] Truncated, collecting parts");
             appendMonitorLogInt("[SMS] Part", mp->receivedParts);
             
             // Delete from SIM
             selectSIM(simSlot);
-            if (msg->messageIndex > 0) {
-                deleteSMS(msg->messageIndex);
+            if (activeMsg->messageIndex > 0) {
+                deleteSMS(activeMsg->messageIndex);
             }
             return;  // Don't forward yet, wait for continuation
         }
@@ -922,32 +946,17 @@ void processIncomingSMS(int simSlot, const SmsMessage* msg) {
     appendMonitorLogVal("[SMS] From", senderDisplay);
 
     // Add message to monitor
-    if (msg->message && msg->message[0] != '\0') {
-        appendMonitorLogVal("[SMS] Msg", msg->message);
+    if (activeMsg->message && activeMsg->message[0] != '\0') {
+        appendMonitorLogVal("[SMS] Msg", activeMsg->message);
     }
 
     // Forward the message
-    forwardSms(simSlot, senderDisplay, msg);
+    forwardSms(simSlot, senderDisplay, activeMsg);
 }
 
 // Forward SMS to backend (extracted for reuse by multipart)
 // Never run HTTPS here — poll path must stay fast; forward runs from main loop queue.
 static void forwardSms(int simSlot, const char* senderDisplay, const SmsMessage* msg) {
-    if (isHexUcs2LikeMessage(msg ? msg->message : nullptr)) {
-        appendErrorLogInt("[SMS] Blocked UCS2-hex-like message SIM", simSlot + 1);
-        appendMonitorLog("[SMS] Blocked suspicious hex/UCS2 message");
-        selectSIM(simSlot);
-        if (msg && msg->messageIndex > 0) {
-            if (deleteSMS(msg->messageIndex)) {
-                logMsgInt("[SMS] Deleted blocked message from SIM, idx", msg->messageIndex);
-                appendMonitorLogInt("[SMS] Deleted blocked idx", msg->messageIndex);
-            } else {
-                appendErrorLogInt("[SMS] Failed to delete blocked idx", msg->messageIndex);
-            }
-        }
-        return;
-    }
-
     requestSmsForwardPriority();
     enqueuePendingSms(simSlot, simStates[simSlot].number, senderDisplay, msg->message);
     logMsgInt("[SMS] New message queued for forward, SIM", simSlot + 1);
@@ -1047,21 +1056,25 @@ bool forwardSmsToBackendWithSender(const SmsMessage* msg, const char* normalized
 
     // Determine SIM number (static to avoid stack)
     static char simNum[PHONE_BUFFER_SIZE];
-    if (!charBufIsEmpty(simStates[msg->simSlot].number)) {
+    simNum[0] = '\0';
+    if (msg->simSlot >= 0 && msg->simSlot < SIM_COUNT && !charBufIsEmpty(simStates[msg->simSlot].number)) {
         normalizePhNumber(simStates[msg->simSlot].number, simNum, sizeof(simNum));
-    } else if (!charBufIsEmpty(agentSimNumber)) {
+    }
+    if (!isNormalizedPhMobile(simNum) && !charBufIsEmpty(agentSimNumber)) {
         normalizePhNumber(agentSimNumber, simNum, sizeof(simNum));
-    } else {
-        simNum[0] = '\0';
     }
 
-    if (strlen(simNum) != 13 || strncmp(simNum, "+639", 4) != 0) {
+    if (!isNormalizedPhMobile(simNum)) {
         if (msg->simSlot >= 0 && msg->simSlot < SIM_COUNT) {
             simStates[msg->simSlot].enabled = false;  // Turn off invalid SIM slot in UI.
         }
         logMsgInt("[SMS] Invalid SIM number, slot disabled", msg->simSlot + 1);
         if (errorOut) snprintf(errorOut, errorOutSize, "Invalid SIM number");
         return false;
+    }
+
+    if (msg->simSlot >= 0 && msg->simSlot < SIM_COUNT) {
+        charBufSet(simStates[msg->simSlot].number, sizeof(simStates[msg->simSlot].number), simNum);
     }
 
     const char* senderToUse = normalizedSender && normalizedSender[0] != '\0' ? normalizedSender : msg->sender;

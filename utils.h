@@ -54,10 +54,15 @@ inline void generateDefaultDeviceId(char* out, size_t outSize) {
 // Phone Number Normalization (Philippines format)
 // -----------------------------------------------------------------------------
 
-// Normalize to +639XXXXXXXX format
-// Returns length of normalized number, or 0 if invalid
-// Output buffer must be at least 14 bytes
+// Normalize to +639XXXXXXXX format (+639 + 9 subscriber digits = 13 chars).
+// Returns 13 on success, 0 if invalid. Output buffer must be at least 14 bytes.
 int normalizePhNumber(const char* input, char* output, size_t outputSize);
+
+// True when number is canonical +639XXXXXXXX (13 chars).
+bool isNormalizedPhMobile(const char* number);
+
+// Normalize in place; returns true when buf holds +639XXXXXXXX.
+bool applyPhMobileNormalization(char* buf, size_t bufSize);
 
 // Check if string looks like a phone number
 bool isPhoneNumber(const char* str);
@@ -122,6 +127,15 @@ void extractNetworkType(const char* response, char* output, size_t outputSize);
 // Extract phone number from +CNUM response
 int extractPhoneNumber(const char* cnum, char* output, size_t outputSize);
 
+// Decode SIM800 UCS2 hex payload (e.g. "00310032..." -> "12") into UTF-8 out buffer.
+bool decodeUcs2HexMessage(const char* hexIn, char* out, size_t outSize);
+
+// True when body looks like UCS2 hex from modem (not plain text).
+bool looksLikeUcs2HexPayload(const char* s);
+
+// Decode UCS2 hex in place when detected; returns false only if hex-like but undecodable.
+bool normalizeSmsBodyFromModem(char* message, size_t messageSize);
+
 // -----------------------------------------------------------------------------
 // Time Helpers
 // -----------------------------------------------------------------------------
@@ -155,77 +169,86 @@ inline void charBufTrim(char* buf) {
     }
 }
 
+// True when output is +639XXXXXXXX (13 chars).
+inline bool isNormalizedPhMobile(const char* number) {
+    return number && strlen(number) == 13 && strncmp(number, "+639", 4) == 0;
+}
+
 inline int normalizePhNumber(const char* input, char* output, size_t outputSize) {
     if (!input || !output || outputSize < 14) return 0;
-    
-    // Copy and trim
-    char temp[32];
-    strncpy(temp, input, sizeof(temp) - 1);
-    temp[sizeof(temp) - 1] = '\0';
-    charBufTrim(temp);
-    
-    // Remove spaces and dashes
-    size_t j = 0;
-    for (size_t i = 0; temp[i] && j < sizeof(temp) - 1; i++) {
-        if (temp[i] != ' ' && temp[i] != '-') {
-            temp[j++] = temp[i];
+
+    // Already canonical (+639 + 9 subscriber digits).
+    if (strncmp(input, "+639", 4) == 0 && strlen(input) == 13) {
+        charBufSet(output, outputSize, input);
+        return 13;
+    }
+
+    // Repair legacy double-9 corruption: +6399XXXXXXXXX (14 chars).
+    if (strncmp(input, "+6399", 5) == 0 && strlen(input) == 14) {
+        snprintf(output, outputSize, "+639%s", input + 5);
+        return 13;
+    }
+
+    char digits[16];
+    int nd = 0;
+    for (const char* p = input; *p && nd < 15; p++) {
+        if (*p >= '0' && *p <= '9') {
+            digits[nd++] = *p;
         }
     }
-    temp[j] = '\0';
-    
-    // Already in correct format: +639XXXXXXXX (13 chars)
-    if (strncmp(temp, "+639", 4) == 0 && strlen(temp) == 13) {
-        strcpy(output, temp);
-        return 13;
+    digits[nd] = '\0';
+    if (nd < 10) {
+        output[0] = '\0';
+        return 0;
     }
-    
-    // Convert 09XX to +639XX
-    if (strncmp(temp, "09", 2) == 0 && strlen(temp) == 11) {
-        strcpy(output, "+639");
-        strcat(output, temp + 2);
-        return 13;
+
+    // PH mobile is always 10 digits starting with 9; take the last 10 digit run.
+    const char* tail = digits + nd - 10;
+    if (tail[0] != '9') {
+        output[0] = '\0';
+        return 0;
     }
-    
-    // Convert 9XX to +639XX
-    if (temp[0] == '9' && strlen(temp) == 10) {
-        strcpy(output, "+639");
-        strcat(output, temp);
-        return 13;
+
+    snprintf(output, outputSize, "+639%s", tail + 1);
+    return 13;
+}
+
+inline bool applyPhMobileNormalization(char* buf, size_t bufSize) {
+    if (!buf || bufSize < 14 || charBufIsEmpty(buf)) return false;
+    char normalized[16];
+    if (normalizePhNumber(buf, normalized, sizeof(normalized)) != 13) return false;
+    charBufSet(buf, bufSize, normalized);
+    return true;
+}
+
+// Parse AT+CNUM response and store +639XXXXXXXX when possible.
+inline bool parseCnumResponseNumber(const char* cnumResponse, char* out, size_t outSize) {
+    if (!cnumResponse || !out || outSize < 2) return false;
+    out[0] = '\0';
+
+    const char* numStart = strstr(cnumResponse, ",\"");
+    if (!numStart) return false;
+    numStart += 2;
+    const char* numEnd = strchr(numStart, '"');
+    if (!numEnd || numEnd <= numStart) return false;
+
+    char raw[32];
+    const int len = (int)(numEnd - numStart);
+    if (len <= 0 || len >= (int)sizeof(raw)) return false;
+    strncpy(raw, numStart, (size_t)len);
+    raw[len] = '\0';
+
+    if (normalizePhNumber(raw, out, outSize) == 13) {
+        return true;
     }
-    
-    // Convert +09XX to +639XX
-    if (strncmp(temp, "+09", 3) == 0 && strlen(temp) == 12) {
-        strcpy(output, "+639");
-        strcat(output, temp + 3);
-        return 13;
-    }
-    
-    // Convert +63XX (missing 9) to +639XX
-    if (strncmp(temp, "+63", 3) == 0 && strlen(temp) == 12) {
-        strcpy(output, "+639");
-        strcat(output, temp + 4);
-        return 13;
-    }
-    
-    // Already has +63
-    if (strncmp(temp, "+63", 3) == 0) {
-        strncpy(output, temp, outputSize - 1);
-        output[outputSize - 1] = '\0';
-        return strlen(output);
-    }
-    
-    // Add + if missing
-    if (temp[0] != '+' && strlen(temp) >= 10) {
-        output[0] = '+';
-        strncpy(output + 1, temp, outputSize - 2);
-        output[outputSize - 1] = '\0';
-        return strlen(output);
-    }
-    
-    // Return as-is
-    strncpy(output, temp, outputSize - 1);
-    output[outputSize - 1] = '\0';
-    return strlen(output);
+    charBufSet(out, outSize, raw);
+    applyPhMobileNormalization(out, outSize);
+    return isNormalizedPhMobile(out);
+}
+
+inline int extractPhoneNumber(const char* cnum, char* output, size_t outputSize) {
+    if (!parseCnumResponseNumber(cnum, output, outputSize)) return 0;
+    return isNormalizedPhMobile(output) ? 13 : (int)strlen(output);
 }
 
 inline bool isPhoneNumber(const char* str) {
@@ -407,6 +430,81 @@ inline void extractNetworkType(const char* response, char* output, size_t output
     // Default to 2G for SIM800L (it doesn't support 3G/4G)
     strncpy(output, "2G", outputSize - 1);
     output[outputSize - 1] = '\0';
+}
+
+inline int hexNibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+inline bool looksLikeUcs2HexPayload(const char* s) {
+    if (!s) return false;
+    int hexCount = 0;
+    int total = 0;
+    for (const char* p = s; *p; p++) {
+        const char c = *p;
+        if (c == ' ' || c == '\r' || c == '\n' || c == '\t') continue;
+        total++;
+        if (hexNibble(c) >= 0) hexCount++;
+    }
+    return total >= 8 && (total % 4 == 0) && (hexCount * 100 / total) >= 95;
+}
+
+inline bool decodeUcs2HexMessage(const char* hexIn, char* out, size_t outSize) {
+    if (!hexIn || !out || outSize < 2) return false;
+
+    char compact[640];
+    size_t clen = 0;
+    for (const char* p = hexIn; *p && clen < sizeof(compact) - 1; p++) {
+        const char c = *p;
+        if (c == ' ' || c == '\r' || c == '\n' || c == '\t') continue;
+        if (hexNibble(c) < 0) return false;
+        compact[clen++] = c;
+    }
+    compact[clen] = '\0';
+    if (clen < 4 || (clen % 4) != 0) return false;
+
+    size_t outPos = 0;
+    for (size_t i = 0; i + 3 < clen; i += 4) {
+        const int h0 = hexNibble(compact[i]);
+        const int h1 = hexNibble(compact[i + 1]);
+        const int h2 = hexNibble(compact[i + 2]);
+        const int h3 = hexNibble(compact[i + 3]);
+        if (h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0) return false;
+        const uint16_t codeUnit =
+            (uint16_t)((h0 << 12) | (h1 << 8) | (h2 << 4) | h3);
+        if (codeUnit == 0) break;
+
+        if (codeUnit < 0x80) {
+            if (outPos + 1 >= outSize) return false;
+            out[outPos++] = (char)codeUnit;
+        } else if (codeUnit < 0x800) {
+            if (outPos + 2 >= outSize) return false;
+            out[outPos++] = (char)(0xC0 | (codeUnit >> 6));
+            out[outPos++] = (char)(0x80 | (codeUnit & 0x3F));
+        } else {
+            if (outPos + 3 >= outSize) return false;
+            out[outPos++] = (char)(0xE0 | (codeUnit >> 12));
+            out[outPos++] = (char)(0x80 | ((codeUnit >> 6) & 0x3F));
+            out[outPos++] = (char)(0x80 | (codeUnit & 0x3F));
+        }
+    }
+    out[outPos] = '\0';
+    return outPos > 0;
+}
+
+inline bool normalizeSmsBodyFromModem(char* message, size_t messageSize) {
+    if (!message || messageSize < 2 || charBufIsEmpty(message)) return true;
+    if (!looksLikeUcs2HexPayload(message)) return true;
+
+    char decoded[320];
+    if (!decodeUcs2HexMessage(message, decoded, sizeof(decoded))) {
+        return false;
+    }
+    charBufSet(message, messageSize, decoded);
+    return true;
 }
 
 inline int extractOperatorName(const char* cops, char* output, size_t outputSize) {

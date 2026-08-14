@@ -19,6 +19,7 @@
 // Call once in setup()
 #if !USE_DUAL_UART
 void initMux();
+void muxInvalidateSelection();
 #else
 // In dual-UART mode, no mux initialization needed
 inline void initMux() {}
