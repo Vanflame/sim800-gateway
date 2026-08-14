@@ -156,6 +156,9 @@ void handleRegisterSim();
 // POST /heartbeat - Manual heartbeat trigger (debug)
 void handleHeartbeatManual();
 
+// POST /heartbeat-full - Manual full sync heartbeat (forces full inventory sync)
+void handleHeartbeatFullSync();
+
 // POST /toggle-polling - Toggle SMS polling pause
 void handleTogglePolling();
 

@@ -13,6 +13,7 @@
 
 #include "config.h"
 #include "mux.h"
+#include "mux_map.h"
 #include "sim800.h"
 #include "sms.h"
 #include "webui.h"
@@ -23,6 +24,7 @@
 #include "ussd.h"
 #include "maintenance.h"
 #include "status_led.h"
+#include "sender_map.h"
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -106,6 +108,8 @@ volatile bool httpsBusy = false;  // Prevent concurrent HTTPS
 unsigned long wifiUserSetupUntilMs = 0;  // Pause STA reconnect while user scans/saves WiFi
 bool modemGatewayRunning = false;
 volatile bool modemStartRequested = false;
+static bool modemBootStartRequested = false;
+static unsigned long modemBootStartTime = 0;
 
 bool isModemGatewayRunning() {
     return modemGatewayRunning;
@@ -145,6 +149,14 @@ void modemGatewayTick() {
     }
     if (millis() < wifiUserSetupUntilMs) {
         return;
+    }
+    
+    // Apply auto-start delay for boot requests
+    if (modemBootStartRequested) {
+        if (millis() - modemBootStartTime < MODEM_AUTO_START_DELAY_MS) {
+            return;
+        }
+        modemBootStartRequested = false;
     }
 
     modemStartRequested = false;
@@ -957,9 +969,13 @@ void setup() {
 
     // Initialize SIM multiplexor
     initMux();
+    muxMapLoad();  // Load saved MUX mapping configuration
     appendMonitorLog("[MUX] Initialized");
     initSMSQueue();
     initSMSPolling();
+    
+    // Load sender map configuration
+    senderMapLoad();
     
     appendMonitorLog("[SMS] Init");
     
@@ -970,7 +986,16 @@ void setup() {
     logMsg("Setup complete!");
     logMsg("========================================");
 
+#if MODEM_AUTO_START_ON_BOOT
+    appendMonitorLog("[BOOT] Ready — auto-starting modem gateway");
+    logMsg("[BOOT] Auto-start enabled - requesting modem start");
+    // Queue auto-start with delay
+    modemBootStartRequested = true;
+    modemBootStartTime = millis();
+    modemStartRequested = true;
+#else
     appendMonitorLog("[BOOT] Ready — press Run in web UI to init SIM800");
+#endif
     statusLedSetBootComplete();
 }
 

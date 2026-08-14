@@ -4174,6 +4174,7 @@ void initWebUI() {
     server.on("/register-device", HTTP_POST, handleRegisterDevice);
     server.on("/register-sim", HTTP_POST, handleRegisterSim);
     server.on("/heartbeat", HTTP_POST, handleHeartbeatManual);
+    server.on("/heartbeat-full", HTTP_POST, handleHeartbeatFullSync);
     server.on("/toggle-polling", HTTP_POST, handleTogglePolling);
     server.on("/toggle-heartbeat", HTTP_POST, handleToggleHeartbeat);
     server.on("/toggle-missed-call", HTTP_POST, handleToggleMissedCall);
@@ -6360,6 +6361,36 @@ void handleHeartbeatManual() {
     performHeartbeat();
     
     sendJsonSuccess("Heartbeat sent - check monitor for result");
+}
+
+void handleHeartbeatFullSync() {
+    // Manual full sync heartbeat - forces full inventory sync
+    if (httpsBusy) {
+        sendJsonError("HTTPS busy, try again later");
+        return;
+    }
+    
+    if (charBufIsEmpty(agentBaseUrl)) {
+        sendJsonError("No backend URL configured");
+        return;
+    }
+    
+    if (charBufIsEmpty(agentBearerToken)) {
+        sendJsonError("Not logged in");
+        return;
+    }
+    
+    logMsg("[HEARTBEAT] Manual full sync trigger");
+    appendMonitorLog("[HEARTBEAT] Manual full sync");
+    
+    // Force full sync by resetting the inventory heartbeat flag
+    agentInventoryHeartbeatDone = false;
+    lastFullInventorySyncMs = 0;
+    
+    // Call performHeartbeat directly
+    performHeartbeat();
+    
+    sendJsonSuccess("Full sync heartbeat sent - check monitor for result");
 }
 
 void handleTogglePolling() {

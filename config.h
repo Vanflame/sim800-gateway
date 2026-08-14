@@ -48,7 +48,7 @@
 // -----------------------------------------------------------------------------
 // Firmware version (shown in web UI; bump when releasing OTA builds)
 // -----------------------------------------------------------------------------
-#define FIRMWARE_VERSION    "1.0.26"
+#define FIRMWARE_VERSION    "1.0.27"
 
 // 1 = queue SIM init + SMS polling automatically after boot (no web UI "Run" needed).
 #ifndef MODEM_AUTO_START_ON_BOOT
@@ -129,10 +129,13 @@
 #define SIM_COUNT       16      // Total number of SIM slots
 
 // UI slot 0..15 (SIM 1..16) -> CD74HC4067 mux channel (S0-S3)
+// Updated to match specific PCB wiring:
+// SIM 1->4, SIM 2->5, SIM 3->6, SIM 4->9, SIM 5->8, SIM 6->7, SIM 7->10, SIM 8->11,
+// SIM 9->12, SIM 10->15, SIM 11->13, SIM 12->14, SIM 13->0, SIM 14->3, SIM 15->1, SIM 16->2
 #define LOGICAL_TO_MUX_INIT { \
-    12, 11, 10,  3,  4,  5, \
-    15, 14, 13,  0,  1,  2, \
-     9,  8,  7,  6 \
+     4,  5,  6,  9,  8,  7, \
+    10, 11, 12, 15, 13, 14, \
+     0,  3,  1,  2 \
 }
 #endif
 #define MUX_SETTLE_MS   350     // Mux settle after channel switch (ms); NVS can override
