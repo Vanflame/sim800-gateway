@@ -1694,10 +1694,52 @@ static void parseActiveSessionsFromJson(const char* s) {
 
 static bool simInHeartbeatReport(int i) {
     if (i < 0 || i >= SIM_COUNT) return false;
-    if (simStates[i].userDisabled) return false;
-    if (!simStates[i].enabled) return false;
-    if (!simStates[i].responsive) return false;
-    if (charBufIsEmpty(simStates[i].number)) return false;
+    
+    // Log why SIM is excluded from heartbeat report
+    if (simStates[i].userDisabled) {
+        static unsigned long lastUserDisabledLog = 0;
+        if (millis() - lastUserDisabledLog > 60000) {  // Log once per minute
+            char buf[64];
+            snprintf(buf, sizeof(buf), "[SIM] Slot %d excluded: user disabled", i + 1);
+            logMsg(buf);
+            lastUserDisabledLog = millis();
+        }
+        return false;
+    }
+    
+    if (!simStates[i].enabled) {
+        static unsigned long lastEnabledLog = 0;
+        if (millis() - lastEnabledLog > 60000) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "[SIM] Slot %d excluded: not enabled", i + 1);
+            logMsg(buf);
+            lastEnabledLog = millis();
+        }
+        return false;
+    }
+    
+    if (!simStates[i].responsive) {
+        static unsigned long lastResponsiveLog = 0;
+        if (millis() - lastResponsiveLog > 60000) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "[SIM] Slot %d excluded: not responsive", i + 1);
+            logMsg(buf);
+            lastResponsiveLog = millis();
+        }
+        return false;
+    }
+    
+    if (charBufIsEmpty(simStates[i].number)) {
+        static unsigned long lastNoNumberLog = 0;
+        if (millis() - lastNoNumberLog > 60000) {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "[SIM] Slot %d excluded: no phone number", i + 1);
+            logMsg(buf);
+            lastNoNumberLog = millis();
+        }
+        return false;
+    }
+    
     char normalizedNum[PHONE_BUFFER_SIZE];
     normalizeSimNumber(simStates[i].number, normalizedNum, sizeof(normalizedNum));
     if (charBufIsEmpty(normalizedNum)) {
@@ -1705,6 +1747,7 @@ static bool simInHeartbeatReport(int i) {
         appendErrorLogInt("[SIM] Disabled invalid number slot", i + 1);
         return false;
     }
+    
     return true;
 }
 
