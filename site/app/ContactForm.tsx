@@ -3,7 +3,7 @@ import { useRef, useState } from "react";
 import s from "./contact.module.css";
 
 // Messages go to the Vanflame portfolio inbox (/admin → Inbox), tagged with this project.
-const ENDPOINT = process.env.NEXT_PUBLIC_CONTACT_ENDPOINT || "https://personal-portfolio-lyart-eight-39.vercel.app/api/contact";
+const ENDPOINT = process.env.NEXT_PUBLIC_CONTACT_ENDPOINT || "https://www.vanflame.dev/api/contact";
 
 type Props = { source: string; title: string; lede: string; interests: string[]; button?: string };
 
