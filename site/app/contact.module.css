@@ -1,0 +1,26 @@
+/* Themed per site via CSS variables set on :root (see globals.css --cf-*) */
+.wrap { padding: 90px clamp(16px, 4vw, 40px); background: var(--cf-section, transparent); color: var(--cf-text, inherit); }
+.inner { max-width: 1120px; margin: 0 auto; display: grid; grid-template-columns: .9fr 1.1fr; gap: 44px; align-items: start; }
+.kicker { margin: 0; font-weight: 600; font-size: 13px; line-height: 1; font-family: var(--cf-font-head, inherit); letter-spacing: .1em; text-transform: uppercase; color: var(--cf-accent); }
+.title { margin: 12px 0 0; font-weight: 700; font-size: clamp(30px, 4.2vw, 46px); line-height: 1.08; font-family: var(--cf-font-head, inherit); letter-spacing: -.02em; }
+.lede { margin: 16px 0 0; max-width: 440px; color: var(--cf-muted); font-size: 17px; line-height: 1.6; }
+.points { margin: 22px 0 0; padding: 0; list-style: none; display: grid; gap: 10px; }
+.points li { position: relative; padding-left: 28px; font-weight: 600; }
+.points li::before { content: "✓"; position: absolute; left: 0; top: 0; display: grid; place-items: center; width: 20px; height: 20px; border-radius: 50%; background: var(--cf-accent); color: var(--cf-on-accent, #fff); font-size: 11px; }
+.card { padding: clamp(20px, 3vw, 30px); border-radius: var(--cf-radius, 16px); background: var(--cf-card, #fff); border: 1px solid var(--cf-line, rgba(0,0,0,.1)); box-shadow: 0 30px 70px rgba(0,0,0,.12); }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.f { display: grid; gap: 6px; font-size: 13px; font-weight: 600; color: var(--cf-muted); }
+.wide { grid-column: 1 / -1; }
+.f input, .f select, .f textarea { width: 100%; padding: 12px 14px; border-radius: calc(var(--cf-radius, 16px) * .6); border: 1px solid var(--cf-line, rgba(0,0,0,.12)); background: var(--cf-input, transparent); color: var(--cf-text, inherit); font-weight: 400; font-size: 15px; line-height: 1.4; font-family: inherit; outline: none; transition: border-color .2s, box-shadow .2s; }
+.f select option { color: #111; }
+.f textarea { resize: vertical; min-height: 120px; }
+.f input:focus, .f select:focus, .f textarea:focus { border-color: var(--cf-accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--cf-accent) 18%, transparent); }
+.hp { position: absolute; left: -9999px; width: 1px; height: 1px; opacity: 0; }
+.err { margin: 14px 0 0; padding: 10px 14px; border-radius: 10px; background: rgba(255, 70, 70, .12); color: #e5484d; font-weight: 600; font-size: 14px; }
+.btn { width: 100%; margin-top: 16px; padding: 15px 20px; border: 0; border-radius: calc(var(--cf-radius, 16px) * .6); background: var(--cf-btn, var(--cf-accent)); color: var(--cf-on-accent, #fff); font-weight: 700; font-size: 16px; line-height: 1; font-family: var(--cf-font-head, inherit); cursor: pointer; transition: transform .2s, filter .2s; }
+.btn:hover { transform: translateY(-2px); filter: brightness(1.08); } .btn:disabled { opacity: .6; cursor: wait; transform: none; }
+.note { margin: 12px 0 0; font-size: 12px; color: var(--cf-muted); text-align: center; }
+.done { display: grid; justify-items: center; text-align: center; gap: 8px; padding: 50px 24px; }
+.done h3 { margin: 6px 0 0; font-weight: 700; font-size: 26px; font-family: var(--cf-font-head, inherit); } .done p { margin: 0; color: var(--cf-muted); }
+.check { display: grid; place-items: center; width: 62px; height: 62px; border-radius: 50%; background: var(--cf-accent); color: var(--cf-on-accent, #fff); font-size: 28px; }
+@media (max-width: 880px) { .inner, .grid { grid-template-columns: 1fr; } }

@@ -1,4 +1,4 @@
-:root {
+:root { --cf-text:#e6f1ff;--cf-muted:#8aa3c2;--cf-card:#0b1a2e;--cf-input:#07111f;--cf-line:rgba(120,190,255,.18);--cf-accent:#3de0ff;--cf-on-accent:#04121f;--cf-radius:10px;--cf-font-head:"Chakra Petch",sans-serif;
   --bg: #07111f; --bg2: #0b1a2e; --line: rgba(120, 190, 255, .14); --grid: rgba(120, 190, 255, .06);
   --text: #e6f1ff; --muted: #8aa3c2; --cyan: #3de0ff; --amber: #ffb547; --ok: #4dff9a;
   --f-head: "Chakra Petch", system-ui, sans-serif; --f-body: "IBM Plex Sans", system-ui, sans-serif; --f-mono: "JetBrains Mono", ui-monospace, monospace;

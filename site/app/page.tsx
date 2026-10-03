@@ -1,3 +1,4 @@
+import ContactForm from "./ContactForm";
 import Board from "./Board";
 
 const REPO = "https://github.com/Vanflame/sim800-gateway";
@@ -36,7 +37,7 @@ export default function Page() {
     <main>
       <nav className="nav wrap">
         <a className="brand" href="#"><span className="chip" />SIM800<b>GATEWAY</b></a>
-        <div className="nav__links mono"><a href="#features">Features</a><a href="#specs">Specs</a><a href="#flow">Flow</a><a className="btn btn--sm" href={REPO}>GitHub ↗</a></div>
+        <div className="nav__links mono"><a href="#features">Features</a><a href="#specs">Specs</a><a href="#flow">Flow</a><a href="#contact">Contact</a><a className="btn btn--sm" href={REPO}>GitHub ↗</a></div>
       </nav>
 
       <header className="hero wrap">
@@ -90,6 +91,8 @@ export default function Page() {
         <h2>Flash it. Plug in SIMs.<br /><span>Start receiving.</span></h2>
         <a className="btn" href={REPO}>Get the firmware ↗</a>
       </section>
+
+      <ContactForm source="SIM800 Gateway" title="Want a gateway like this?" lede="Need the firmware for your own SIM bank, a custom build, or help wiring it to your backend? Send a message." interests={["Use this gateway for my business", "Custom firmware / hardware build", "Backend integration", "Something else"]} />
 
       <footer className="wrap foot mono"><span>SIM800 GATEWAY · ESP32 FIRMWARE</span><span>Built by Vanflame</span></footer>
     </main>
