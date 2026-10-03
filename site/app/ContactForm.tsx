@@ -62,7 +62,7 @@ export default function ContactForm({ source, title, lede, interests, button = "
             <input className={s.hp} name="_hp" tabIndex={-1} autoComplete="off" aria-hidden="true" />
             {error && <p className={s.err} role="alert">{error}</p>}
             <button className={s.btn} type="submit" disabled={state === "sending"}>{state === "sending" ? "Sending…" : button}</button>
-            <p className={s.note}>Your details and approximate location (from your IP) are stored only so we can reply.</p>
+            <p className={s.note}>Information submitted through this form is used only to respond to your inquiry and is never sold or shared.</p>
           </form>
         )}
       </div>
