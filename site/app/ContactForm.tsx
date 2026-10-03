@@ -1,5 +1,5 @@
 "use client";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import s from "./contact.module.css";
 
 // Messages go to the Vanflame portfolio inbox (/admin → Inbox), tagged with this project.
@@ -11,6 +11,21 @@ export default function ContactForm({ source, title, lede, interests, button = "
   const opened = useRef(Date.now());
   const [state, setState] = useState<"idle" | "sending" | "done">("idle");
   const [error, setError] = useState("");
+  const vid = useRef("");
+
+  // One anonymous visit per day per site for the portfolio's visitor map (city-level, no IP stored).
+  useEffect(() => {
+    try {
+      let v = localStorage.getItem("vf-vid") || "";
+      if (!v) { v = Math.random().toString(36).slice(2, 14) + Date.now().toString(36); localStorage.setItem("vf-vid", v); }
+      vid.current = v;
+      const day = new Date().toISOString().slice(0, 10), k = "vf-seen-" + source;
+      if (localStorage.getItem(k) === day || navigator.webdriver) return;
+      localStorage.setItem(k, day);
+      navigator.sendBeacon(ENDPOINT.replace(/\/api\/contact$/, "/api/track"),
+        new Blob([JSON.stringify({ vid: v, source, page: location.pathname, referrer: document.referrer })], { type: "text/plain" }));
+    } catch {}
+  }, [source]);
 
   async function submit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -23,7 +38,7 @@ export default function ContactForm({ source, title, lede, interests, button = "
     try {
       const r = await fetch(ENDPOINT, {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ source, page: location.href, fields, _hp: data.get("_hp") || "", _t: opened.current, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, screen: `${screen.width}x${screen.height}` }),
+        body: JSON.stringify({ source, page: location.href, fields, _hp: data.get("_hp") || "", _t: opened.current, vid: vid.current, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, screen: `${screen.width}x${screen.height}` }),
       });
       const d = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(d.error || "Something went wrong. Please try again.");
